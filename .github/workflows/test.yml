@@ -1,0 +1,74 @@
+name: test
+
+# What can run on a stock ubuntu runner, and what cannot.
+#
+# The memory-reclaim suites need cgroup v2 with a writable memory.reclaim inside
+# a user slice, zram, and a real compositor to protect — none of which a hosted
+# runner has. So they run here and only here; the runner proves the code parses,
+# the tests are syntactically sound, and the installer renders units correctly
+# for hostile paths. The load and reclaim assertions are documented in the README
+# as run on the development machine, not implied by a green tick here.
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  static:
+    name: parse, tests and installer rendering
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: python syntax
+        run: |
+          python3 -m compileall -q helper tests
+          echo "--- shell syntax ---"
+          for f in install.sh helper/ram_keeper_notify tests/*.sh; do
+            bash -n "$f"
+          done
+
+      - name: node tests (panel data shaping)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq nodejs
+          node tests/test_model.js
+          node tests/test_unknown_ui.js
+
+      - name: forecast and hostile-config suites
+        run: |
+          python3 tests/test_forecast.py
+          python3 tests/test_config_hostile.py
+          python3 tests/test_inviolable.py
+          python3 tests/test_resilience.py
+
+      # The pass-budget suite stubs reclaim_from, so it asserts the accounting
+      # without moving any real memory — that part belongs on a runner.
+      - name: pass budget
+        run: python3 tests/test_pass_budget.py
+
+      - name: qml structure
+        run: python3 tests/test_qml_structure.py
+
+      - name: installer renders hostile paths
+        run: bash tests/test_hostile_install_path.sh
+
+  skipped-here:
+    name: what this runner cannot verify
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          cat <<'MSG'
+          These suites are real and pass on the development machine, but they
+          cannot run on a hosted runner:
+
+            test_no_oom_kill.py   sustained load; needs a real desktop to survive
+            (the reclaim paths)   and asserts nothing is killed
+
+          Requirements: cgroup v2, a writable memory.reclaim in a user slice,
+          zram, and a live compositor. That is an Omarchy desktop, not a VM.
+          MSG
