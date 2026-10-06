@@ -44,7 +44,7 @@ command -v node >/dev/null && {
 
 echo
 echo "python tests (daemon logic and hostile input):"
-run "forecast maths"      /usr/bin/python3 test_forecast.py
+run "forecast maths"      env RAM_KEEPER_LIVE=1 /usr/bin/python3 test_forecast.py
 run "hostile configs"     /usr/bin/python3 test_config_hostile.py
 run "compositor shield"   /usr/bin/python3 test_inviolable.py
 run "resilience"          /usr/bin/python3 test_resilience.py

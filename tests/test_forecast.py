@@ -3,7 +3,8 @@ A synthetic test: feed the tracker a known linear decline and check it
 predicts the crossing time. Then feed it noise and check it does NOT cry wolf.
 Then run it on the live machine.
 """
-import json, subprocess, sys, time
+import json
+import os, subprocess, sys, time
 
 import sys
 from pathlib import Path
@@ -122,6 +123,17 @@ f6 = t6.forecast(1000 * MB)
 print(f"  culprit={f6.culprit!r}")
 check("a process that appeared mid-window is not blamed",
       "brand-new" not in f6.culprit, repr(f6.culprit))
+# ---------------------------------------------------------------------------
+# Everything below needs a real desktop: cgroup v2, zram, and a live compositor.
+# A GitHub runner has none of those, so asserting on the host's own report there
+# tests the runner, not this code. It runs in tests/test_no_oom_kill.py and in
+# tests/run-all.sh on the development machine.
+# ---------------------------------------------------------------------------
+
+if os.environ.get("RAM_KEEPER_LIVE") != "1":
+    print("\n== live probe skipped (set RAM_KEEPER_LIVE=1 on a desktop) ==")
+    sys.exit(0 if fails == 0 else 1)
+
 print("\n== 7. a slow decline is 'soon', not 'imminent' ==")
 clock7 = FakeClock()
 t7 = rk.TrendTracker(clock=clock7)
