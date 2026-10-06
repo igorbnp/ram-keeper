@@ -38,6 +38,11 @@ any description would:
 - A button labelled "Drop cache" that also swapped anonymous memory to zram.
 - A panel that froze on its first reading and reported stale numbers forever,
   because a Quickshell `Timer` needs `running: true` to be explicit.
+- An installer path test that passed while the installer was broken: the test
+  reimplemented the substitution instead of calling it, so a plugin directory
+  containing a space had never been given to systemd. The fix needed quoting the
+  whole argument, and the test now starts a throwaway unit to prove systemd
+  accepts the result.
 
 None of these would have shown up in normal use. They surfaced because the tests
 assert on behaviour instead of on the presence of code.

@@ -74,16 +74,25 @@ render_unit() {
   # character in the path can mean anything.
   local src="$1" dst="$2"
   "$PYTHON" - "$src" "$dst" "$PLUGIN_DIR" "$PYTHON_OVERRIDE" <<'PYEOF'
+import re
 import sys
 src, dst, plugin_dir, python = sys.argv[1:5]
 with open(src, encoding="utf-8") as handle:
     content = handle.read()
-rendered = content.replace("@PLUGIN_DIR@", plugin_dir)
+# systemd splits ExecStart on whitespace and honours double quotes only when
+# they wrap a WHOLE argument. Quote each argument that CONTAINS the placeholder
+# together with the subpath that follows it in the template, because the
+# template appends "/helper/..." after the placeholder.
+rendered = re.sub(r'@PLUGIN_DIR@(\S*)',
+                  lambda m: ('"%s%s"' % (plugin_dir, m.group(1))) if " " in plugin_dir
+                  else plugin_dir + m.group(1),
+                  content)
 rendered = rendered.replace("/usr/bin/python3", python)
 if not rendered.strip():
     sys.exit(f"rendered unit is empty: {dst}")
 if "@PLUGIN_DIR@" in rendered:
     sys.exit(f"template placeholder survived in {dst}")
+
 with open(dst, "w", encoding="utf-8") as handle:
     handle.write(rendered)
 PYEOF
