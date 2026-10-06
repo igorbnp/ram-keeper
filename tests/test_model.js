@@ -4,7 +4,6 @@ const path = require("path");
 const PLUGIN = path.join(__dirname, "..");
 const M_PATH = path.join(PLUGIN, "qml", "Model.js");
 
-const { execFileSync } = require("child_process");
 const M = require(M_PATH);
 
 let failures = 0;
@@ -13,11 +12,48 @@ function check(name, cond, detail) {
   else { console.log(`  FAIL ${name}${detail ? " — " + detail : ""}`); failures++; }
 }
 
-// Real snapshot from the daemon helper.
-const raw = execFileSync("/usr/bin/python3",
-  [path.join(PLUGIN, "helper", "ram_keeper.py"), "--once"],
-  { encoding: "utf8" });
-const snap = M.parseSnapshot(raw);
+// A fixed snapshot, shaped like real daemon output.
+//
+// This used to run the daemon and assert against whatever the host reported,
+// so the suite passed or failed depending on the machine. On a GitHub runner
+// there are no user cgroups and no zram, and "apps present" / "zram identified"
+// failed for reasons unrelated to the code. A fixture tests the shaping; the
+// daemon's real output is covered by the python suites, which only run on a
+// desktop.
+const snap = M.parseSnapshot(JSON.stringify({
+  state: "ok", free_percent: 38.3,
+  mem_total: 8026562560, mem_available: 3073976832,
+  mem_used: 4952585728, anon_and_kernel: 1665888256, cached: 2347696128,
+  zram: {
+    devices: [
+      { name: "/swap/swapfile", type: "file", size: 8027074560,
+        used: 7417856, ram_backed: false },
+      { name: "/dev/zram0", type: "partition", size: 8025796608,
+        used: 2950127616, ram_backed: true }
+    ],
+    used: 2957545472, size: 16052871168,
+    disk_used: 7417856, ram_used: 2950127616
+  },
+  psi: { some_avg10: 0, some_avg60: 0.05, some_avg300: 0.31,
+         full_avg10: 0, full_avg60: 0.04, full_avg300: 0.3 },
+  forecast: { horizon_seconds: 962.9, rate_bytes_per_sec: -2666973,
+              will_cross: true, confidence: 0.43, samples: 5,
+              trend: "rising", culprit: "", urgency: "eventual" },
+  groups: [
+    { name: "app-org.chromium.Chromium-733668.scope",
+      label: "Chromium 733668", kind: "scope", current: 442421248,
+      anon: 211144704, file: 213536768, reclaimable_file: 208338944,
+      swap: 473661440, reclaimable: 208338944, protected: false,
+      swapable: true, pids: 152 },
+    { name: "wayland-wm@hyprland.desktop.service",
+      label: "wayland-wm@hyprland", kind: "service", current: 1221656576,
+      anon: 366366720, file: 680165376, reclaimable_file: 410349568,
+      swap: 601264128, reclaimable: 410349568, protected: true,
+      swapable: true, pids: 1919 }
+  ],
+  reclaimable_total: 782864384,
+  checked_at: 1791253790.008
+}));
 
 console.log("== parsing ==");
 check("parses real helper output", snap !== null);
