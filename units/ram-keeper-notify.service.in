@@ -1,0 +1,31 @@
+[Unit]
+Description=ram-keeper — event-driven memory alerts with one-click AI diagnosis
+Documentation=man:systemd.unit(5)
+# The notifier needs a notification bus and the daemon's state file. It talks
+# to the user session, so it starts after the graphical session exists.
+After=graphical-session.target ram-keeper.service
+PartOf=graphical-session.target
+ConditionEnvironment=WAYLAND_DISPLAY
+
+[Service]
+Type=simple
+ExecStart=@PLUGIN_DIR@/helper/ram_keeper_notify
+Restart=always
+RestartSec=10
+
+# Three watchers, one script: journalctl plus two polling loops. That is a few
+# MB of bash, and it must never be the reason the machine is short on memory.
+MemoryHigh=64M
+MemoryMax=128M
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+# Reads its own state and the journal; writes only its dedupe flags.
+ReadWritePaths=%h/.local/state/ram-keeper
+PrivateTmp=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=graphical-session.target

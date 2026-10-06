@@ -1,0 +1,243 @@
+#!/bin/bash
+# ram-keeper: announce only the moments a human actually wants to know about.
+#
+# This follows the pattern omarchy-crash-watch uses, deliberately: never spin
+# up an LLM to watch a number, because a number does not need reasoning. Wake
+# the agent only when there is evidence of a real problem, and only when a
+# human clicks to hear about it.
+#
+# Three kinds of moment earn a toast:
+#   1. The daemon itself failed — the important one. If ram-keeper dies
+#      silently, the user believes they are protected and are not.
+#   2. systemd-oomd actually killed something. RAM Keeper's whole purpose is
+#      to make that never happen, so its occurrence is a real report.
+#   3. Memory went critical and stayed there.
+#
+# What is deliberately NOT here: a periodic "memory is at 42%" report. That is
+# the same sentence every time, and it trains the user to dismiss toasts —
+# which would cost us the alerts that matter.
+#
+# Every toast carries `Click to ...` and a command, so clicking opens the
+# agent with the context already gathered. No LLM runs until that click.
+
+set -uo pipefail
+
+readonly STATE_DIR="$HOME/.local/state/ram-keeper"
+readonly FLAG_DIR="$STATE_DIR/flags"
+readonly LOG="$STATE_DIR/log.jsonl"
+readonly PIDFILE="$STATE_DIR/notify.pid"
+readonly DEDUPE_SECONDS=${RAM_KEEPER_DEDUPE_SECONDS:-1800}
+readonly UNIT=ram-keeper.service
+
+# Resolved at click time, not at install time: a Hermes profile switch or a
+# skill reinstall must not leave the notifier pointing at a stale path.
+skill_path() {
+  local found
+  for root in "${HERMES_HOME:-$HOME/.hermes}"; do
+    for candidate in "$root/skills/ram-memory-diagnosis/SKILL.md" \
+                     "$root/profiles/"*/skills/ram-memory-diagnosis/SKILL.md; do
+      [[ -f "$candidate" ]] && { echo "$candidate"; return 0; }
+    done
+    found="$root/skills/ram-memory-diagnosis/SKILL.md"
+  done
+  echo "$found"
+}
+readonly SKILL_PATH="$(skill_path)"
+
+mkdir -p "$FLAG_DIR"
+
+# nf-md-memory_alert / nf-md-check, escaped so this file reads without a Nerd Font.
+readonly ALERT_GLYPH=$'\U000f0535'
+
+log_event() {
+  printf '{"ts":%s,"event":"%s"}\n' "$(date +%s)" "$1" >>"$LOG" 2>/dev/null || true
+}
+
+# Dedupe by flag file: it exists means "already told the user recently".
+# Touching it restarts the window. Survives a restart of this script, which an
+# in-memory associative array would not.
+# Keep the dedupe directory bounded. OOM lines embed a PID and an RSS, so they
+# never collide: without pruning, a crash-looping app adds one file per boot,
+# permanently, and nothing ever removes them.
+prune_flags() {
+  local keep="${1:-200}"
+  local -a all=()
+  mapfile -t all < <(ls -1t "$FLAG_DIR"/oom-* "$FLAG_DIR"/pressure-* 2>/dev/null) || return 0
+  (( ${#all[@]} <= keep )) && return 0
+  rm -f "${all[@]:keep}" 2>/dev/null || true
+}
+
+should_announce() {
+  local marker="$FLAG_DIR/$1" now
+  now=$(date +%s)
+  if [[ -e "$marker" ]]; then
+    local age=$(( now - $(stat -c %Y "$marker" 2>/dev/null || echo 0) ))
+    (( age < DEDUPE_SECONDS )) && return 1
+  fi
+  touch "$marker"
+  prune_flags 200
+  return 0
+}
+
+# A toast nobody sees is worse than no toast: it trains the user to ignore
+# notifications entirely. The shell owns the notification name, so wait for it
+# to claim the name — same reason omarchy-crash-watch does.
+#
+# The timeout is POSITIONAL: `omarchy-notification-wait [seconds]`. Passing
+# `--timeout` makes it treat the flag as the value of $1, and with `set -u` the
+# resulting unbound variable kills this whole notifier — taking the other two
+# watchers with it. Failures here must never be fatal.
+send() {
+  local urgency="$1" glyph="$2" title="$3" body="$4" action="$5"
+  omarchy-notification-wait 5 || {
+    log_event "notify-server-unready"
+    return 1
+  }
+  omarchy-notification-send \
+    --urgency "$urgency" \
+    --glyph "$glyph" \
+    "$title" \
+    "$body" \
+    --exec bash -lc "$action" || log_event "notify-send-failed"
+}
+
+# Build the click action as a single shell command string.
+#
+# Two things learned the hard way:
+#   * The prompt goes through printf %q so any quote inside it survives being
+#     handed to `bash -lc`.
+#   * NO `--inline`. That flag makes omarchy exec the agent directly, which
+#     fails for Hermes with "hermes-tui: no TTY" because a notification click
+#     has no terminal attached. Without it, omarchy-launch-tui opens a real
+#     terminal window — which is what omarchy-agent-crash does too, and the only
+#     shape that actually works.
+#   * The skill PATH is inlined in the prompt, exactly like omarchy-agent-crash
+#     does. An agent that cannot resolve skills by name should still be able to
+#     read the file.
+agent_action() {
+  local prompt="$1"
+  printf 'omarchy agent prompt %q' "Read and follow the skill at $SKILL_PATH.
+
+$prompt"
+}
+
+# ---------------------------------------------------------------------------
+# 1. The daemon died — the one thing that must never be silent
+# ---------------------------------------------------------------------------
+watch_daemon() {
+  # Starts EMPTY on purpose. Initialising to 1 made the first iteration toast
+  # for a daemon that was already stopped at login — exactly the "a unit
+  # disabled at login is a choice, not a failure" case the comment below
+  # describes. Only a transition from running to stopped is an event.
+  local was_alive=""
+  while true; do
+    if systemctl --user is-active --quiet "$UNIT"; then
+      was_alive=1
+    elif [[ "$was_alive" == "1" ]]; then
+      # Only speak if it was alive and has now stopped. A unit disabled at
+      # login is a choice, not a failure, and must not nag.
+      was_alive=0
+      log_event "daemon-down"
+      if should_announce daemon-down; then
+        send critical "$ALERT_GLYPH" \
+          "RAM protection stopped" \
+          "ram-keeper is not running. Click to restart it." \
+          'systemctl --user restart ram-keeper.service; omarchy-shell io.github.igorbnp.ram-keeper refresh'
+      fi
+    fi
+    sleep 15
+  done
+}
+
+# ---------------------------------------------------------------------------
+# 2. A process was actually killed for using too much memory
+# ---------------------------------------------------------------------------
+watch_oom_kills() {
+  # What systemd-oomd actually writes is "Memory cgroup out of memory: Killed
+  # process NNNN (name)". The earlier pattern also accepted a bare
+  # "systemd-oomd", which only ever matches our OWN prompt text in the journal
+  # (the click action quotes "systemd-oomd just killed a process...") — so the
+  # filter could match the wrong thing and still miss the real event. Verified
+  # against `strings /usr/lib/systemd/systemd-oomd`.
+  #
+  # Per-line dedupe by content hash, so a crash-looping app cannot produce an
+  # endless stream of identical toasts while a genuinely different event still
+  # gets through.
+  # NOT `journalctl --user`: the kernel's OOM lines live in the SYSTEM journal
+  # and the user view never shows them (verified: 0 matches over a whole boot,
+  # and still 0 after a real oomd kill). This watcher was therefore dead code.
+  # Both vocabularies are matched — the kernel's
+  # "Memory cgroup out of memory: Killed process" and oomd's own
+  # "Marked <path> for killing due to memory pressure" — because either one
+  # means the user is about to lose a process.
+  journalctl -f -n 0 -o cat 2>/dev/null \
+    | grep --line-buffered -iE 'memory cgroup out of memory|for killing due to memory pressure' \
+    | while IFS= read -r line; do
+        # Never react to our own traffic. The click action's prompt is written
+        # into the journal by the agent it launches, and it contains the very
+        # words this watcher greps for. Without these guards one real kill
+        # toasts, the click echoes it, the echo toasts again, and the cycle
+        # continues until the dedupe window expires.
+        [[ "$line" == *ram-keeper* ]] && continue
+        [[ "$line" == *ram-memory-diagnosis* ]] && continue
+        [[ "$line" == *"just killed a process on this machine"* ]] && continue
+        [[ "$line" == *"use too much memory"* ]] && continue
+        key="oom-$(printf '%s' "$line" | md5sum | cut -c1-8)"
+        should_announce "$key" || continue
+        log_event "oom-kill"
+        send critical "$ALERT_GLYPH" \
+          "A process was killed for using too much memory" \
+          "RAM Keeper should have prevented this. Click to find out what happened." \
+          "$(agent_action "systemd-oomd just killed a process on this machine for using too much memory. Use the ram-memory-diagnosis skill to work out what happened and what to change.")"
+      done
+}
+
+# ---------------------------------------------------------------------------
+# 3. Memory critical and staying there
+# ---------------------------------------------------------------------------
+watch_pressure() {
+  local last_state=""
+  while true; do
+    [[ -f "$STATE_DIR/state.json" ]] || { sleep 30; continue; }
+
+    local snapshot state free
+    snapshot="$(cat "$STATE_DIR/state.json" 2>/dev/null)"
+    state="$(printf '%s' "$snapshot" | jq -r '.state // "unknown"' 2>/dev/null)"
+    free="$(printf '%s' "$snapshot" | jq -r '.free_percent // "?"' 2>/dev/null)"
+
+    # Only on the transition INTO critical, not every poll while critical. A
+    # single dip is normal and self-correcting; the daemon handles it silently,
+    # which is the entire point of having it.
+    if [[ "$state" == "critical" && "$last_state" != "critical" ]] \
+       && should_announce pressure-critical; then
+      log_event "pressure-critical"
+      send critical "$ALERT_GLYPH" \
+        "Memory is critically low" \
+        "Only ${free}% free. RAM Keeper is reclaiming now. Click if the machine feels slow." \
+        "$(agent_action "RAM Keeper reported critical memory pressure: only ${free}% of RAM free. Use the ram-memory-diagnosis skill to explain what is using the memory and whether anything needs to change.")"
+    fi
+    last_state="$state"
+    sleep 30
+  done
+}
+
+# ---------------------------------------------------------------------------
+
+main() {
+  # Single instance: three of these looping would triple every notification.
+  if [[ -f "$PIDFILE" ]] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then
+    exit 0
+  fi
+  echo $$ >"$PIDFILE"
+  trap 'rm -f "$PIDFILE"' EXIT
+
+  # Nothing to say until a notification path exists.
+  command -v omarchy-notification-send >/dev/null || exit 0
+
+  watch_daemon &
+  watch_pressure &
+  watch_oom_kills &
+  wait
+}
+
+main "$@"

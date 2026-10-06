@@ -1,0 +1,43 @@
+[Unit]
+Description=ram-keeper — automatic RAM steward for a memory-scarce desktop
+Documentation=man:systemd.unit(5)
+# After the things that define what memory exists: zram must exist before we
+# can reclaim anon into it, and our own cgroup must be discoverable.
+After=systemd-user-sessions.service systemd-zram-setup@zram0.service
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 @PLUGIN_DIR@/helper/ram_keeper.py --daemon
+Restart=always
+RestartSec=5
+
+# The daemon's whole job is to hold the machine's memory steady. Let it use a
+# real slice when it needs to (it reads cgroups and sleeps between passes), but
+# cap it so a runaway loop can't become the problem it was built to prevent.
+# These bind the daemon's own cgroup, so if it ever really ran away the victim
+# would be the daemon — never the desktop.
+MemoryHigh=192M
+MemoryMax=384M
+
+# Sandbox. Every claim below was verified by running the reclaim from INSIDE
+# this exact sandbox, not by assuming:
+#   /proc/meminfo, /proc/pressure/memory → readable; these are the only
+#       system-wide signals used and ProtectSystem=strict does not touch procfs
+#   /sys/fs/cgroup/.../memory.reclaim     → still WRITABLE for cgroups we own,
+#       which is the entire point of this daemon
+#   ~/.config/ram-keeper/config.json      → ReadOnlyPaths below is REQUIRED.
+#       Without it, ProtectHome=read-only makes the file invisible to the unit
+#       and every user setting silently reverts to the built-in defaults.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadOnlyPaths=%h/.config/ram-keeper
+ReadWritePaths=%h/.local/state/ram-keeper
+PrivateTmp=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=default.target

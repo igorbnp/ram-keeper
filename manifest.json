@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.igorbnp.ram-keeper",
+  "name": "RAM Keeper",
+  "version": "1.0.0",
+  "author": "igorbnp",
+  "description": "Automatic memory steward: reclaims page cache first, then pushes anonymous memory into zram, and never touches your compositor. A live panel shows free memory, PSI pressure, zram use, and every reclaim it performs.",
+  "license": "MIT",
+  "kinds": [
+    "service",
+    "bar-widget"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "qml/Service.qml",
+    "barWidget": "qml/Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "RAM Keeper",
+    "description": "Live memory pressure with automatic reclamation",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "showPercent": true
+    }
+  }
+}
