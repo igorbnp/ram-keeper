@@ -39,6 +39,9 @@ jobs:
           node tests/test_model.js
           node tests/test_unknown_ui.js
 
+      # These five are the portable half. test_forecast.py runs everything
+      # before its live probe without RAM_KEEPER_LIVE, and reports the rest as
+      # skipped: they need cgroup v2, zram and a compositor.
       - name: forecast and hostile-config suites
         run: |
           python3 tests/test_forecast.py
@@ -63,12 +66,21 @@ jobs:
     steps:
       - run: |
           cat <<'MSG'
-          These suites are real and pass on the development machine, but they
-          cannot run on a hosted runner:
+          These suites are real and pass on an Omarchy desktop, but a hosted
+          runner has no user cgroups, no zram and no compositor, so they report
+          as SKIPPED here rather than passing or failing:
 
-            test_no_oom_kill.py   sustained load; needs a real desktop to survive
-            (the reclaim paths)   and asserts nothing is killed
+            the live half of test_forecast.py   forecast from the real daemon
+            test_config_hostile.py              against real cgroup accounting
+            test_inviolable.py                  compositor shield, live scan
+            test_resilience.py                  victims, restarts, crashes
+            test_no_oom_kill.py                sustained load; nothing is killed
 
-          Requirements: cgroup v2, a writable memory.reclaim in a user slice,
-          zram, and a live compositor. That is an Omarchy desktop, not a VM.
+          Requirements: cgroup v2 with a writable memory.reclaim inside a user
+          slice, zram, and a live session that must survive the test. Run them
+          with tests/run-all.sh on an Omarchy desktop.
+
+          The green tick above means: the code parses, the arithmetic holds, the
+          panel shapes data correctly, and the installer renders units systemd
+          accepts. It does NOT mean the reclaim path was exercised.
           MSG

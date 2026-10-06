@@ -45,9 +45,9 @@ command -v node >/dev/null && {
 echo
 echo "python tests (daemon logic and hostile input):"
 run "forecast maths"      env RAM_KEEPER_LIVE=1 /usr/bin/python3 test_forecast.py
-run "hostile configs"     /usr/bin/python3 test_config_hostile.py
-run "compositor shield"   /usr/bin/python3 test_inviolable.py
-run "resilience"          /usr/bin/python3 test_resilience.py
+run "hostile configs"     env RAM_KEEPER_LIVE=1 /usr/bin/python3 test_config_hostile.py
+run "compositor shield"   env RAM_KEEPER_LIVE=1 /usr/bin/python3 test_inviolable.py
+run "resilience"          env RAM_KEEPER_LIVE=1 /usr/bin/python3 test_resilience.py
 run "no OOM kill"         /usr/bin/python3 test_no_oom_kill.py
 run "pass budget"        /usr/bin/python3 test_pass_budget.py
 
