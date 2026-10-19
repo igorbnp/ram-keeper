@@ -161,10 +161,18 @@ check("state is a known value",
 print("\n== 8. swap split is honest ==")
 z = d["zram"]
 print(f"  ram_used={z.get('ram_used',0)//MB}MB disk_used={z.get('disk_used',0)//MB}MB")
-check("zram classified as RAM-backed",
-      any(dev.get("ram_backed") for dev in z["devices"] if "zram" in dev["name"]))
-check("swapfile classified as disk-backed",
-      any(not dev.get("ram_backed") for dev in z["devices"] if "swapfile" in dev["name"]))
+has_zram = any("zram" in dev["name"] for dev in z["devices"])
+if has_zram:
+    check("zram classified as RAM-backed",
+          any(dev.get("ram_backed") for dev in z["devices"] if "zram" in dev["name"]))
+else:
+    print("  --   zram not present on this system, skipping zram assertion")
+has_swapfile = any("swapfile" in dev["name"] for dev in z["devices"])
+if has_swapfile:
+    check("swapfile classified as disk-backed",
+          any(not dev.get("ram_backed") for dev in z["devices"] if "swapfile" in dev["name"]))
+else:
+    print("  --   swapfile not present on this system, skipping swapfile assertion")
 check("ram_used + disk_used == used",
       z.get("ram_used", 0) + z.get("disk_used", 0) == z["used"])
 print("\nALL PASS" if fails == 0 else f"\n{fails} FAILURES")
