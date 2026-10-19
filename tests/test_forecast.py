@@ -132,7 +132,7 @@ check("a process that appeared mid-window is not blamed",
 
 if os.environ.get("RAM_KEEPER_LIVE") != "1":
     print("\n== live probe skipped (set RAM_KEEPER_LIVE=1 on a desktop) ==")
-    sys.exit(0 if fails == 0 else 1)
+    assert fails == 0, f"Test failed: {fails} failures"
 
 print("\n== 7. a slow decline is 'soon', not 'imminent' ==")
 clock7 = FakeClock()
@@ -168,4 +168,4 @@ check("swapfile classified as disk-backed",
 check("ram_used + disk_used == used",
       z.get("ram_used", 0) + z.get("disk_used", 0) == z["used"])
 print("\nALL PASS" if fails == 0 else f"\n{fails} FAILURES")
-sys.exit(0 if fails == 0 else 1)
+assert fails == 0, f"Test failed: {fails} failures"

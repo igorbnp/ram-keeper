@@ -136,4 +136,4 @@ for n in ("Hyprland", "quickshell", "hermes"):
 subprocess.run(["systemctl", "--user", "stop", "ramtest-kill"], capture_output=True)
 
 print("\n" + ("ALL PASS" if fails == 0 else f"\n{fails} FAILURES"))
-sys.exit(0 if fails == 0 else 1)
+assert fails == 0, f"Test failed: {fails} failures"

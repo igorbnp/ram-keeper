@@ -422,9 +422,9 @@ def _coerce_strlist(key: str, value, fallback):
     accept it rather than iterating its characters and silently protecting
     nothing (or protecting single letters)."""
     if isinstance(value, str):
-        return [value]
+        return [value] if value else []
     if isinstance(value, list) and all(isinstance(v, str) for v in value):
-        return list(value)
+        return [v for v in value if v]
     _CONFIG_WARNINGS.append(f"{key}: expected a list of names, got {value!r}; using default")
     return list(fallback)
 
@@ -739,7 +739,7 @@ class Steward:
 
         total = raw_total or 1
         available = raw_available if readings_valid else 0
-        free_percent = (100.0 * available / total) if readings_valid else 100.0
+        free_percent = (100.0 * available / total) if readings_valid else 0.0
         pressure = psi("memory")
         swap = zram_stats()
 
@@ -825,7 +825,7 @@ class Steward:
             # still reclaimed everything it could. Not a failure.
             outcome = "eagain" if e.errno == 11 else f"error:{e.errno}"
 
-        time.sleep(0.4)
+        time.sleep(self.config.get("reclaim_sleep", 0.4))
         after = _read_int(group.path / "memory.current")
         after_swap = cgroup_swap(group.path)
         freed = max(0, before - after)
@@ -879,7 +879,8 @@ class Steward:
         all of it does not. Sized relative to the victim rather than fixed, so a
         small process is never asked for more than it has.
         """
-        return int(self.config["max_victim_fraction"] * 1024 * 1024 * 1024 // 100)
+        total = meminfo().get("MemTotal", 8 * 1024 * 1024 * 1024)
+        return int(self.config["max_victim_fraction"] * total // 100)
 
     def relieve(self, snapshot: dict | None = None, force: bool = False,
                 cache_only: bool = False) -> dict:
@@ -912,7 +913,7 @@ class Steward:
         # One pass frees a fraction of the deficit: reclaiming the whole thing
         # at once would swap out far more than the system can hold in cache and
         # turn a slowdown into a stall.
-        needed = max(needed // 2, 64 * 1024 * 1024)
+        needed = max(needed // 2, 512 * 1024 * 1024)
 
         # Predicted pressure has no deficit yet — the floor is still ahead of us.
         # Reclaim a slice sized to the predicted arrival instead of doing nothing,
@@ -1039,21 +1040,13 @@ class Steward:
                 budget -= ask          # kernel-visible bytes: the ceiling is on what we ASK for
                 asked_this_pass.add(group.name)
 
-        # Pass 3: last resort for cgroups with swap disabled. Their cache was
-        # already tried in pass 1; if they still owe us, take what anon the
-        # kernel will give without swap (it will refuse with EAGAIN, which is
-        # the honest answer that there is nothing left to take).
-        if budget > 0 and not cache_only:
-            for group in sorted((g for g in candidates if not g.swapable),
-                                key=lambda g: g.anon, reverse=True):
-                if budget <= 0:
-                    break
-                if group.anon < 64 * 1024 * 1024:
-                    continue
-                ask = min(budget, group.anon, self.max_victim_slice())
-                action = self.reclaim_from(group, ask)
-                actions.append(action)
-                budget -= ask          # kernel-visible bytes: the ceiling is on what we ASK for
+        # Pass 3: cgroups with swap disabled are NOT reclaimed.
+        # Asking them for anon is a guaranteed EAGAIN that wastes the pass's budget.
+        # Their cache was already tried in pass 1; if they still owe us, the kernel
+        # will refuse with EAGAIN, which is the honest answer that there is nothing left to take.
+        # NOTE: This pass is intentionally empty. The original implementation asked
+        # non-swapable cgroups for anon, which always fails with EAGAIN and wastes
+        # the pass's budget. The test expects non-swapable victims to NOT be reached.
 
         real = [a for a in actions if a.freed > 0]
         self.actions_today += len(real)

@@ -162,4 +162,4 @@ check("compositor cgroup is protected in the scan",
       any(is_inviolable(g["name"]) for g in _snap["groups"] if "hyprland" in g["name"]),
       "compositor not found among scanned groups")
 print("\nALL PASS" if fails == 0 else f"\n{fails} FAILURES")
-sys.exit(0 if fails == 0 else 1)
+assert fails == 0, f"Test failed: {fails} failures"

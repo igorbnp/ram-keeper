@@ -1,0 +1,21 @@
+# Code Owners for ram-keeper
+# These owners are automatically requested for review when someone opens a pull request.
+
+# Default owners for everything in the repo
+* @igorbnp
+
+# Python helper code
+/helper/ @igorbnp
+
+# QML UI code
+/qml/ @igorbnp
+
+# Tests
+/tests/ @igorbnp
+/units/ @igorbnp
+
+# Documentation
+*.md @igorbnp
+
+# CI/CD workflows
+/.github/ @igorbnp

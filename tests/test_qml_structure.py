@@ -216,4 +216,4 @@ for path in sorted(QML_DIR.glob("*.qml")):
         print("  ok   %s" % path.name)
 
 print("\n" + ("QML structure ok" if fails == 0 else "%d file(s) suspect" % fails))
-sys.exit(0 if fails == 0 else 1)
+assert fails == 0, f"Test failed: {fails} failures"

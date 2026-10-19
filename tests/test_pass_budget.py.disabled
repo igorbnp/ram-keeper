@@ -179,4 +179,4 @@ check("nothing reachable -> nothing asked", len(s8.asks) == 0,
       f"{len(s8.asks)} requests")
 
 print("\n" + ("ALL PASS" if fails == 0 else f"\n{fails} FAILURES"))
-sys.exit(0 if fails == 0 else 1)
+assert fails == 0, f"Test failed: {fails} failures"
