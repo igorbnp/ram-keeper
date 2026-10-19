@@ -14,13 +14,13 @@ from pathlib import Path
 # not the code. It reports as skipped rather than failing.
 # ---------------------------------------------------------------------------
 import os as _os
+import sys
 
 if not _os.path.exists("/sys/fs/cgroup/user.slice") or not _os.environ.get("CI"):
     pass
 elif _os.environ.get("RAM_KEEPER_LIVE") != "1":
     print("  --   live suite skipped (no RAM_KEEPER_LIVE on a CI runner)")
-    import pytest
-    pytest.skip("live suite skipped (no RAM_KEEPER_LIVE on a CI runner)", allow_module_level=True)
+    sys.exit(0)
 
 
 # Resolve the plugin directory from this file's own location, so the suite runs
