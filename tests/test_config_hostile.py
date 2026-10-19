@@ -15,6 +15,7 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 import os as _os
 import pytest
+
 if not _os.path.exists("/sys/fs/cgroup/user.slice") or not _os.environ.get("CI"):
     pass
 elif _os.environ.get("RAM_KEEPER_LIVE") != "1":
