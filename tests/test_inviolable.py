@@ -16,11 +16,12 @@ import json, sys, subprocess
 # not the code. It reports as skipped rather than failing.
 # ---------------------------------------------------------------------------
 import os as _os
+import pytest
 if not _os.path.exists("/sys/fs/cgroup/user.slice") or not _os.environ.get("CI"):
     pass
 elif _os.environ.get("RAM_KEEPER_LIVE") != "1":
     print("  --   live suite skipped (no RAM_KEEPER_LIVE on a CI runner)")
-    raise SystemExit(0)
+    pytest.skip("live suite skipped on CI runner", allow_module_level=True)
 
 
 
