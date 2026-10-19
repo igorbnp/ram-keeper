@@ -16,7 +16,7 @@ import json, sys, subprocess
 # not the code. It reports as skipped rather than failing.
 # ---------------------------------------------------------------------------
 import os as _os
-import pytest
+import sys
 if not _os.path.exists("/sys/fs/cgroup/user.slice") or not _os.environ.get("CI"):
     pass
 elif _os.environ.get("RAM_KEEPER_LIVE") != "1":
