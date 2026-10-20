@@ -60,6 +60,12 @@ jobs:
       - name: installer renders hostile paths
         run: bash tests/test_hostile_install_path.sh
 
+      - name: installer starts an inactive service
+        run: bash tests/test_installer_inactive_start.sh
+
+      - name: request sizing and safe OOM-test mode
+        run: python3 tests/test_no_oom_kill.py
+
   skipped-here:
     name: what this runner cannot verify
     runs-on: ubuntu-latest
@@ -74,7 +80,7 @@ jobs:
             test_config_hostile.py              against real cgroup accounting
             test_inviolable.py                  compositor shield, live scan
             test_resilience.py                  victims, restarts, crashes
-            test_no_oom_kill.py                sustained load; nothing is killed
+            the live half of test_no_oom_kill.py 4.8 GB stress (opt-in only)
 
           Requirements: cgroup v2 with a writable memory.reclaim inside a user
           slice, zram, and a live session that must survive the test. Run them

@@ -735,7 +735,7 @@ class Steward:
         # aggressive response available.
         raw_total = info.get("MemTotal", 0)
         raw_available = info.get("MemAvailable", 0)
-        readings_valid = raw_total > 0 and raw_available > 0
+        readings_valid = raw_total > 0 and "MemAvailable" in info and raw_available >= 0
 
         total = raw_total or 1
         available = raw_available if readings_valid else 0
@@ -863,24 +863,25 @@ class Steward:
             pass
         return 3.0
 
-    def max_victim_slice(self) -> int:
-        """The most the daemon will ever ask of ONE cgroup in ONE pass.
+    def max_victim_slice(self, victim_bytes: int | None = None) -> int:
+        """Return the configured fraction of one victim's current memory.
 
-        This cap exists because of a measured failure, not a hypothetical one.
-        Under sustained load the anon pass computed a 1.5 GB ask for a single
-        Chromium cgroup holding ~300 MB. The kernel honoured it as far as it
-        could, but that emptied the process: it ended up with almost no resident
-        pages, faulted hard, and `systemd-oomd` killed it. Reclaim meant to save
-        the machine had become the thing that killed an app.
-
-        The fix is to be a small, predictable fraction of what the victim
-        actually holds. Several passes over several seconds take 500 MB out of a
-        2 GB process without ever leaving it unable to run; one pass asking for
-        all of it does not. Sized relative to the victim rather than fixed, so a
-        small process is never asked for more than it has.
+        Pass the cgroup's ``current`` bytes for every reclaim request. With no
+        argument, return the system-wide equivalent as a planning ceiling only.
+        A measured regression showed why this must be victim-relative: a 1.5 GB
+        request against a Chromium cgroup holding ~300 MB emptied the process,
+        which then faulted hard and was killed by systemd-oomd. The per-victim
+        cap spreads pressure across passes instead of draining one app at once.
         """
-        total = meminfo().get("MemTotal", 8 * 1024 * 1024 * 1024)
-        return int(self.config["max_victim_fraction"] * total // 100)
+        try:
+            if victim_bytes is None:
+                victim_bytes = int(meminfo().get(
+                    "MemTotal", 8 * 1024 * 1024 * 1024) or 0)
+            size = max(0, int(victim_bytes))
+            fraction = max(0.0, min(100.0, float(self.config["max_victim_fraction"])))
+        except (TypeError, ValueError, OverflowError):
+            return 0
+        return int(fraction * size // 100)
 
     def relieve(self, snapshot: dict | None = None, force: bool = False,
                 cache_only: bool = False) -> dict:
@@ -935,9 +936,9 @@ class Steward:
             # which is exactly backwards. Inside a ten-minute horizon take a
             # third of the gap; beyond that, pre-empt only a little.
             horizon = float(forecast.get("horizon_seconds") or 0)
-            # A pre-emptive pass is a precaution, not a rescue: it is bounded by
-            # the per-victim slice like everything else, so a healthy machine can
-            # never be drained more than one slice in a single pass.
+            # The forecast pass has a small machine-wide planning ceiling;
+            # each actual cgroup request is separately capped to that victim's
+            # configured fraction of its current memory below.
             headroom = self.max_victim_slice()
             slice_of_gap = gap // 3 if horizon < 600 else min(gap // 3, headroom // 2)
             needed = max(min(slice_of_gap, headroom), 64 * 1024 * 1024)
@@ -1011,7 +1012,7 @@ class Steward:
                 # documented ceiling from one cgroup in one pass.
                 if group.name in asked_this_pass:
                     continue
-                ask = min(budget, group.reclaimable, self.max_victim_slice())
+                ask = min(budget, group.reclaimable, self.max_victim_slice(group.current))
                 action = self.reclaim_from(group, ask)
                 actions.append(action)
                 budget -= ask      # kernel-visible bytes: the ceiling is what we ASK for
@@ -1034,7 +1035,7 @@ class Steward:
                     continue
                 if group.name in asked_this_pass:
                     continue
-                ask = min(budget, group.anon, self.max_victim_slice())
+                ask = min(budget, group.anon, self.max_victim_slice(group.current))
                 action = self.reclaim_from(group, ask)
                 actions.append(action)
                 budget -= ask          # kernel-visible bytes: the ceiling is on what we ASK for

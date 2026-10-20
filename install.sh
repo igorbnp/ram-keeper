@@ -159,15 +159,14 @@ fi
 # --------------------------------------------------------------------------
 
 systemctl --user daemon-reload
-# try-restart, NOT `enable --now`. `enable --now` only STARTS a unit that is
-# inactive; on a unit that is already running it is a no-op, so every code fix
-# after the first install would leave the OLD daemon resident — the file on
-# disk changes, the running process does not, and the user is protected by
-# code that no longer exists. That failure is invisible: the unit is active,
-# the installer reports success, and the bug being fixed stays fixed nowhere.
+# `enable --now` only STARTS a unit that is inactive; on a unit that is already
+# running it is a no-op, so every code fix after the first install would leave
+# the OLD daemon resident. `restart` is required: it reloads changed code when
+# active AND starts the service on a fresh install. Fall back to `start` if the
+# restart fails for a transient reason.
 systemctl --user enable ram-keeper.service >/dev/null 2>&1 \
   || die "could not enable ram-keeper.service"
-systemctl --user try-restart ram-keeper.service >/dev/null 2>&1 \
+systemctl --user restart ram-keeper.service >/dev/null 2>&1 \
   || systemctl --user start ram-keeper.service
 
 sleep 2

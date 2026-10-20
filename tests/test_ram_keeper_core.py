@@ -729,6 +729,18 @@ class TestSnapshot:
                         result = s.snapshot()
         assert result["state"] == "unknown"
 
+    def test_zero_available_is_valid_critical_memory_not_unknown(self):
+        """A genuine zero-availability reading must trigger emergency state."""
+        s = rk.Steward()
+        with patch("ram_keeper.meminfo", return_value={"MemTotal": 8026562560, "MemAvailable": 0, "Cached": 0}):
+            with patch("ram_keeper.psi", return_value={"some_avg10": 0, "some_avg60": 0, "some_avg300": 0, "full_avg10": 0, "full_avg60": 0, "full_avg300": 0}):
+                with patch("ram_keeper.zram_stats", return_value={"devices": [], "used": 0, "size": 0}):
+                    with patch("ram_keeper.user_root", return_value=Path("/nonexistent")):
+                        result = s.snapshot()
+        assert result["state"] == "critical"
+        assert result["free_percent"] == 0.0
+        assert result["mem_available"] == 0
+
     def test_state_stalling_when_high_psi(self):
         """Should report 'stalling' when PSI is high but free memory is OK."""
         s = rk.Steward()

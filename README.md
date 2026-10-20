@@ -303,8 +303,10 @@ one that names them.
   individual reclaim had reported `outcome: ok`. Reclaim is now capped at a
   fraction of each victim and at a fraction of what is actually reclaimable per
   pass, so pressure is relieved over several small passes instead of one
-  destructive one. This is the single most important limit in the code, and it
-  exists because guessing at it was not good enough.
+  destructive one. Each individual request uses that cgroup's current memory,
+  not total machine RAM; the system-wide fraction is only a planning ceiling.
+  This is the single most important limit in the code, and it exists because
+  guessing at it was not good enough.
 
 ## What the tests actually proved
 
