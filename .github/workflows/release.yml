@@ -15,25 +15,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-          cache: "pip"
-
-      - name: Install dependencies
+      - name: Verify tag and manifest agree
         run: |
-          python -m pip install --upgrade pip
-          pip install build
+          tag="${GITHUB_REF_NAME#v}"
+          ver=$(python3 -c "import json;print(json.load(open('manifest.json'))['version'])")
+          echo "tag=$tag manifest=$ver"
+          [ "$tag" = "$ver" ] || { echo "::error::tag $tag does not match manifest version $ver"; exit 1; }
 
-      - name: Build package
-        run: python -m build
+      - name: Build the source archives
+        run: |
+          name="ram-keeper-${GITHUB_REF_NAME}"
+          git archive --format=tar.gz --prefix="${name}/" -o "${name}.tar.gz" HEAD
+          git archive --format=zip    --prefix="${name}/" -o "${name}.zip" HEAD
+          sha256sum "${name}.tar.gz" "${name}.zip" > SHA256SUMS
+          ls -l "${name}".* SHA256SUMS
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            dist/*
+            ram-keeper-*.tar.gz
+            ram-keeper-*.zip
+            SHA256SUMS
           generate_release_notes: true
           draft: false
           prerelease: false

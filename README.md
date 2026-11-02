@@ -198,6 +198,14 @@ own preconditions (cgroup v2, zram, swap priority, `systemd-oomd` active),
 installs the units, restarts the daemon so new code actually runs, and proves
 it can read your memory state before reporting success.
 
+### Versions and releases
+
+`manifest.json` carries the plugin version, and a release tag must match it
+(`v1.1.0` ↔ `1.1.0`) — the release workflow refuses to publish when they disagree.
+A release is a source snapshot: `.tar.gz`, `.zip` and `SHA256SUMS`. The installer
+never downloads anything, so the number that tells you whether your checkout is
+current is the manifest version, which is what `omarchy plugin update` reads.
+
 ## Remove
 
 ```bash
