@@ -32,8 +32,13 @@ MemoryMax=384M
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=read-only
-ReadOnlyPaths=%h/.config/ram-keeper
-ReadWritePaths=%h/.local/state/ram-keeper
+# A leading `-` is not decoration. Measured on this machine: a ReadWritePaths
+# target that does not exist fails the unit with 226/NAMESPACE before ExecStart
+# ever runs, and ReadOnlyPaths fails the same way with ProtectSystem=strict or
+# when both are missing. The config is optional and the state directory can be
+# deleted; neither should turn protection into a permanent restart loop.
+ReadOnlyPaths=-%h/.config/ram-keeper
+ReadWritePaths=-%h/.local/state/ram-keeper
 PrivateTmp=yes
 RestrictSUIDSGID=yes
 RestrictRealtime=yes

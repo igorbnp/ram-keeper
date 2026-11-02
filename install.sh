@@ -59,44 +59,16 @@ mkdir -p "$STATE_DIR" "$STATE_DIR/flags" "$HOME/.config/systemd/user"
 # the id (which the marketplace requires to be namespaced) — a hardcoded path
 # breaks the moment either changes.
 render_unit() {
-  # Render the template with `envsubst`-style expansion done by PYTHON, not sed
-  # and not bash parameter substitution.
-  #
-  # Both naive approaches are wrong on real home directories:
-  #   sed "s|@PLUGIN_DIR@|$PLUGIN_DIR|g" — a path containing `|` is parsed as
-  #     more sed options. It failed, and because the redirect had already
-  #     truncated the destination, left an EMPTY unit file: a daemon that never
-  #     starts, with no error shown.
-  #   "${content//@PLUGIN_DIR@/$PLUGIN_DIR}" — `&` is special in the PATTERN
-  #     (it matches the matched text), so a directory named "sub dir&x" expands
-  #     the placeholder to itself and the placeholder survives into the unit.
-  # Python's str.replace is literal in both the needle and the haystack, so no
-  # character in the path can mean anything.
+  # One implementation, in helper/render_unit.py, also used by the hostile-path
+  # test. `sed` broke on a path containing `|` (and left an empty unit behind
+  # because the redirect had already truncated it); bash's ${var//pat/rep}
+  # treated `&` as the matched text. Python's string ops are literal, and the
+  # renderer writes to a temp file then renames, so a failure cannot leave a
+  # truncated unit for systemd to load.
   local src="$1" dst="$2"
-  "$PYTHON" - "$src" "$dst" "$PLUGIN_DIR" "$PYTHON_OVERRIDE" <<'PYEOF'
-import re
-import sys
-src, dst, plugin_dir, python = sys.argv[1:5]
-with open(src, encoding="utf-8") as handle:
-    content = handle.read()
-# systemd splits ExecStart on whitespace and honours double quotes only when
-# they wrap a WHOLE argument. Quote each argument that CONTAINS the placeholder
-# together with the subpath that follows it in the template, because the
-# template appends "/helper/..." after the placeholder.
-rendered = re.sub(r'@PLUGIN_DIR@(\S*)',
-                  lambda m: ('"%s%s"' % (plugin_dir, m.group(1))) if " " in plugin_dir
-                  else plugin_dir + m.group(1),
-                  content)
-rendered = rendered.replace("/usr/bin/python3", python)
-if not rendered.strip():
-    sys.exit(f"rendered unit is empty: {dst}")
-if "@PLUGIN_DIR@" in rendered:
-    sys.exit(f"template placeholder survived in {dst}")
-
-with open(dst, "w", encoding="utf-8") as handle:
-    handle.write(rendered)
-PYEOF
-  [[ $? -eq 0 ]] || die "could not render $src"
+  "$PYTHON" "$PLUGIN_DIR/helper/render_unit.py" \
+      "$src" "$dst" "$PLUGIN_DIR" "$PYTHON_OVERRIDE" \
+    || die "could not render $src (see the error above)"
   [[ -s "$dst" ]] || die "rendered unit is empty: $dst"
 }
 

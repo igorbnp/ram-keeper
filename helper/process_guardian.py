@@ -1,15 +1,10 @@
 #!/usr/bin/env python3
-"""process_guardian — watches for new processes and decides protection.
+"""Experimental process-discovery helpers; not active in the production daemon.
 
-A background daemon cannot know every app the user runs. This module:
-  * detects processes that appeared since the last scan
-  * looks up their human-readable description (from .desktop files or unit metadata)
-  * decides whether they should be protected from reclamation
-
-The decision is conservative: unknown processes are NOT protected by default.
-Only processes explicitly marked as important (compositor, shell, user's own
-critical apps) get protection. The user can add to the protected list via
-config, but the guardian never auto-protects a process it doesn't recognize.
+The daemon and QML panel do not import or call this module. It provides isolated
+functions for a possible future Process Guardian, but new-process notifications
+and dynamic user protection are not currently part of the running plugin. The
+production daemon uses its config plus the built-in inviolable cgroups.
 """
 
 from __future__ import annotations

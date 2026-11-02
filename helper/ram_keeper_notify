@@ -27,10 +27,22 @@ readonly FLAG_DIR="$STATE_DIR/flags"
 readonly LOG="$STATE_DIR/log.jsonl"
 readonly PIDFILE="$STATE_DIR/notify.pid"
 readonly DEDUPE_SECONDS=${RAM_KEEPER_DEDUPE_SECONDS:-1800}
+# Poll intervals, overridable so the test suite can exercise a transition in
+# seconds instead of waiting 15 and 30 of them.
+readonly DAEMON_POLL=${RAM_KEEPER_DAEMON_POLL:-15}
+readonly PRESSURE_POLL=${RAM_KEEPER_PRESSURE_POLL:-30}
 readonly UNIT=ram-keeper.service
 
-# Resolved at click time, not at install time: a Hermes profile switch or a
-# skill reinstall must not leave the notifier pointing at a stale path.
+# python3 is already a hard dependency of this plugin (the daemon is written in
+# it), so parse the snapshot with it instead of adding a jq dependency. A
+# missing jq used to make watch_pressure read state="" forever: a watcher that
+# is dead code but looks alive.
+PYTHON3="${RAM_KEEPER_PYTHON:-/usr/bin/python3}"
+[[ -x "$PYTHON3" ]] || PYTHON3="$(command -v python3 2>/dev/null || true)"
+
+# The skill path is resolved at click time, not install time: a Hermes profile
+# switch or a skill reinstall must not leave the notifier pointing at a stale
+# path.
 skill_path() {
   local found
   for root in "${HERMES_HOME:-$HOME/.hermes}"; do
@@ -145,7 +157,7 @@ watch_daemon() {
           'systemctl --user restart ram-keeper.service; omarchy-shell io.github.igorbnp.ram-keeper refresh'
       fi
     fi
-    sleep 15
+    sleep "$DAEMON_POLL"
   done
 }
 
@@ -195,15 +207,35 @@ watch_oom_kills() {
 # ---------------------------------------------------------------------------
 # 3. Memory critical and staying there
 # ---------------------------------------------------------------------------
+
+# Read one snapshot without jq. Prints state<TAB>free_percent, or fails.
+snapshot_fields() {
+  [[ -n "$PYTHON3" ]] || return 1
+  printf '%s' "$1" | "$PYTHON3" -c 'import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    raise SystemExit(1)
+if not isinstance(d, dict):
+    raise SystemExit(1)
+print("%s\t%s" % (d.get("state") or "unknown",
+                  "?" if d.get("free_percent") is None else d["free_percent"]))' 2>/dev/null
+}
+
 watch_pressure() {
   local last_state=""
   while true; do
-    [[ -f "$STATE_DIR/state.json" ]] || { sleep 30; continue; }
+    [[ -f "$STATE_DIR/state.json" ]] || { sleep "$PRESSURE_POLL"; continue; }
 
-    local snapshot state free
+    local snapshot state free fields
     snapshot="$(cat "$STATE_DIR/state.json" 2>/dev/null)"
-    state="$(printf '%s' "$snapshot" | jq -r '.state // "unknown"' 2>/dev/null)"
-    free="$(printf '%s' "$snapshot" | jq -r '.free_percent // "?"' 2>/dev/null)"
+    if ! fields="$(snapshot_fields "$snapshot")" || [[ -z "$fields" ]]; then
+      # A partial write or a corrupt file is not "critical". Say nothing.
+      sleep "$PRESSURE_POLL"
+      continue
+    fi
+    state="${fields%%$'\t'*}"
+    free="${fields#*$'\t'}"
 
     # Only on the transition INTO critical, not every poll while critical. A
     # single dip is normal and self-correcting; the daemon handles it silently,
@@ -217,26 +249,58 @@ watch_pressure() {
         "$(agent_action "RAM Keeper reported critical memory pressure: only ${free}% of RAM free. Use the ram-memory-diagnosis skill to explain what is using the memory and whether anything needs to change.")"
     fi
     last_state="$state"
-    sleep 30
+    sleep "$PRESSURE_POLL"
   done
 }
 
 # ---------------------------------------------------------------------------
+# Supervision
+# ---------------------------------------------------------------------------
+#
+# `wait` on three background jobs does not restart a dead one: if journalctl
+# exits (journal rotation, a cgroup OOM kill of the pipeline, a broken pipe),
+# the OOM watcher is gone forever while the unit stays "active" and the user
+# believes alerts are on. Each watcher therefore restarts itself, and says so
+# in the log, which makes the failure visible instead of silent.
+supervise() {
+  local name="$1"; shift
+  while true; do
+    "$@"
+    log_event "watcher-exited:$name"
+    sleep 5
+  done
+}
+
+# A PID file proves nothing: `kill -0` tests that the PID EXISTS. A notifier
+# killed by SIGKILL leaves the file behind, the PID is later recycled by an
+# unrelated process, and this script then refuses to start forever — the unit
+# looks active, every alert is silently off, and nothing is logged. Verify the
+# process identity from /proc.
+pid_is_this_script() {
+  local pid="$1"
+  [[ -n "$pid" && "$pid" =~ ^[0-9]+$ ]] || return 1
+  [[ -r "/proc/$pid/cmdline" ]] || return 1
+  tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | grep -q 'ram_keeper_notify'
+}
 
 main() {
   # Single instance: three of these looping would triple every notification.
-  if [[ -f "$PIDFILE" ]] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; then
-    exit 0
+  if [[ -f "$PIDFILE" ]]; then
+    if pid_is_this_script "$(cat "$PIDFILE" 2>/dev/null)"; then
+      exit 0
+    fi
+    log_event "stale-pidfile"
   fi
   echo $$ >"$PIDFILE"
   trap 'rm -f "$PIDFILE"' EXIT
 
   # Nothing to say until a notification path exists.
   command -v omarchy-notification-send >/dev/null || exit 0
+  [[ -n "$PYTHON3" ]] || log_event "no-python3"
 
-  watch_daemon &
-  watch_pressure &
-  watch_oom_kills &
+  supervise daemon watch_daemon &
+  supervise pressure watch_pressure &
+  supervise oom watch_oom_kills &
   wait
 }
 

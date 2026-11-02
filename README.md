@@ -222,11 +222,13 @@ Click the bar widget (or `omarchy-shell shell toggle ram-keeper`). It shows:
 - **Headline** — `Healthy · 42% free`, with the state as the first word.
 - **Memory bar** — one strip split into Apps / Cache / Free, because reading
   proportions off one bar is faster than reading three numbers. The split sums
-  exactly to `MemTotal`.
+  exactly to `MemTotal`; if the cache breakdown is unavailable, the panel says
+  so instead of inventing a split.
 - **Free memory now** — act once, on demand.
 - **Drop cache** — the manual version of the cheap pass.
 - **Memory stall** — the PSI number, which is the honest answer to "is this
-  machine actually struggling". `None` means genuinely none.
+  machine actually struggling". `None` means a valid zero-pressure reading;
+  `Unavailable` means the kernel could not provide a readable PSI signal.
 - **Swap rows** — disk swap and zram listed separately, and zram is explicitly
   *not* flagged red when it's full, because a full zram is compressed RAM, not
   a performance cliff.
@@ -270,6 +272,10 @@ one that names them.
   on all kernels — on the kernel this was developed against (7.2.5) every
   cgroup reports a bare `"1"`. Victims are scored by `memory.current` and
   `memory.stat` instead. Only the global `/proc/pressure/memory` is read.
+- **Process Guardian is not active in the production daemon.** The helper file
+  is experimental and unwired: it does not discover or dynamically protect new
+  processes at runtime. Protection currently comes from configured names and
+  the built-in inviolable cgroups; helper tests do not prove daemon integration.
 - **Reclaim cannot help if zram *and* disk swap are both full.** At that point
   the only remaining lever is killing a process, which this tool deliberately
   leaves to `systemd-oomd`. You will get a critical toast instead of a silent
@@ -317,6 +323,7 @@ one that names them.
 | The desktop survives | 3.2 GB of extra load for 4 min unattended: worst case 21% free, 0.8% stall, zero OOM kills, Hyprland/quickshell/Hermes all alive |
 | The compositor is unreachable | `"protected": []`, `"protected": ["my-app"]`, and an explicit unprotect all leave it protected — verified by enumeration, not by reading the code |
 | A bad config cannot hurt you | 25 hostile configs (wrong types, `NaN`, `Infinity`, inverted thresholds, truncated JSON, non-list) all degrade to a working daemon |
+| Incomplete memory or PSI data is never shown as a real zero | Regression tests cover missing `MemTotal`/`Cached`, unavailable PSI, null UI values, stale-forecast suppression, and forced reclaim refusal |
 | Nothing is killed | 0 OOM kills under sustained load, after the per-victim cap was added in response to a kill it *did* cause (see Known limitations) |
 
 ## Operational notes

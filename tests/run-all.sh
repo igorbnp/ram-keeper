@@ -61,6 +61,36 @@ fi
 run "pass budget"        /usr/bin/python3 test_pass_budget.py
 
 echo
+echo "notifier (real script, stub binaries, throwaway HOME):"
+run "notifier e2e"       bash test_notifier_e2e.sh
+
+echo
+echo "unit-test suites (pytest):"
+# These are the biggest suites in the repo and they were previously not part of
+# this runner at all — `run-all.sh` reported "all suites passed" while 200+
+# tests in test_ram_keeper_core.py, test_integration.py and the rest had never
+# been executed. pytest is an optional tool on a desktop, so report SKIP with
+# the one command that fixes it rather than pretending to pass.
+PYTEST_PY=""
+for candidate in /usr/bin/python3 python3; do
+  if command -v "$candidate" >/dev/null 2>&1 \
+     && "$candidate" -c 'import pytest' >/dev/null 2>&1; then
+    PYTEST_PY="$candidate"
+    break
+  fi
+done
+if [[ -n "$PYTEST_PY" ]]; then
+  run "pytest (core, policy, attacks)" bash -c \
+    "cd '$PWD' && '$PYTEST_PY' -m pytest -q -p no:cacheprovider \
+      test_ram_keeper_core.py test_integration.py test_process_guardian.py \
+      test_bugfixes.py test_reclaim_policy.py test_config_attacks.py \
+      test_unit_hardening.py"
+else
+  echo "  --   SKIP: pytest not installed for this python."
+  echo "       install with: python3 -m pip install --user pytest   (see requirements.txt)"
+fi
+
+echo
 if (( fails == 0 )); then
   echo "all suites passed"
 else

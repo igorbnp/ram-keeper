@@ -141,7 +141,9 @@ check("reads real psi", psi && psi.stallPercent >= 0);
 check("zero psi is ok severity", M.psiRow({ some_avg60: 0, full_avg60: 0 }).severity === "ok");
 check("25% stall is critical", M.psiRow({ some_avg60: 25, full_avg60: 0 }).severity === "critical");
 check("10% stall is warning", M.psiRow({ some_avg60: 10, full_avg60: 0 }).severity === "warning");
-check("null psi is safe", M.psiRow(null).severity === "ok");
+check("null psi is explicitly unavailable", M.psiRow(null).severity === "unavailable");
+check("missing psi average is unavailable", M.psiRow({}).severity === "unavailable");
+check("unavailable psi label", M.psiLabel(M.psiRow(null)) === "Unavailable");
 check("label for none", M.psiLabel({ stallPercent: 0, severity: "ok" }) === "None");
 
 console.log("\n== gauges ==");
@@ -200,6 +202,88 @@ check("action result reports freed and swapped",
     === "freed 1.00 GB · moved 512 MB to zram",
   M.summaryLine({ acted: true, freed: 1073741824, swapped_out: 536870912 }));
 check("null result is safe", M.summaryLine(null) === "");
+
+
+console.log("\n== candidates are ordered by what we would actually recover ==");
+// "AVAILABLE TO RECLAIM" used to sort by total size, so a 2 GB process holding
+// 150 MB of giveable memory was listed above a 500 MB process that could give
+// 500 MB — the panel led with the process that matters least.
+const MB = 1024 * 1024;
+const orderSnap = {
+  mem_total: 8000 * MB, groups: [
+    { name: "app-big-idle-1.scope", label: "big-idle", current: 2000 * MB,
+      anon: 100 * MB, reclaimable: 50 * MB, protected: false, swapable: true },
+    { name: "app-small-hungry-1.scope", label: "small-hungry", current: 500 * MB,
+      anon: 400 * MB, reclaimable: 100 * MB, protected: false, swapable: true }
+  ]
+};
+const ordered = M.reclaimableGroups(orderSnap, 8);
+check("the hungrier process leads, not the biggest one",
+  ordered.length === 2 && ordered[0].key === "app-small-hungry-1.scope",
+  ordered.map(function (r) { return r.key + "=" + r.give; }).join(", "));
+
+console.log("\n== hostile snapshots must never throw ==");
+// A deterministic LCG: the same failures must be reproducible.
+let seed = 1234567;
+function rand() { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648; }
+const weird = [null, undefined, "", "x", 0, -1, 1e308, NaN, Infinity, [], {}, true,
+               [{ name: null }], { groups: null }, { groups: [{}] },
+               { mem_total: 0, groups: [] }, { mem_total: "large" },
+               { mem_total: 8000, anon_and_kernel: -5, cached: 1e9 },
+               { mem_total: 8000, anon_and_kernel: "NaN", cached: null }];
+let thrown = null;
+try {
+  for (let i = 0; i < 500; i++) {
+    const s = (i < weird.length) ? weird[i] : {
+      mem_total: rand() * 1e10,
+      mem_used: rand() * 1e10,
+      anon_and_kernel: rand() * 1e10 - 5e9,
+      cached: rand() * 1e10,
+      free_percent: rand() * 200 - 50,
+      memory_breakdown_valid: rand() > 0.5,
+      memory_reading_valid: rand() > 0.5,
+      state: ["ok", "tight", "critical", "trending", "unknown", "bogus"][Math.floor(rand() * 6)],
+      forecast: { urgency: ["none", "eventual", "soon", "imminent"][Math.floor(rand() * 4)],
+                  horizon_seconds: rand() * 1e5, rate_bytes_per_sec: rand() * 1e7 - 5e6,
+                  confidence: rand(), will_cross: rand() > 0.5, culprit: rand() > 0.7 ? "X" : "" },
+      psi: { some_avg60: rand() * 100, full_avg60: rand() * 100, available: rand() > 0.2 },
+      zram: { devices: [{ name: "zram0", size: rand() * 1e10, used: rand() * 1e10 }] },
+      groups: [{ name: "g" + i, label: null, current: rand() * 1e10,
+                 anon: rand() * 1e10, reclaimable: rand() * 1e10,
+                 protected: rand() > 0.5, swapable: rand() > 0.5 }]
+    };
+    M.memorySegments(s); M.memoryPercentages(s); M.reclaimableGroups(s, 8);
+    M.protectedGroups(s, 4); M.swapRows(s); M.psiRow(s && s.psi);
+    M.psiLabel(M.psiRow(s && s.psi)); M.forecastRow(s && s.forecast);
+    M.forecastForSnapshot(s); M.freePercentLabel(s); M.freeFraction(s);
+    M.usedFraction(s); M.stateLabel(s && s.state); M.stateGlyph(s && s.state);
+    M.parseJsonLine(JSON.stringify(s || {})); M.formatBytes(s && s.mem_total);
+
+    // Invariants that a UI can rely on, whatever the input.
+    const segs = M.memorySegments(s);
+    if (!Array.isArray(segs)) throw new Error("memorySegments did not return an array");
+    segs.forEach(function (seg) {
+      if (!isFinite(seg.bytes) || seg.bytes < 0) throw new Error("segment " + seg.key + " invalid: " + seg.bytes);
+    });
+    const pcts = M.memoryPercentages(s);
+    pcts.forEach(function (seg) {
+      if (!isFinite(seg.fraction) || seg.fraction < 0 || seg.fraction > 1.001) {
+        throw new Error("fraction out of range: " + seg.key + "=" + seg.fraction);
+      }
+    });
+    const text = M.formatBytes(s && s.mem_total);
+    if (typeof text !== "string" || /NaN|undefined|Infinity/.test(text)) {
+      throw new Error("formatBytes produced " + text);
+    }
+  }
+} catch (e) { thrown = e; }
+check("500 hostile snapshots produce no exception", thrown === null, thrown && thrown.message);
+
+console.log("\n== percentages never overflow the bar ==");
+const over = M.memoryPercentages({ mem_total: 1000, mem_used: 2000,
+  anon_and_kernel: 1500, cached: 500, memory_breakdown_valid: true });
+const sum = over.reduce(function (a, s) { return a + s.fraction; }, 0);
+check("clamped total <= 1", sum <= 1.001, "sum=" + sum);
 
 console.log(failures === 0 ? "\nALL PASS" : `\n${failures} FAILURES`);
 process.exit(failures === 0 ? 0 : 1);

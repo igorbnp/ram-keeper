@@ -13,6 +13,17 @@ live status or copy its contents into a user's configuration.
 - Inspect the live system before recommending that a service be enabled,
   disabled, stopped, or protected.
 
+## Memory telemetry
+
+- `memory_reading_valid` requires a positive `MemTotal` and a present,
+  in-range `MemAvailable`. Invalid readings produce `state=unknown`, null
+  derived metrics, a cleared forecast, and no reclaim—even with a forced request.
+- `memory_breakdown_valid` additionally requires a valid `Cached` value. Free
+  percentage remains usable without it, but the Apps/Cache/Free split is null
+  and the panel hides the chart instead of treating missing cache as zero.
+- PSI carries an explicit `available` flag. An unreadable or malformed source is
+  not a real zero-pressure reading.
+
 ## Process Guardian status
 
 `helper/process_guardian.py` currently provides process-discovery and protection

@@ -1,113 +1,120 @@
 #!/usr/bin/env bash
-# Render the units through the installer's OWN substitution and check the
-# ExecStart line systemd will actually receive.
+# Render the units through the SHIPPED renderer and prove systemd accepts and
+# executes the result.
 #
-# An earlier version reimplemented the substitution here, in Python, and passed
-# while the shipped installer failed on a directory containing a space: the case
-# was never handed to systemd, so it looked covered and was not. Both parts now
-# run against the installer's logic — and the space case additionally gets a
-# throwaway systemd unit, because quoting rules live in systemd, not in us.
+# The earlier version of this file carried its own copy of the substitution, so
+# it passed while the installer failed on a directory containing a space. Both
+# now call helper/render_unit.py — the single implementation — and every case
+# ends in a real `systemctl --user start`, because the quoting rules live in
+# systemd, not in us.
 set -uo pipefail
 
 PLUGIN="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+RENDER="$PLUGIN/helper/render_unit.py"
 fails=0
 B="$(mktemp -d)"
-trap 'rm -rf "$B"' EXIT
+UNIT_DIR="$HOME/.config/systemd/user"
+trap 'rm -rf "$B"; rm -f "$UNIT_DIR"/rk-hostile-*.service; systemctl --user daemon-reload >/dev/null 2>&1' EXIT
 
-check() {
-  if [[ "$2" == "$3" ]]; then
-    echo "  ok   $1"
+ok()  { echo "  ok   $1"; }
+bad() { echo "  FAIL $1"; fails=$((fails + 1)); }
+
+render() {  # render <template> <dir> [python]
+  PLUGIN_DIR="$2" /usr/bin/python3 "$RENDER" --stdout "$1" "$2" "${3:-/usr/bin/python3}"
+}
+
+# Start a throwaway unit from one rendered ExecStart line and report the result.
+run_unit() {  # run_unit <label> <execstart-line>
+  local label="$1" line="$2" unit
+  unit="rk-hostile-$$-$RANDOM"
+  mkdir -p "$UNIT_DIR"
+  {
+    echo "[Unit]"
+    echo "Description=ram-keeper hostile path probe"
+    echo "[Service]"
+    echo "Type=oneshot"
+    echo "$line"
+  } >"$UNIT_DIR/$unit.service"
+  systemctl --user daemon-reload >/dev/null 2>&1
+  systemctl --user start "$unit.service" >/dev/null 2>&1
+  local result status
+  result="$(systemctl --user show "$unit.service" -p Result --value 2>/dev/null)"
+  status="$(systemctl --user show "$unit.service" -p ExecMainStatus --value 2>/dev/null)"
+  systemctl --user stop "$unit.service" >/dev/null 2>&1
+  systemctl --user reset-failed "$unit.service" >/dev/null 2>&1
+  rm -f "$UNIT_DIR/$unit.service"
+  if [[ "$result" == "success" && "$status" == "0" ]]; then
+    ok "$label"
   else
-    echo "  FAIL $1"
-    echo "         esperado: $3"
-    echo "         obtido:   $2"
-    fails=$((fails + 1))
+    bad "$label (Result=$result ExecMainStatus=$status)"
+    echo "         $line"
   fi
 }
 
-# The installer's render_unit, verbatim, emitting to stdout instead of a file.
-render() {
-  local src="$1" dir="$2"
-  PLUGIN_DIR="$dir" /usr/bin/python3 - "$src" "$dir" /usr/bin/python3 <<'PYEOF'
-import re, sys
-src, plugin_dir, python = sys.argv[1:4]
-content = open(src, encoding="utf-8").read()
-if not content.strip():
-    sys.exit("template is empty")
-rendered = re.sub(r"@PLUGIN_DIR@(\S*)",
-                  lambda m: ('"%s%s"' % (plugin_dir, m.group(1)))
-                  if " " in plugin_dir else plugin_dir + m.group(1),
-                  content)
-rendered = rendered.replace("/usr/bin/python3", python)
-if "@PLUGIN_DIR@" in rendered:
-    sys.exit("placeholder survived")
-sys.stdout.write(rendered)
-PYEOF
-}
+echo "── diretórios hostis: renderizar e EXECUTAR no systemd ──"
+# A ram-keeper copy is placed in each directory so --once runs the real helper.
+for dirname in 'plain' 'with space' 'with|pipe' 'with&amp' "with'quote" \
+               'with@at' 'with"double' 'with%percent' 'with$dollar' \
+               'with;semicolon' 'with#hash' 'with,comma' 'with=equals'; do
+  dir="$B/$dirname"
+  mkdir -p "$dir/helper"
+  cp "$PLUGIN/helper/ram_keeper.py" "$dir/helper/"
 
-echo "── ExecStart renderizado (o caminho inteiro entre aspas quando tem espaço) ──"
-for spec in "simples:plain" "com espaco:with space" "com pipe:with|pipe" \
-            "com amp:with&amp" "com aspas:with'q" "com arroba:with@at"; do
-  label="${spec%%:*}"; dir="$B/${spec#*:}"
-  mkdir -p "$dir"
   out="$(render "$PLUGIN/units/ram-keeper.service" "$dir" 2>&1)"
-  line="$(printf '%s\n' "$out" | grep '^ExecStart=' | head -1)"
+  if grep -q '@PLUGIN_DIR@' <<<"$out"; then
+    bad "$dirname — placeholder sobreviveu"; continue
+  fi
+  line="$(grep '^ExecStart=' <<<"$out" | head -1)"
   if [[ -z "$line" ]]; then
-    echo "  FAIL $label — nenhum ExecStart renderizado"
-    printf '%s\n' "$out" | sed 's/^/         /'
-    fails=$((fails + 1))
-    continue
+    bad "$dirname — sem ExecStart"; printf '%s\n' "$out" | sed 's/^/         /'; continue
   fi
-  if [[ "$dir" == *" "* ]]; then
-    want="ExecStart=/usr/bin/python3 \"$dir/helper/ram_keeper.py\" --daemon"
-  else
-    want="ExecStart=/usr/bin/python3 $dir/helper/ram_keeper.py --daemon"
-  fi
-  check "$label" "$line" "$want"
+  # The helper copies are identical; --once exits 0 only if it really ran.
+  run_unit "systemd executa: $dirname" "${line/--daemon/--once}"
 done
 
 echo
-echo "── o notifier recebe o mesmo tratamento ──"
-space="$B/notify sp"
-mkdir -p "$space"
-line="$(render "$PLUGIN/units/ram-keeper-notify.service.in" "$space" 2>&1 \
-        | grep '^ExecStart=' | head -1)"
-check "notifier com espaco" "$line" "ExecStart=\"$space/helper/ram_keeper_notify\""
-
-echo
-echo "── systemd de verdade executa um ExecStart com espaço ──"
-probe_dir="$B/rk sp"
-mkdir -p "$probe_dir/helper"
-cp "$PLUGIN/helper/ram_keeper.py" "$probe_dir/helper/"
-probe_line="$(render "$PLUGIN/units/ram-keeper.service" "$probe_dir" \
-              | grep '^ExecStart=' | head -1)"
-probe_line="${probe_line/--daemon/--once}"
-unit="rk-spacetest-$$"
-mkdir -p "$HOME/.config/systemd/user"
-{
-  echo "[Unit]"
-  echo "Description=ram-keeper space path probe"
-  echo "[Service]"
-  echo "Type=oneshot"
-  echo "$probe_line"
-} >"$HOME/.config/systemd/user/$unit.service"
-systemctl --user daemon-reload >/dev/null 2>&1
-systemctl --user start "$unit" >/dev/null 2>&1
-sleep 2
-result="$(systemctl --user show "$unit" -p Result --value 2>/dev/null)"
-status="$(systemctl --user show "$unit" -p ExecMainStatus --value 2>/dev/null)"
-systemctl --user stop "$unit" >/dev/null 2>&1
-rm -f "$HOME/.config/systemd/user/$unit.service"
-systemctl --user daemon-reload >/dev/null 2>&1
-if [[ "$result" == "success" && "$status" == "0" ]]; then
-  echo "  ok   systemd aceitou e executou"
+echo "── aspas: o argumento INTEIRO é citado, não só o diretório ──"
+space="$B/quote check"
+mkdir -p "$space/helper" && cp "$PLUGIN/helper/ram_keeper.py" "$space/helper/"
+line="$(render "$PLUGIN/units/ram-keeper.service" "$space" | grep '^ExecStart=' | head -1)"
+want="ExecStart=/usr/bin/python3 \"$space/helper/ram_keeper.py\" --daemon"
+if [[ "$line" == "$want" ]]; then
+  ok "caminho com espaço entre aspas por inteiro"
 else
-  echo "  FAIL systemd rejeitou (Result=$result ExecMainStatus=$status)"
-  echo "         $probe_line"
-  fails=$((fails + 1))
+  bad "aspas erradas"
+  echo "         esperado: $want"
+  echo "         obtido:   $line"
 fi
 
 echo
+echo "── o notifier recebe o mesmo tratamento ──"
+line="$(render "$PLUGIN/units/ram-keeper-notify.service.in" "$space" | grep '^ExecStart=' | head -1)"
+want="ExecStart=\"$space/helper/ram_keeper_notify\""
+if [[ "$line" == "$want" ]]; then
+  ok "notifier com espaço"
+else
+  bad "notifier com espaço"
+  echo "         esperado: $want"
+  echo "         obtido:   $line"
+fi
+
+echo
+echo "── um caminho que systemd NÃO consegue representar é recusado ──"
+newline_dir="$B/broken"$'\n'"path"
+mkdir -p "$newline_dir"
+if out="$(render "$PLUGIN/units/ram-keeper.service" "$newline_dir" 2>&1)"; then
+  bad "aceitou um caminho com newline (o unit file viraria duas linhas)"
+else
+  ok "recusou um caminho com newline"
+fi
+
+echo
+echo "── o instalador usa o MESMO renderizador ──"
+grep -q 'helper/render_unit.py' "$PLUGIN/install.sh" \
+  && ok "install.sh delega para render_unit.py" \
+  || bad "install.sh não usa o renderizador compartilhado"
+
+echo
 [[ "$fails" -eq 0 ]] && echo "todos os paths renderizam e executam" \
-                    || echo "$fails falha(s)"
+                     || echo "$fails falha(s)"
 exit "$fails"

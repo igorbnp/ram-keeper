@@ -28,6 +28,29 @@ check("no legend for unknown", M.memorySegments(unknownSnap).length === 0);
 check("no swap rows for unknown", M.swapRows(unknownSnap).length === 0);
 check("no victims for unknown", M.reclaimableGroups(unknownSnap).length === 0);
 
+const missingReading = { state: "unknown", memory_reading_valid: false, mem_total: null,
+                         mem_available: null, free_percent: null, groups: [], psi: {} };
+check("parse keeps a fresh unknown-reading snapshot", M.parseSnapshot(JSON.stringify(missingReading)) !== null);
+check("unavailable PSI is not reported as zero", M.psiLabel(M.psiRow({available: false})) === "Unavailable");
+check("unknown reading has no free percentage", M.freePercentLabel(missingReading) === "--%");
+const staleForecast = { urgency: "imminent", will_cross: true, horizon_seconds: 60,
+                        rate_bytes_per_sec: -1000000, confidence: 1, samples: 5 };
+check("unknown snapshot suppresses stale forecast",
+      typeof M.forecastForSnapshot === "function"
+        && M.forecastForSnapshot({ state: "unknown", memory_reading_valid: false,
+                                   forecast: staleForecast }) === null);
+check("valid snapshot retains its forecast",
+      typeof M.forecastForSnapshot === "function"
+        && M.forecastForSnapshot({ state: "ok", memory_reading_valid: true,
+                                   forecast: staleForecast }).urgency === "imminent");
+
+const missingBreakdown = { state: "ok", memory_reading_valid: true,
+                           memory_breakdown_valid: false, mem_total: 1000,
+                           mem_available: 300, mem_used: 700,
+                           cached: null, anon_and_kernel: null, groups: [] };
+check("no bar for unavailable memory breakdown", M.memoryPercentages(missingBreakdown).length === 0);
+check("no legend for unavailable memory breakdown", M.memorySegments(missingBreakdown).length === 0);
+
 // A healthy snapshot must still work (regression guard: the guard above must
 // not have broken the normal case).
 const healthy = { mem_total: 8026562560, mem_available: 3000000000,

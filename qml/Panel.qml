@@ -39,7 +39,7 @@ Panel {
   readonly property bool busy: !!(root.keeper && root.keeper.busy)
   readonly property bool daemonUp: !!(root.keeper && root.keeper.daemonUp)
   readonly property var forecast: root.loaded
-    ? Model.forecastRow(root.snap.forecast) : null
+    ? Model.forecastForSnapshot(root.snap) : null
 
   // True once the service object exists. Every control that calls into it must
   // gate on this, not on `!busy`: a null keeper makes `busy` false, so the busy
@@ -62,7 +62,7 @@ Panel {
     : (Model.isWarning(state) ? Qt.darker(root.accentColor, 1.25) : root.foreground)
 
   readonly property string glyph: Model.stateGlyph(state)
-  readonly property string percentText: loaded ? Math.round(snap.free_percent || 0) + "%" : "--"
+  readonly property string percentText: loaded ? Model.freePercentLabel(snap) : "--"
 
   // Free memory is the headline: the number the user actually cares about is
   // "how much room do I have", not "how much am I using".
@@ -103,7 +103,9 @@ Panel {
       ? root.percentText + " " + root.glyph
       : root.glyph
     tooltipText: root.loaded
-      ? Math.round(snap.free_percent || 0) + "% memory free — " + Model.stateLabel(root.state)
+      ? (Model.isUnknown(root.state)
+          ? "Memory reading unavailable"
+          : root.percentText + " memory free — " + Model.stateLabel(root.state))
       : "Measuring memory…"
     onPressed: function(b) {
       if (b === Qt.RightButton) root.togglePercent()
@@ -192,9 +194,22 @@ Panel {
           foreground: root.foreground
         }
 
+        Text {
+          visible: root.loaded && !Model.isUnknown(root.state)
+            && root.snap.memory_breakdown_valid === false
+          width: parent.width
+          text: "Memory breakdown unavailable"
+          color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.65)
+          font.family: Style.font.family
+          font.pixelSize: Style.font.bodySmall
+          wrapMode: Text.Wrap
+        }
+
         // The stacked bar: apps / cache / free. Reading proportions off one
         // strip is far faster than reading three numbers.
         Item {
+          visible: root.loaded && !Model.isUnknown(root.state)
+            && root.snap.memory_breakdown_valid !== false
           width: parent.width
           height: Style.space(14)
 
@@ -229,6 +244,8 @@ Panel {
 
         // Legend doubles as the exact numbers.
         Row {
+          visible: root.loaded && !Model.isUnknown(root.state)
+            && root.snap.memory_breakdown_valid !== false
           width: parent.width
           spacing: Style.space(12)
 
