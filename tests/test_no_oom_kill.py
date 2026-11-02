@@ -5,10 +5,11 @@ a single Chromium cgroup holding ~300 MB. The kernel emptied the process, it
 faulted hard, and systemd-oomd killed it. Reclaim meant to protect the machine
 had become the thing that killed an app.
 
-This reproduces that shape — one victim large enough to tempt a big ask, plus
-sustained pressure — and asserts the cap holds AND nothing gets killed.
+This reproduces the request-size failure deterministically and checks the per-victim cap.
+The live stress section allocates 4.8 GB and sleeps for three minutes; it is opt-in
+via RAM_KEEPER_DANGEROUS_TESTS=1 and is never part of the default suite.
 """
-import json, re, subprocess, sys, time
+import json, os, re, subprocess, sys, time
 from pathlib import Path
 
 PLUGIN = Path(__file__).resolve().parent.parent
@@ -65,9 +66,21 @@ def build_snapshot(victim_anon_mb, victim_file_mb, state, free_pct):
 print("== 1. the cap is derived from the victim's size, not fixed ==")
 s = rk.Steward()
 teto = s.max_victim_slice()
-print(f"  max_victim_slice = {teto//MB} MB ({s.config['max_victim_fraction']}% of 8 GB)")
-check("cap is positive and bounded", 0 < teto <= 2 * 1024 * MB,
-      f"{teto//MB}MB")
+frac = s.config["max_victim_fraction"]
+total = int(rk.meminfo().get("MemTotal", 0) or 0)
+print(f"  max_victim_slice = {teto//MB} MB ({frac}% of {total//MB} MB)")
+# Machine-independent invariants: an absolute byte ceiling turns this suite into
+# a test of the runner's RAM. A 16 GB CI box legitimately plans a 3995 MB ceiling
+# where an 8 GB laptop plans 2047 MB; what must hold everywhere is the relation.
+check("cap is positive", teto > 0, f"{teto//MB}MB")
+check("planning cap is the configured fraction of MemTotal",
+      total > 0 and teto == int(frac * total // 100),
+      f"{teto//MB}MB vs {frac}% of {total//MB}MB")
+check("cap tracks the victim, not a fixed number",
+      s.max_victim_slice(400 * MB) == int(frac * 400 * MB // 100)
+      and s.max_victim_slice(400 * MB) < 400 * MB,
+      f"{s.max_victim_slice(400 * MB)//MB}MB of 400MB")
+check("cap is zero for an empty victim", s.max_victim_slice(0) == 0)
 
 print("\n== 2. the exact shape that killed the browser ==")
 # critical, one 300MB-anon victim with a little cache: previously asked 1521MB.
@@ -105,35 +118,39 @@ finally:
     elif cfgfile.exists():
         cfgfile.unlink()
 
-print("\n== 5. live: sustained load must not kill anything ==")
-kills_before = oom_kills()
-hog = """
+if os.environ.get("RAM_KEEPER_DANGEROUS_TESTS") == "1":
+    print("\n== 5. live: sustained load must not kill anything ==")
+    kills_before = oom_kills()
+    hog = """
 import time
 b = [bytearray(4*1024*1024) for _ in range(1200)]
 print('READY', flush=True)
 time.sleep(420)
 """
-subprocess.run(["systemd-run", "--user", "--unit=ramtest-kill", "/usr/bin/python3", "-c", hog],
-               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-for _ in range(60):
-    time.sleep(0.5)
-    if "READY" in subprocess.run(["journalctl", "--user", "-u", "ramtest-kill",
-                                  "-o", "cat", "--no-pager"],
-                                 capture_output=True, text=True).stdout:
-        break
-print("  load running; letting the daemon work for 3 minutes")
-time.sleep(180)
+    subprocess.run(["systemd-run", "--user", "--unit=ramtest-kill", "/usr/bin/python3", "-c", hog],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    for _ in range(60):
+        time.sleep(0.5)
+        if "READY" in subprocess.run(["journalctl", "--user", "-u", "ramtest-kill",
+                                      "-o", "cat", "--no-pager"],
+                                     capture_output=True, text=True).stdout:
+            break
+    print("  load running; letting the daemon work for 3 minutes")
+    time.sleep(180)
 
-snap = json.loads(subprocess.run(["/usr/bin/python3", HELPER, "--once"],
-                                 capture_output=True, text=True).stdout)
-print(f"  state={snap['state']} free={snap['free_percent']}%")
-kills_after = oom_kills()
-check("no new OOM kills during sustained load", kills_after == kills_before,
-      f"{kills_before} -> {kills_after}")
-for n in ("Hyprland", "quickshell", "hermes"):
-    check(f"{n} survived", alive(n))
+    snap = json.loads(subprocess.run(["/usr/bin/python3", HELPER, "--once"],
+                                     capture_output=True, text=True).stdout)
+    print(f"  state={snap['state']} free={snap['free_percent']}%")
+    kills_after = oom_kills()
+    check("no new OOM kills during sustained load", kills_after == kills_before,
+          f"{kills_before} -> {kills_after}")
+    for n in ("Hyprland", "quickshell", "hermes"):
+        check(f"{n} survived", alive(n))
 
-subprocess.run(["systemctl", "--user", "stop", "ramtest-kill"], capture_output=True)
+    subprocess.run(["systemctl", "--user", "stop", "ramtest-kill"], capture_output=True)
+else:
+    print("\n== 5. live stress test ==")
+    print("  SKIP — allocates 4.8 GB and runs for 3 minutes. Set RAM_KEEPER_DANGEROUS_TESTS=1 only on a disposable host.")
 
 print("\n" + ("ALL PASS" if fails == 0 else f"\n{fails} FAILURES"))
 assert fails == 0, f"Test failed: {fails} failures"

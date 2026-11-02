@@ -482,9 +482,17 @@ class TestConfigPath:
 class TestLoadConfig:
     """Tests for load_config."""
 
-    def test_returns_default_config(self):
-        """Should return default config when no file exists."""
-        with patch("pathlib.Path.read_text", side_effect=OSError):
+    def test_returns_default_config(self, tmp_path):
+        """Should return default config when no file exists.
+
+        Pointed at a path that does not exist rather than patched at the
+        `read_text` level: the mock used to intercept every Path.read_text in
+        the process, including the one that wrote the test's own output, and it
+        stopped intercepting anything the moment load_config started reading
+        bytes.
+        """
+        missing = tmp_path / "does-not-exist" / "config.json"
+        with patch("ram_keeper.config_path", return_value=missing):
             result = rk.load_config()
         assert result["target_free_percent"] == 18.0
         assert result["critical_free_percent"] == 10.0
@@ -595,6 +603,33 @@ class TestLoadConfig:
             result = rk.load_config()
         assert isinstance(result["protected"], list)
         assert "my-app" in result["protected"]
+
+    def test_blank_protected_string_warns_and_uses_defaults(self, tmp_path):
+        config_file = tmp_path / "config.json"
+        for blank in ("", "   "):
+            config_file.write_text(json.dumps({"protected": blank}))
+            with patch("ram_keeper.config_path", return_value=config_file):
+                result = rk.load_config()
+            assert result["protected"] == rk.DEFAULT_CONFIG["protected"]
+            assert any("protected" in warning and "blank" in warning.lower()
+                       for warning in rk.config_warnings())
+
+    def test_blank_names_in_protected_lists_warn_and_keep_defaults(self, tmp_path):
+        config_file = tmp_path / "config.json"
+        for key in ("protected", "never_reclaim"):
+            config_file.write_text(json.dumps({key: ["   "]}))
+            with patch("ram_keeper.config_path", return_value=config_file):
+                result = rk.load_config()
+            assert result[key] == rk.DEFAULT_CONFIG[key]
+            assert any(key in warning and "blank" in warning.lower()
+                       for warning in rk.config_warnings())
+
+    def test_empty_protected_list_remains_an_explicit_choice(self, tmp_path):
+        config_file = tmp_path / "config.json"
+        config_file.write_text(json.dumps({"protected": []}))
+        with patch("ram_keeper.config_path", return_value=config_file):
+            result = rk.load_config()
+        assert result["protected"] == []
 
     def test_handles_bool_as_number(self, tmp_path):
         """Should reject bool values for numeric fields."""
@@ -728,6 +763,18 @@ class TestSnapshot:
                     with patch("ram_keeper.user_root", return_value=Path("/nonexistent")):
                         result = s.snapshot()
         assert result["state"] == "unknown"
+
+    def test_zero_available_is_valid_critical_memory_not_unknown(self):
+        """A genuine zero-availability reading must trigger emergency state."""
+        s = rk.Steward()
+        with patch("ram_keeper.meminfo", return_value={"MemTotal": 8026562560, "MemAvailable": 0, "Cached": 0}):
+            with patch("ram_keeper.psi", return_value={"some_avg10": 0, "some_avg60": 0, "some_avg300": 0, "full_avg10": 0, "full_avg60": 0, "full_avg300": 0}):
+                with patch("ram_keeper.zram_stats", return_value={"devices": [], "used": 0, "size": 0}):
+                    with patch("ram_keeper.user_root", return_value=Path("/nonexistent")):
+                        result = s.snapshot()
+        assert result["state"] == "critical"
+        assert result["free_percent"] == 0.0
+        assert result["mem_available"] == 0
 
     def test_state_stalling_when_high_psi(self):
         """Should report 'stalling' when PSI is high but free memory is OK."""
@@ -1054,7 +1101,8 @@ class TestPublishedSnapshot:
 
     def test_returns_none_for_missing_file(self, tmp_path):
         """Should return None if state file doesn't exist."""
-        with patch("ram_keeper.Path.home", return_value=tmp_path):
+        with patch("ram_keeper.state_dir",
+                   return_value=tmp_path / ".local/state/ram-keeper"):
             result = rk.published_snapshot()
             assert result is None
 
@@ -1067,7 +1115,8 @@ class TestPublishedSnapshot:
         old_time = time.time() - 300  # 5 minutes ago
         import os
         os.utime(state_file, (old_time, old_time))
-        with patch("ram_keeper.Path.home", return_value=tmp_path):
+        with patch("ram_keeper.state_dir",
+                   return_value=tmp_path / ".local/state/ram-keeper"):
             result = rk.published_snapshot(max_age=120)
             assert result is None
 
@@ -1076,7 +1125,8 @@ class TestPublishedSnapshot:
         state_file = tmp_path / ".local" / "state" / "ram-keeper" / "state.json"
         state_file.parent.mkdir(parents=True)
         state_file.write_text(json.dumps({"state": "ok", "mem_total": 1000}))
-        with patch("ram_keeper.Path.home", return_value=tmp_path):
+        with patch("ram_keeper.state_dir",
+                   return_value=tmp_path / ".local/state/ram-keeper"):
             result = rk.published_snapshot(max_age=120)
             assert result is not None
             assert result["state"] == "ok"
@@ -1086,7 +1136,8 @@ class TestPublishedSnapshot:
         state_file = tmp_path / ".local" / "state" / "ram-keeper" / "state.json"
         state_file.parent.mkdir(parents=True)
         state_file.write_text("not valid json")
-        with patch("ram_keeper.Path.home", return_value=tmp_path):
+        with patch("ram_keeper.state_dir",
+                   return_value=tmp_path / ".local/state/ram-keeper"):
             result = rk.published_snapshot()
             assert result is None
 
@@ -1095,6 +1146,7 @@ class TestPublishedSnapshot:
         state_file = tmp_path / ".local" / "state" / "ram-keeper" / "state.json"
         state_file.parent.mkdir(parents=True)
         state_file.write_text("[1, 2, 3]")
-        with patch("ram_keeper.Path.home", return_value=tmp_path):
+        with patch("ram_keeper.state_dir",
+                   return_value=tmp_path / ".local/state/ram-keeper"):
             result = rk.published_snapshot()
             assert result is None

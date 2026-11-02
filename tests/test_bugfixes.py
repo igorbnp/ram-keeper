@@ -155,8 +155,8 @@ class TestBug4_ReadingsValid:
         config = dict(DEFAULT_CONFIG)
         return Steward(config=config)
 
-    def test_invalid_readings_show_zero_free(self):
-        """Se /proc/meminfo não pode ser lido, free_percent deve ser 0."""
+    def test_invalid_readings_are_unknown(self):
+        """Se /proc/meminfo não pode ser lido, as métricas devem ficar indisponíveis."""
         steward = self._make_steward()
         with patch("ram_keeper.meminfo") as mock_meminfo, \
              patch("ram_keeper.psi") as mock_psi, \
@@ -165,14 +165,18 @@ class TestBug4_ReadingsValid:
              patch("ram_keeper.scan") as mock_scan:
             mock_meminfo.return_value = {}
             mock_psi.return_value = {"some_avg10": 0, "some_avg60": 0, "some_avg300": 0,
-                                      "full_avg10": 0, "full_avg60": 0, "full_avg300": 0}
+                                      "full_avg10": 0, "full_avg60": 0, "full_avg300": 0,
+                                      "available": True}
             mock_zram.return_value = {"devices": [], "used": 0, "size": 0}
             mock_user_root.return_value = Path("/nonexistent")
             mock_scan.return_value = []
             snap = steward.snapshot()
-            assert snap["free_percent"] == 0.0, \
-                "free_percent deveria ser 0 quando meminfo falha"
             assert snap["state"] == "unknown"
+            assert snap["memory_reading_valid"] is False
+            assert snap["free_percent"] is None
+            assert snap["mem_total"] is None
+            assert snap["mem_available"] is None
+            assert snap["mem_used"] is None
 
     def test_valid_readings_show_correct_free(self):
         """Se /proc/meminfo é lido corretamente, free_percent deve ser correto."""
@@ -195,8 +199,8 @@ class TestBug4_ReadingsValid:
             assert snap["free_percent"] == 50.0, \
                 f"Esperado 50%, obtido {snap['free_percent']}%"
 
-    def test_partial_meminfo_shows_zero_free(self):
-        """Se /proc/meminfo está parcialmente legível, free_percent deve ser 0."""
+    def test_partial_meminfo_is_unknown(self):
+        """Uma leitura sem MemAvailable não pode virar 0% de memória livre."""
         steward = self._make_steward()
         with patch("ram_keeper.meminfo") as mock_meminfo, \
              patch("ram_keeper.psi") as mock_psi, \
@@ -205,13 +209,17 @@ class TestBug4_ReadingsValid:
              patch("ram_keeper.scan") as mock_scan:
             mock_meminfo.return_value = {"MemTotal": 16 * 1024**3}
             mock_psi.return_value = {"some_avg10": 0, "some_avg60": 0, "some_avg300": 0,
-                                      "full_avg10": 0, "full_avg60": 0, "full_avg300": 0}
+                                      "full_avg10": 0, "full_avg60": 0, "full_avg300": 0,
+                                      "available": True}
             mock_zram.return_value = {"devices": [], "used": 0, "size": 0}
             mock_user_root.return_value = Path("/nonexistent")
             mock_scan.return_value = []
             snap = steward.snapshot()
-            assert snap["free_percent"] == 0.0, \
-                "free_percent deveria ser 0 quando MemAvailable está ausente"
+            assert snap["state"] == "unknown"
+            assert snap["memory_reading_valid"] is False
+            assert snap["free_percent"] is None
+            assert snap["mem_available"] is None
+            assert snap["mem_used"] is None
 
 
 class TestBug5_ConsecutiveFailures:

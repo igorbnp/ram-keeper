@@ -21,8 +21,10 @@ MemoryMax=128M
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=read-only
-# Reads its own state and the journal; writes only its dedupe flags.
-ReadWritePaths=%h/.local/state/ram-keeper
+# Reads its own state and the journal; writes only its dedupe flags. The `-`
+# prefix keeps the unit startable if the state directory is missing — systemd
+# treats a non-existent path in ReadWritePaths as a fatal sandbox error.
+ReadWritePaths=-%h/.local/state/ram-keeper
 PrivateTmp=yes
 RestrictSUIDSGID=yes
 LockPersonality=yes

@@ -22,7 +22,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -127,6 +129,67 @@ def cgroup_swap(path: Path) -> int:
     return _stat_field(_read(path / "memory.stat"), "swap")
 
 
+_TRAILING_ID = re.compile(r"-(?:\d+|[0-9a-f]{8})$")
+
+
+def _strip_unit_suffix(name: str) -> str:
+    """Drop a systemd unit suffix. Only the kind marker, not escaped text."""
+    for suffix in (".service", ".scope", ".slice", ".socket", ".mount"):
+        if name.endswith(suffix):
+            return name[: -len(suffix)]
+    return name
+
+
+def unit_aliases(name: str) -> frozenset[str]:
+    """Every shape a user could reasonably use to name this cgroup.
+
+    A config entry has to be written against a name the user can actually see:
+    "Spotify", not "app-Spotify-1043.scope". Systemd, meanwhile, only ever
+    publishes the second form — with a PID or a stable hash glued on, escaped
+    hyphens, and (for desktop apps) a reverse-DNS id. Without this expansion,
+    `protected: ["spotify"]` silently protects nothing at all, which is the
+    worst possible outcome for a setting whose whole purpose is safety.
+
+    Deliberately conservative: aliases only ever REMOVE decoration
+    (suffix, `app-` prefix, trailing id, reverse-DNS prefix). A name is never
+    split on a hyphen, so protecting "syncthing" cannot accidentally protect
+    "syncthing-server".
+    """
+    if not name or not isinstance(name, str):
+        return frozenset()
+    text = name.strip().replace("\\x2d", "-")
+    if not text:
+        return frozenset()
+    aliases: set[str] = {text}
+    base = _strip_unit_suffix(text)
+    aliases.add(base)
+    if base.startswith("app-"):
+        rest = base[4:]
+        aliases.add(rest)
+        aliases.add(_TRAILING_ID.sub("", base))
+        trimmed = _TRAILING_ID.sub("", rest)
+        aliases.add(trimmed)
+        # org.chromium.Chromium-991 → Chromium; Hyprland-chromium-ea8ee5ca →
+        # Hyprland-chromium (the hash is already stripped above).
+        if "." in trimmed:
+            aliases.add(trimmed.rsplit(".", 1)[-1])
+            aliases.add(trimmed.split(".", 1)[-1])
+    return frozenset(a.casefold() for a in aliases if a)
+
+
+def names_match(cgroup_name: str, wanted) -> bool:
+    """True if `cgroup_name` is one of the names in `wanted` (see aliases)."""
+    if not wanted:
+        return False
+    theirs = unit_aliases(cgroup_name)
+    if not theirs:
+        return False
+    for candidate in wanted:
+        if isinstance(candidate, str) and unit_aliases(candidate) & theirs:
+            return True
+    return False
+
+
 def human_label(name: str) -> str:
     """Turn a systemd cgroup name into something worth showing a human."""
     label = name
@@ -208,8 +271,7 @@ def scan(root: Path, protected: set[str], min_bytes: int) -> list[Cgroup]:
         else:
             kind = "service"
 
-        is_protected = (name in protected
-                        or name.removesuffix(".service") in protected
+        is_protected = (names_match(name, protected)
                         or is_inviolable(name))
         found.append(Cgroup(
             path=cgroup_dir,
@@ -245,13 +307,19 @@ def meminfo() -> dict:
 
 
 def psi(resource: str = "memory") -> dict:
-    """Pressure Stall Information: how long the system waited on memory."""
-    out = {"some_avg10": 0.0, "some_avg60": 0.0, "some_avg300": 0.0,
+    """Pressure Stall Information plus whether its key signal was readable.
+
+    A real zero and an unavailable file are different things: the former is a
+    healthy reading, the latter means pressure cannot be inferred from PSI.
+    """
+    out = {"available": False,
+           "some_avg10": 0.0, "some_avg60": 0.0, "some_avg300": 0.0,
            "full_avg10": 0.0, "full_avg60": 0.0, "full_avg300": 0.0}
     try:
         text = Path(f"/proc/pressure/{resource}").read_text()
     except OSError:
         return out
+    valid_keys: set[str] = set()
     for line in text.strip().splitlines():
         parts = line.split()
         if not parts:
@@ -264,9 +332,14 @@ def psi(resource: str = "memory") -> dict:
             key = f"{kind}_{name}"
             if key in out:
                 try:
-                    out[key] = float(value)
+                    number = float(value)
                 except ValueError:
-                    pass
+                    continue
+                if not math.isfinite(number) or number < 0:
+                    continue
+                out[key] = number
+                valid_keys.add(key)
+    out["available"] = "some_avg60" in valid_keys
     return out
 
 
@@ -339,8 +412,16 @@ DEFAULT_CONFIG = {
         "quickshell",
         "ram-keeper",
     ],
-    # Never reclaim these even if large (background indexers etc. rebuild
-    # caches slowly and are cheap to leave alone).
+    # Seconds to let a cgroup settle after a reclaim request before measuring
+    # what actually came back. Reclaim of cache is synchronous; anon→zram can
+    # take a moment to be accounted. This knob was read by reclaim_from() while
+    # being absent from DEFAULT_CONFIG, so load_config() rejected it as an
+    # unknown setting and the documented value never took effect.
+    "reclaim_sleep": 0.4,
+    # cgroups never reclaimed. The compositor and our own infrastructure are
+    # added automatically; this is for the user's own additions. Names are
+    # matched through unit_aliases(), so "localsearch" and
+    # "localsearch-3.service" are the same setting.
     "never_reclaim": [
         "localsearch-3.service",
     ],
@@ -357,6 +438,10 @@ INVIOABLE_PROTECTED = frozenset({
     "session",                        # any session-* scope
     "quickshell",                     # the shell that draws this panel
     "ram-keeper",                     # ourselves
+    # systemd --user's own manager. It is a leaf cgroup holding the thing that
+    # would have to act on a problem, so making it a victim is self-defeating:
+    # reclaiming from it stalls every unit the user has.
+    "init",
 })
 
 
@@ -380,6 +465,21 @@ def config_path() -> Path:
     return Path.home() / ".config" / "ram-keeper" / "config.json"
 
 
+def state_dir() -> Path:
+    """Where the daemon publishes state and logs.
+
+    Overridable with RAM_KEEPER_STATE_DIR so a test suite cannot write into the
+    real ~/.local/state/ram-keeper. It did: the unit tests built a real Steward
+    with synthetic snapshots and appended fabricated "reclaim" events to the
+    production log, which is an audit trail. A test that pollutes the data it is
+    meant to protect is worse than no test.
+    """
+    override = os.environ.get("RAM_KEEPER_STATE_DIR")
+    if override:
+        return Path(override)
+    return Path.home() / ".local/state/ram-keeper"
+
+
 # Bounds every user-supplied number is clamped into. A config file is the one
 # place a typo becomes a machine-wide problem: a negative interval would make
 # the daemon spin, and a zero budget would make it reclaim nothing while
@@ -394,6 +494,7 @@ CONFIG_BOUNDS = {
     "interval_pressure": (0.5, 600.0),
     "max_reclaim_per_pass": (16 * 1024 * 1024, 32 * 1024 * 1024 * 1024),
     "max_victim_fraction": (5, 60),
+    "reclaim_sleep": (0.0, 5.0),
 }
 
 _CONFIG_WARNINGS: list[str] = []
@@ -404,8 +505,14 @@ def _coerce_number(key: str, value, fallback):
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         _CONFIG_WARNINGS.append(f"{key}: expected a number, got {value!r}; using {fallback}")
         return fallback
-    number = float(value)
-    if number != number or number in (float("inf"), float("-inf")):
+    try:
+        number = float(value)
+    except (OverflowError, ValueError):
+        # A 400-digit integer is valid JSON and parses to a Python int, but
+        # float() on it raises OverflowError — which nothing above catches.
+        _CONFIG_WARNINGS.append(f"{key}: {value!r} is too large; using {fallback}")
+        return fallback
+    if not math.isfinite(number):
         _CONFIG_WARNINGS.append(f"{key}: not a finite number ({value!r}); using {fallback}")
         return fallback
     low, high = CONFIG_BOUNDS[key]
@@ -422,9 +529,18 @@ def _coerce_strlist(key: str, value, fallback):
     accept it rather than iterating its characters and silently protecting
     nothing (or protecting single letters)."""
     if isinstance(value, str):
-        return [value] if value else []
+        name = value.strip()
+        if not name:
+            _CONFIG_WARNINGS.append(f"{key}: blank name; using default list")
+            return list(fallback)
+        return [name]
     if isinstance(value, list) and all(isinstance(v, str) for v in value):
-        return [v for v in value if v]
+        names = [name for v in value if (name := v.strip())]
+        if len(names) != len(value):
+            _CONFIG_WARNINGS.append(f"{key}: blank name in list; using default when no names remain")
+            if value and not names:
+                return list(fallback)
+        return names
     _CONFIG_WARNINGS.append(f"{key}: expected a list of names, got {value!r}; using default")
     return list(fallback)
 
@@ -441,16 +557,34 @@ def load_config() -> dict:
     _CONFIG_WARNINGS.clear()
     cfg = dict(DEFAULT_CONFIG)
 
+    # Read BYTES, then decode. `read_text()` raises UnicodeDecodeError (a
+    # ValueError, not an OSError) on a file some editor, sync tool or bad
+    # copy left with invalid UTF-8 — and that would escape every caller,
+    # including the daemon's reload and the panel's --once, as a traceback
+    # instead of a warning. Same for a pathologically nested document:
+    # json.loads raises RecursionError (a RuntimeError), which `except
+    # ValueError` does not catch.
+    raw: bytes | None = None
     try:
-        raw = config_path().read_text()
+        raw = config_path().read_bytes()
     except OSError:
         raw = None
     if raw is not None:
+        text: str | None = None
         try:
-            user = json.loads(raw)
-        except ValueError as exc:
-            _CONFIG_WARNINGS.append(f"config.json is not valid JSON ({exc}); using defaults")
-            user = None
+            text = raw.decode("utf-8-sig")   # tolerates a BOM, which json.loads rejects
+        except UnicodeDecodeError as exc:
+            _CONFIG_WARNINGS.append(f"config.json is not valid UTF-8 ({exc}); using defaults")
+        user = None
+        if text is not None:
+            try:
+                user = json.loads(text)
+            except RecursionError:
+                _CONFIG_WARNINGS.append("config.json is nested too deeply; using defaults")
+                user = None
+            except ValueError as exc:
+                _CONFIG_WARNINGS.append(f"config.json is not valid JSON ({exc}); using defaults")
+                user = None
         if isinstance(user, dict):
             for key, value in user.items():
                 if key not in DEFAULT_CONFIG:
@@ -672,9 +806,9 @@ class Action:
 class Steward:
     config: dict = field(default_factory=load_config)
     log_path: Path = field(
-        default_factory=lambda: Path.home() / ".local/state/ram-keeper/log.jsonl")
+        default_factory=lambda: state_dir() / "log.jsonl")
     state_path: Path = field(
-        default_factory=lambda: Path.home() / ".local/state/ram-keeper/state.json")
+        default_factory=lambda: state_dir() / "state.json")
     actions_today: int = 0
     bytes_reclaimed_today: int = 0
     tracker: TrendTracker = field(default_factory=TrendTracker)
@@ -735,11 +869,14 @@ class Steward:
         # aggressive response available.
         raw_total = info.get("MemTotal", 0)
         raw_available = info.get("MemAvailable", 0)
-        readings_valid = raw_total > 0 and raw_available > 0
+        readings_valid = (raw_total > 0 and "MemAvailable" in info
+                          and 0 <= raw_available <= raw_total)
 
-        total = raw_total or 1
+        # Keep one harmless internal denominator for forecast arithmetic, but
+        # never publish it as real memory data when the source read is invalid.
+        total = raw_total if raw_total > 0 else 1
         available = raw_available if readings_valid else 0
-        free_percent = (100.0 * available / total) if readings_valid else 0.0
+        free_percent = (100.0 * available / total) if readings_valid else None
         pressure = psi("memory")
         swap = zram_stats()
 
@@ -747,7 +884,7 @@ class Steward:
         never = set(self.config["never_reclaim"])
         groups = scan(user_root(), protected, int(self.config["min_target_bytes"]))
 
-        victims = [g for g in groups if not g.protected and g.name not in never]
+        victims = [g for g in groups if not g.protected and not names_match(g.name, never)]
         victims.sort(key=lambda g: g.reclaimable, reverse=True)
 
         state = "ok"
@@ -759,7 +896,7 @@ class Steward:
             state = "critical"
         elif free_percent < self.config["target_free_percent"]:
             state = "tight"
-        elif pressure["some_avg60"] > self.config["psi_some_percent"]:
+        elif pressure.get("available", True) and pressure["some_avg60"] > self.config["psi_some_percent"]:
             # High stall time with free RAM available means the free memory is
             # in the wrong place (fragmented, or a hot cgroup under pressure).
             state = "stalling"
@@ -772,7 +909,9 @@ class Steward:
             target_bytes = int(total * self.config["target_free_percent"] / 100.0)
             self.last_forecast = self.tracker.forecast(target_bytes)
         else:
-            target_bytes = int(total * self.config["target_free_percent"] / 100.0)
+            # A missing sample breaks the current forecast chain. Keep old trend
+            # points for the next valid sample, but never publish a stale verdict.
+            self.last_forecast = Forecast()
 
         # An imminent crossing is pressure the floor does not show yet. Treat
         # it as its own state so the daemon acts before the number moves rather
@@ -785,24 +924,36 @@ class Steward:
         # from meminfo includes pages held by processes' file mappings, and on a
         # healthy machine it approaches the whole of MemUsed — so the two are
         # reported separately and never allowed to imply that apps use nothing.
-        mem_used = info.get("MemTotal", 0) - info.get("MemAvailable", 0)
-        cached = info.get("Cached", 0)
-        # Clamp: cache can never exceed what is counted as used, and the two
-        # together can never exceed the machine.
-        cached = min(cached, mem_used, total)
-        anon_and_kernel = mem_used - cached
+        if readings_valid:
+            mem_used = raw_total - raw_available
+        else:
+            mem_used = None
+
+        raw_cached = info.get("Cached")
+        breakdown_valid = False
+        cached = anon_and_kernel = None
+        if (readings_valid and isinstance(raw_cached, int)
+                and not isinstance(raw_cached, bool)
+                and 0 <= raw_cached <= raw_total):
+            breakdown_valid = True
+            # Clamp cache to used memory so the three portions still sum to
+            # MemTotal if Linux's cached estimate overlaps MemAvailable.
+            cached = min(raw_cached, raw_total - raw_available, raw_total)
+            anon_and_kernel = (raw_total - raw_available) - cached
 
         return {
             "state": state,
-            "free_percent": round(free_percent, 1),
-            "mem_total": total,
-            "mem_available": available,
+            "memory_reading_valid": readings_valid,
+            "memory_breakdown_valid": breakdown_valid,
+            "free_percent": round(free_percent, 1) if free_percent is not None else None,
+            "mem_total": raw_total if raw_total > 0 else None,
+            "mem_available": raw_available if readings_valid else None,
             "mem_used": mem_used,
             "anon_and_kernel": anon_and_kernel,
             "cached": cached,
             "zram": swap,
             "psi": pressure,
-            "forecast": self.last_forecast.as_dict(),
+            "forecast": self.last_forecast.as_dict() if readings_valid else None,
             "groups": [asdict(g) | {"path": str(g.path)} for g in groups],
             "reclaimable_total": sum(g.reclaimable for g in victims),
             "checked_at": time.time(),
@@ -810,14 +961,26 @@ class Steward:
 
     # -- reclamation -----------------------------------------------------
     def reclaim_from(self, group: Cgroup, amount: int) -> Action:
-        """Ask one cgroup to give back `amount`. Cache comes off first."""
-        before = _read_int(group.path / "memory.current")
+        """Ask one cgroup to give back `amount`. Cache comes off first.
+
+        Accounting rule: every number reported here must be something the
+        kernel actually showed us. A cgroup can disappear between scan() and
+        this call — an app closing is the normal case on a desktop — and then
+        `memory.current` is simply gone. Reading a missing file as "0 bytes"
+        makes `before - after` equal the victim's entire footprint, so a write
+        that failed with ENOENT is reported as hundreds of megabytes freed, the
+        log records an event that never happened, and the pass stops early
+        believing its budget was spent.
+        """
+        before = _read_int(group.path / "memory.current", -1)
         before_swap = cgroup_swap(group.path)
         outcome = "unknown"
         try:
             with open(group.reclaim_file, "w", encoding="utf-8") as handle:
                 handle.write(str(amount))
             outcome = "ok"
+        except FileNotFoundError:
+            outcome = "gone"
         except PermissionError:
             outcome = "denied"
         except OSError as e:
@@ -825,26 +988,56 @@ class Steward:
             # still reclaimed everything it could. Not a failure.
             outcome = "eagain" if e.errno == 11 else f"error:{e.errno}"
 
-        time.sleep(self.config.get("reclaim_sleep", 0.4))
-        after = _read_int(group.path / "memory.current")
+        self._settle()
+        after = _read_int(group.path / "memory.current", -1)
         after_swap = cgroup_swap(group.path)
-        freed = max(0, before - after)
-        swapped = max(0, after_swap - before_swap)
+
+        if before < 0 or after < 0:
+            # The cgroup (or its accounting file) is not there any more. A real
+            # 0 is a legitimate reading; an unreadable file is not.
+            freed = 0
+            swapped = 0
+            if outcome == "ok":
+                outcome = "gone"
+        else:
+            freed = max(0, before - after)
+            swapped = max(0, after_swap - before_swap)
 
         # `freed` from the cgroup is not the same as RAM returned to the system
-        # when the pages went to zram: measured 4.34x compression on this box,
-        # so moving 300 MB of anon out of a cgroup returns ~69 MB of real RAM,
-        # not 300. Reporting the cgroup number as "memory freed" overstates the
-        # benefit roughly fourfold whenever the anon pass runs — which is the
-        # pass that matters most. The honest figure is the RAM actually
-        # returned, with the raw cgroup number kept for auditing.
-        effective = max(0, freed - int(swapped * self.zram_ratio()))
+        # when the pages went to zram. The cgroup drops the UNCOMPRESSED size;
+        # zram then holds `swapped / ratio` bytes of real RAM (measured 4.34x
+        # compression on this box), so moving 300MB of anon returns ~231MB, not
+        # 300 and certainly not 300 - 300*4.34.
+        #
+        # The direction matters more than it looks: multiplying by the ratio
+        # makes the result negative for any swap-heavy reclaim, clamps it to 0,
+        # and therefore reports a pass that moved 150MB as having freed
+        # NOTHING — "acted: false" in the panel, no log entry, no counter. The
+        # whole anon pass looked like a no-op. Verified on a real 600MB cgroup:
+        # 150MB reclaimed into zram, reported 0MB.
+        ratio = max(1.0, self.zram_ratio())
+        effective = max(0, freed - int(swapped / ratio))
         action = Action(label=group.label, requested=amount,
                         freed=effective,
                         swapped_out=swapped, outcome=outcome,
                         cgroup_freed=freed)
         self.bytes_reclaimed_today += max(0, effective)
         return action
+
+    def _settle(self) -> None:
+        """Pause so the kernel's accounting catches up with the request.
+
+        Configurable (and clamped): a negative or NaN value here is a
+        `ValueError` from time.sleep, which would escape the daemon's own
+        except clause while it is holding a pass's state.
+        """
+        try:
+            value = float(self.config.get("reclaim_sleep", 0.4))
+        except (TypeError, ValueError):
+            value = 0.4
+        if not math.isfinite(value):
+            value = 0.4
+        time.sleep(max(0.0, min(5.0, value)))
 
     @staticmethod
     def zram_ratio() -> float:
@@ -863,24 +1056,25 @@ class Steward:
             pass
         return 3.0
 
-    def max_victim_slice(self) -> int:
-        """The most the daemon will ever ask of ONE cgroup in ONE pass.
+    def max_victim_slice(self, victim_bytes: int | None = None) -> int:
+        """Return the configured fraction of one victim's current memory.
 
-        This cap exists because of a measured failure, not a hypothetical one.
-        Under sustained load the anon pass computed a 1.5 GB ask for a single
-        Chromium cgroup holding ~300 MB. The kernel honoured it as far as it
-        could, but that emptied the process: it ended up with almost no resident
-        pages, faulted hard, and `systemd-oomd` killed it. Reclaim meant to save
-        the machine had become the thing that killed an app.
-
-        The fix is to be a small, predictable fraction of what the victim
-        actually holds. Several passes over several seconds take 500 MB out of a
-        2 GB process without ever leaving it unable to run; one pass asking for
-        all of it does not. Sized relative to the victim rather than fixed, so a
-        small process is never asked for more than it has.
+        Pass the cgroup's ``current`` bytes for every reclaim request. With no
+        argument, return the system-wide equivalent as a planning ceiling only.
+        A measured regression showed why this must be victim-relative: a 1.5 GB
+        request against a Chromium cgroup holding ~300 MB emptied the process,
+        which then faulted hard and was killed by systemd-oomd. The per-victim
+        cap spreads pressure across passes instead of draining one app at once.
         """
-        total = meminfo().get("MemTotal", 8 * 1024 * 1024 * 1024)
-        return int(self.config["max_victim_fraction"] * total // 100)
+        try:
+            if victim_bytes is None:
+                victim_bytes = int(meminfo().get(
+                    "MemTotal", 8 * 1024 * 1024 * 1024) or 0)
+            size = max(0, int(victim_bytes))
+            fraction = max(0.0, min(100.0, float(self.config["max_victim_fraction"])))
+        except (TypeError, ValueError, OverflowError):
+            return 0
+        return int(fraction * size // 100)
 
     def relieve(self, snapshot: dict | None = None, force: bool = False,
                 cache_only: bool = False) -> dict:
@@ -900,7 +1094,11 @@ class Steward:
         # though it hasn't been yet. Reclaiming then is the entire point of
         # forecasting; waiting for the floor would make the forecast pointless.
         # Note it is NOT in this list, so a trending state acts.
-        if state in ("ok", "stalling", "unknown") and not force:
+        if state == "unknown":
+            return {"acted": False,
+                    "reason": "memory reading unavailable; refusing to reclaim",
+                    "actions": []}
+        if state in ("ok", "stalling") and not force:
             return {"acted": False, "reason": f"no pressure (state={state}, free={free_percent}%)",
                     "actions": []}
 
@@ -935,9 +1133,9 @@ class Steward:
             # which is exactly backwards. Inside a ten-minute horizon take a
             # third of the gap; beyond that, pre-empt only a little.
             horizon = float(forecast.get("horizon_seconds") or 0)
-            # A pre-emptive pass is a precaution, not a rescue: it is bounded by
-            # the per-victim slice like everything else, so a healthy machine can
-            # never be drained more than one slice in a single pass.
+            # The forecast pass has a small machine-wide planning ceiling;
+            # each actual cgroup request is separately capped to that victim's
+            # configured fraction of its current memory below.
             headroom = self.max_victim_slice()
             slice_of_gap = gap // 3 if horizon < 600 else min(gap // 3, headroom // 2)
             needed = max(min(slice_of_gap, headroom), 64 * 1024 * 1024)
@@ -965,7 +1163,7 @@ class Steward:
         available = sum((g.get("reclaimable") or 0) + (g.get("anon") or 0)
                         for g in snap_groups
                         if not g.get("protected")
-                        and g.get("name") not in _never
+                        and not names_match(g.get("name") or "", _never)
                         and not is_inviolable(g.get("name") or "")
                         and (g.get("current") or 0) > _floor)
         # No floor when there is nothing reachable: a phantom budget reads as
@@ -977,11 +1175,24 @@ class Steward:
         needed = min(needed, int(self.config["max_reclaim_per_pass"]))
         actions: list[Action] = []
         budget = needed
-        # Per-VICTIM-per-pass accounting. max_victim_slice() bounds each REQUEST,
-        # not each victim: pass 1 (cache) and pass 2 (anon) both reach the same
-        # group, so one cgroup was asked 2x the documented ceiling in a single
-        # pass. Each group gets at most one slice per pass, across all passes.
-        asked_this_pass: set[str] = set()
+        # Per-VICTIM accounting, in the unit the kernel is asked in.
+        #
+        # max_victim_slice() bounds what ONE cgroup may be asked in ONE pass.
+        # It was first implemented as "skip a victim once it has been asked
+        # anything", which is much stricter than that: every cgroup with 16MB+
+        # of droppable cache is asked in pass 1, so pass 2 could never ask it
+        # for anonymous memory — while the whole point of pass 2 is that cache
+        # alone is often not enough. Measured on a 6-cgroup desktop, the pass
+        # reported "acted" and left the anon pass as dead code.
+        #
+        # Track the bytes already asked per victim instead, and let the next
+        # pass ask only up to the remaining slice. The shared ceiling is
+        # preserved exactly; the policy is not silently reduced to cache-only.
+        asked_bytes: dict[str, int] = {}
+
+        def remaining_slice(group) -> int:
+            return max(0, self.max_victim_slice(group.current)
+                       - asked_bytes.get(group.name, 0))
 
         groups = [Cgroup(**{k: v for k, v in g.items() if k != "path"} | {"path": Path(g["path"])})
                   for g in snap["groups"]]
@@ -995,7 +1206,7 @@ class Steward:
         candidates = [g for g in groups
                       if not g.protected
                       and not is_inviolable(g.name)
-                      and g.name not in never
+                      and not names_match(g.name, never)
                       and g.current > self.config["min_target_bytes"]]
 
         # Pass 1: page cache, cheapest and invisible to the user.
@@ -1005,17 +1216,13 @@ class Steward:
                     break
                 if group.reclaimable < 16 * 1024 * 1024:
                     continue
-                # One slice per victim per PASS, across every pass. The slice
-                # bounds a single request; without this the cache pass and the
-                # anon pass both reached the same group and asked 2x the
-                # documented ceiling from one cgroup in one pass.
-                if group.name in asked_this_pass:
+                ask = min(budget, group.reclaimable, remaining_slice(group))
+                if ask < 16 * 1024 * 1024:
                     continue
-                ask = min(budget, group.reclaimable, self.max_victim_slice())
                 action = self.reclaim_from(group, ask)
                 actions.append(action)
                 budget -= ask      # kernel-visible bytes: the ceiling is what we ASK for
-                asked_this_pass.add(group.name)
+                asked_bytes[group.name] = asked_bytes.get(group.name, 0) + ask
 
         # Pass 2: anonymous memory to zram. Target the single biggest holder
         # rather than spreading thin slices across everything: one process
@@ -1032,13 +1239,13 @@ class Steward:
                 # guaranteed EAGAIN that wastes the pass's budget.
                 if not group.swapable:
                     continue
-                if group.name in asked_this_pass:
+                ask = min(budget, group.anon, remaining_slice(group))
+                if ask < 16 * 1024 * 1024:
                     continue
-                ask = min(budget, group.anon, self.max_victim_slice())
                 action = self.reclaim_from(group, ask)
                 actions.append(action)
                 budget -= ask          # kernel-visible bytes: the ceiling is on what we ASK for
-                asked_this_pass.add(group.name)
+                asked_bytes[group.name] = asked_bytes.get(group.name, 0) + ask
 
         # Pass 3: cgroups with swap disabled are NOT reclaimed.
         # Asking them for anon is a guaranteed EAGAIN that wastes the pass's budget.
@@ -1161,7 +1368,7 @@ def published_snapshot(max_age: float = 120.0) -> dict | None:
     always report "no forecast yet" — the panel would show a permanently
     useless row and nobody would trust it.
     """
-    path = Path.home() / ".local/state/ram-keeper/state.json"
+    path = state_dir() / "state.json"
     try:
         if time.time() - path.stat().st_mtime > max_age:
             return None
@@ -1171,6 +1378,59 @@ def published_snapshot(max_age: float = 120.0) -> dict | None:
     except (OSError, ValueError):
         pass
     return None
+
+
+def add_never_reclaim(name: str) -> list[str]:
+    """Add one cgroup name to `never_reclaim`, safely.
+
+    Three properties, each of which the naive `read → modify → write_text`
+    version did not have:
+      * a lock, so two concurrent calls (the panel's button and a CLI call)
+        cannot lose one of the two additions;
+      * an atomic replace, so the daemon's 300-second config reload can never
+        read a half-written file and fall back to DEFAULTS — which would
+        silently un-protect everything the user had protected;
+      * validation, so an empty or multi-line argument cannot be written into
+        the config as a setting that matches nothing.
+    """
+    name = (name or "").strip()
+    if not name or any(ord(ch) < 32 or ord(ch) == 127 for ch in name):
+        raise ValueError("cgroup name must be one non-blank line")
+
+    path = config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_suffix(".lock")
+    with open(lock_path, "a", encoding="utf-8") as lock_handle:
+        try:
+            import fcntl
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        except (ImportError, OSError):
+            pass
+
+        existing: dict = {}
+        try:
+            loaded = json.loads(path.read_bytes().decode("utf-8-sig"))
+            if isinstance(loaded, dict):
+                existing = loaded
+        except (OSError, ValueError, UnicodeDecodeError, RecursionError):
+            existing = {}
+
+        current = existing.get("never_reclaim")
+        if isinstance(current, str):
+            current = [current]
+        if not isinstance(current, list):
+            current = []
+        names = [v.strip() for v in current
+                 if isinstance(v, str) and v.strip()]
+
+        if name not in names:
+            names.append(name)
+        existing["never_reclaim"] = names
+
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
+        tmp.replace(path)
+    return names
 
 
 def main() -> int:
@@ -1187,25 +1447,19 @@ def main() -> int:
                         help="add a cgroup to the never-reclaim list")
     args = parser.parse_args()
 
-    steward = Steward()
-
     if args.protected_add:
-        cfg = load_config()
-        lst = list(cfg["never_reclaim"])
-        if args.protected_add not in lst:
-            lst.append(args.protected_add)
-        path = config_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
         try:
-            existing = json.loads(path.read_text()) if path.exists() else {}
-        except (OSError, ValueError):
-            existing = {}
-        if not isinstance(existing, dict):
-            existing = {}
-        existing["never_reclaim"] = lst
-        path.write_text(json.dumps(existing, indent=2))
+            lst = add_never_reclaim(args.protected_add)
+        except ValueError as exc:
+            print(f"ram-keeper: {exc}", file=sys.stderr)
+            return 2
+        except OSError as exc:
+            print(f"ram-keeper: could not write config: {exc}", file=sys.stderr)
+            return 1
         print(json.dumps({"protected": lst}))
         return 0
+
+    steward = Steward()
 
     if args.once:
         # Prefer the daemon's published snapshot: it carries the forecast.

@@ -1,4 +1,8 @@
-"""Integration tests: process_guardian + ram_keeper working together."""
+"""Helper-contract tests for process_guardian + ram_keeper.
+
+These tests exercise functions side by side; they do not verify runtime wiring
+or mean Process Guardian is enabled in the production daemon.
+"""
 
 import json
 import sys
@@ -54,7 +58,7 @@ def mock_system_state():
 
 
 # ---------------------------------------------------------------------------
-# Integration: process_guardian feeds ram_keeper
+# Helper contract: process_guardian feeds ram_keeper
 # ---------------------------------------------------------------------------
 
 class TestGuardianToRamKeeper:
@@ -116,13 +120,14 @@ class TestGuardianToRamKeeper:
 
         # Verify it loads correctly — patch config_path AND Path.home to isolate
         with patch("ram_keeper.config_path", return_value=config_file), \
-             patch("ram_keeper.Path.home", return_value=tmp_path):
+             patch("ram_keeper.state_dir",
+                   return_value=tmp_path / ".local/state/ram-keeper"):
             config = rk.load_config()
         assert "app-my-critical-app.scope" in config["protected"]
 
 
 # ---------------------------------------------------------------------------
-# Integration: ram_keeper scan + process_guardian detection
+# Helper contract: ram_keeper scan + process_guardian detection
 # ---------------------------------------------------------------------------
 
 class TestScanWithGuardian:
@@ -273,7 +278,7 @@ class TestScanWithGuardian:
 
 
 # ---------------------------------------------------------------------------
-# Integration: Full pipeline
+# Helper contract: Full pipeline
 # ---------------------------------------------------------------------------
 
 class TestFullPipeline:
@@ -330,7 +335,8 @@ class TestFullPipeline:
 
         # Load and verify — patch config_path AND Path.home to isolate
         with patch("ram_keeper.config_path", return_value=config_file), \
-             patch("ram_keeper.Path.home", return_value=tmp_path):
+             patch("ram_keeper.state_dir",
+                   return_value=tmp_path / ".local/state/ram-keeper"):
             config = rk.load_config()
 
         assert "app-new-critical.scope" in config["protected"]
@@ -381,7 +387,7 @@ class TestFullPipeline:
 
 
 # ---------------------------------------------------------------------------
-# Integration: Error handling across modules
+# Helper contract: Error handling across modules
 # ---------------------------------------------------------------------------
 
 class TestErrorHandlingIntegration:
@@ -426,7 +432,7 @@ class TestErrorHandlingIntegration:
 
 
 # ---------------------------------------------------------------------------
-# Integration: Config consistency
+# Helper contract: Config consistency
 # ---------------------------------------------------------------------------
 
 class TestConfigConsistency:

@@ -1,105 +1,39 @@
-# Update de Configuração do RAM Keeper Plugin
+# RAM Keeper maintainer notes
 
-## Status Atual dos Serviços
+This replaces the former machine-specific service-status snapshot. Service names,
+enabled state, and protection choices change over time; do not treat this file as
+live status or copy its contents into a user's configuration.
 
-| Serviço | Habilitado | Ativo | Memória | Proteção | Ação |
-|---------|------------|-------|---------|----------|------|
-| **ollama.service** | ✅ Sim | ✅ Sim | ~687 MB | ✅ Protegido | MANTER |
-| **hermes-gateway.service** | ✅ Sim | ✅ Sim | ~304 MB | ✅ Protegido | MANTER (ou desativar se não usa) |
-| **sia-brainstem.service** | ✅ Sim | ✅ Sim | ~217 MB | ✅ Protegido | MANTER (ou desativar se não usa) |
-| **zenfree.service** | ✅ Sim | ✅ Sim | ~46 MB | ✅ Protegido | MANTER |
-| **zenfree-opencode.service** | ❌ Não | ✅ Sim* | - | ✅ Protegido | OK |
-| **syncthing.service** | - | - | - | - | Verificar |
+## Configuration and protection
 
-_*Ativo por causa do `Wants=zenfree-opencode.service` no zenfree.service_
+- User settings live at `~/.config/ram-keeper/config.json`.
+- The daemon protects entries in `protected` and its built-in inviolable set.
+- `max_victim_fraction` applies to each target cgroup's current memory for an
+  actual reclaim request. The no-argument planning bound is system-wide only.
+- Inspect the live system before recommending that a service be enabled,
+  disabled, stopped, or protected.
 
-## Verificação de Proteção Aplicada
+## Memory telemetry
 
-O ram-keeper agora está protegendo automaticamente estes processos:
-- `hermes-gateway`
-- `ollama`
-- `sia-brainstem`
-- `syncthing`
-- `zenfree-opencode`
-- `wayland-wm@hyprland.desktop` (compositor - protegido por sistema)
+- `memory_reading_valid` requires a positive `MemTotal` and a present,
+  in-range `MemAvailable`. Invalid readings produce `state=unknown`, null
+  derived metrics, a cleared forecast, and no reclaim—even with a forced request.
+- `memory_breakdown_valid` additionally requires a valid `Cached` value. Free
+  percentage remains usable without it, but the Apps/Cache/Free split is null
+  and the panel hides the chart instead of treating missing cache as zero.
+- PSI carries an explicit `available` flag. An unreadable or malformed source is
+  not a real zero-pressure reading.
 
-## Ações Recomendadas
+## Process Guardian status
 
-### Para manter apenas serviços essenciais:
+`helper/process_guardian.py` currently provides process-discovery and protection
+helpers, but the production daemon does not call it. Do not describe dynamic
+new-process protection as active until the runtime integration is implemented
+and verified. The daemon's current protections come from its own configuration
+and built-in inviolable rules.
 
-```bash
-# Desativar Hermes Gateway (rede social/AI providers)
-systemctl --user disable hermes-gateway.service
-systemctl --user stop hermes-gateway.service
+## Test safety
 
-# Desativar SIA Brainstem (rede de armazenamento descentralizado)
-systemctl --user disable sia-brainstem.service
-systemctl --user stop sia-brainstem.service
-```
-
-### Para manter todos os serviços (configuração atual):
-
-A configuração foi atualizada em `~/.config/ram-keeper/config.json` para proteger:
-- `ollama.service` - servidor local de IA
-- `hermes-gateway.service` - gateway de mensagens
-- `sia-brainstem.service` - daemon da rede SIA
-- `zenfree.service` - proxy OpenAI
-- `zenfree-opencode.service` - servidor opencode
-- `syncthing.service` - sincronização de arquivos (adicionar se usado)
-
-### Para adicionar mais proteções:
-
-```bash
-# Adicionar um serviço à lista de proteção
-python3 ~/.config/omarchy/plugins/ram-keeper/helper/ram_keeper.py --protected-add nome-do-servico.service
-```
-
-## Configuração Atual (`~/.config/ram-keeper/config.json`)
-
-```json
-{
-  "target_free_percent": 20.0,
-  "critical_free_percent": 10.0,
-  "psi_some_percent": 6.0,
-  "min_target_bytes": 150000000,
-  "cache_first": true,
-  "protected": [
-    "wayland-wm@hyprland.desktop",
-    "quickshell",
-    "ram-keeper",
-    "ollama.service",
-    "syncthing.service",
-    "hermes-gateway.service",
-    "sia-brainstem.service",
-    "zenfree-opencode.service",
-    "zenfree.service"
-  ]
-}
-```
-
-## Resumo
-
-✅ **Protegido (não será reclamado)**:
-- Compositor (wayland-wm@hyprland.desktop)
-- Shell (quickshell)
-- Ram-keeper (o próprio daemon)
-- Ollama (servidor local de IA)
-- Hermes Gateway
-- SIA Brainstem
-- ZenFree/Opencode
-
-✅ **Manter ativo se usado**:
-- Ollama - se usa IA localmente
-- ZenFree - se usa proxy OpenAI
-- Syncthing - se sincroniza arquivos
-
-❌ **Desativar se não usado**:
-- Hermes Gateway - se não usa integração com redes sociais/AI providers
-- SIA Brainstem - se não usa a rede Sia para armazenamento
-
-## Verificação
-
-Para verificar o estado atual:
-```bash
-python3 ~/.config/omarchy/plugins/ram-keeper/helper/ram_keeper.py --once | python3 -c 'import json,sys; d=json.load(sys.stdin); print(f"Estado: {d[\"state\"]}, Livre: {d[\"free_percent\"]}%")'
-```
+The deterministic request-sizing checks run by default. The optional live stress
+case allocates about 4.8 GB and waits three minutes; run it only when that
+resource use is explicitly acceptable by setting `RAM_KEEPER_DANGEROUS_TESTS=1`.

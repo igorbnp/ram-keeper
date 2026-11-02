@@ -29,6 +29,7 @@ the rest keep their defaults. Delete the file to return to defaults.
 |---|---|---|
 | `interval_idle` | `20.0` | Seconds between passes when healthy. |
 | `interval_pressure` | `5.0` | Seconds between passes under pressure. |
+| `reclaim_sleep` | `0.4` | Seconds to wait after asking a cgroup to give memory back, before measuring what actually came back. Cache reclaim is synchronous; anon→zram can take a moment to be accounted. Clamped to 0–5. |
 
 Reading cgroups is cheap (a few dozen small files), so `interval_idle` can go
 lower. There's no reason to raise it — the daemon does nothing when healthy.
@@ -84,11 +85,29 @@ indexers that rebuild their caches slowly and cost nothing to leave running.
 localsearch-3.service
 ```
 
-To protect something else, add its cgroup name to `never_reclaim`:
+Names are matched loosely, in the direction that protects more rather than less:
+the unit suffix is optional, `app-` is optional, the trailing PID/hash that
+systemd glues onto desktop apps is optional, and a reverse-DNS id can be given
+by its last component. So all of these are the same setting:
+
+| You write | What it protects |
+|---|---|
+| `spotify` | `app-Spotify-1043.scope` |
+| `chromium` | `app-org.chromium.Chromium-991.scope` |
+| `syncthing` | `syncthing.service` |
+| `localsearch-3` | `localsearch-3.service` |
+| `app-Foo-2.scope` | that exact instance only |
+
+Hyphens are never split, so protecting `syncthing` cannot accidentally protect
+`syncthing-server`. The compositor, the session scope, the shell, the user
+manager (`init.scope`) and the daemon itself are protected unconditionally and
+cannot be removed by any config file.
+
+To protect something else, add it by the name you see in the panel:
 
 ```bash
 python3 ~/.config/omarchy/plugins/ram-keeper/helper/ram_keeper.py \
-  --protected-add your-app.scope
+  --protected-add your-app
 ```
 
 To find a cgroup name:
@@ -145,8 +164,9 @@ python3 ~/.config/omarchy/plugins/ram-keeper/helper/ram_keeper.py \
 
 ## Troubleshooting
 
-**The panel says the daemon is off** — it polls `systemctl is-active` every 15 s.
-Start it:
+**The panel says the daemon is off** — liveness comes from the snapshot the
+daemon publishes every pass (5 s under pressure, 20 s idle); no snapshot for
+180 s means it stopped. Start it:
 
 ```bash
 systemctl --user start ram-keeper.service

@@ -29,41 +29,47 @@ function formatRate(bytes) {
 
 // Order matters — the bar reads left to right like a sentence:
 // apps, then cache, then what is genuinely free and available.
-function memorySegments(snapshot) {
-  if (!snapshot || !snapshot.mem_total) return [];
-  var total = snapshot.mem_total;
-  var cached = Math.max(0, Number(snapshot.cached) || 0);
+// ---[ memory parts ]-------------------------------------------------------
+// One normalisation for both the bar and the legend.
+//
+// The helper already publishes values that are supposed to sum to MemTotal, but
+// a snapshot is data from another process: a race between two /proc reads, an
+// older helper, or a hand-edited state.json can put `anon_and_kernel + cached`
+// above `mem_total`. Painting fractions straight from that produced a bar 200%
+// wide (clipped, so it looks full) and a legend claiming more memory than the
+// machine has. The total is the authority; the parts are clamped into it.
+function memoryParts(snapshot) {
+  if (!snapshot || snapshot.memory_breakdown_valid === false) return null;
+  var total = Number(snapshot.mem_total);
+  if (!isFinite(total) || total <= 0) return null;
   var used = Math.max(0, Number(snapshot.mem_used) || 0);
-  // The helper already publishes `anon_and_kernel`, clamped so the three parts
-  // sum to MemTotal exactly. Prefer it; fall back to deriving from mem_used
-  // only if an older helper is on disk.
-  var realUsed = Number(snapshot.anon_and_kernel);
-  if (!isFinite(realUsed) || realUsed < 0) {
-    realUsed = Math.max(0, Math.min(used - cached, used));
+  var cached = Math.max(0, Number(snapshot.cached) || 0);
+  var apps = Number(snapshot.anon_and_kernel);
+  if (!isFinite(apps) || apps < 0) {
+    apps = Math.max(0, Math.min(used - cached, used));
   }
-  var free = Math.max(0, total - realUsed - cached);
+  apps = Math.max(0, Math.min(total, apps));
+  var cache = Math.max(0, Math.min(total - apps, cached));
+  return { total: total, apps: apps, cache: cache, free: total - apps - cache };
+}
 
+function memorySegments(snapshot) {
+  var parts = memoryParts(snapshot);
+  if (!parts) return [];
   return [
-    { key: "apps", label: "Apps", bytes: realUsed, tone: "primary" },
-    { key: "cache", label: "Cache", bytes: cached, tone: "cache" },
-    { key: "free", label: "Free", bytes: free, tone: "free" }
+    { key: "apps", label: "Apps", bytes: parts.apps, tone: "primary" },
+    { key: "cache", label: "Cache", bytes: parts.cache, tone: "cache" },
+    { key: "free", label: "Free", bytes: parts.free, tone: "free" }
   ].filter(function (s) { return s.bytes > 0; });
 }
 
 function memoryPercentages(snapshot) {
-  if (!snapshot || !snapshot.mem_total) return [];
-  var total = snapshot.mem_total;
-  var used = Math.max(0, Number(snapshot.mem_used) || 0);
-  var cached = Math.max(0, Number(snapshot.cached) || 0);
-  var realUsed = Number(snapshot.anon_and_kernel);
-  if (!isFinite(realUsed) || realUsed < 0) {
-    realUsed = Math.max(0, Math.min(used - cached, used));
-  }
-  var free = Math.max(0, total - realUsed - cached);
+  var parts = memoryParts(snapshot);
+  if (!parts) return [];
   return [
-    { key: "apps", label: "Apps", fraction: realUsed / total, tone: "primary" },
-    { key: "cache", label: "Cache", fraction: cached / total, tone: "cache" },
-    { key: "free", label: "Free", fraction: free / total, tone: "free" }
+    { key: "apps", label: "Apps", fraction: parts.apps / parts.total, tone: "primary" },
+    { key: "cache", label: "Cache", fraction: parts.cache / parts.total, tone: "cache" },
+    { key: "free", label: "Free", fraction: parts.free / parts.total, tone: "free" }
   ].filter(function (s) { return s.fraction > 0.001; });
 }
 
@@ -153,6 +159,11 @@ function forecastRow(forecast) {
   };
 }
 
+function forecastForSnapshot(snapshot) {
+  if (!snapshot || snapshot.state === "unknown" || snapshot.memory_reading_valid === false) return null;
+  return forecastRow(snapshot.forecast);
+}
+
 // Humanise a horizon. Seconds matter when they are small — "in 45s" is
 // actionable, "in 0.01 minutes" is noise.
 function horizonLabel(seconds) {
@@ -193,7 +204,11 @@ function reclaimableGroups(snapshot, limit) {
         kind: g.kind || ""
       };
     });
-  rows.sort(function (a, b) { return b.bytes - a.bytes; });
+  // Ordered by what this pass could RECOVER, which is not the same as size: a
+  // 2 GB process holding 150 MB of giveable memory matters less than a 500 MB
+  // process that can give 500 MB. The section is titled "available to reclaim",
+  // so the first row has to be the one that gives the most.
+  rows.sort(function (a, b) { return (b.give - a.give) || (b.bytes - a.bytes); });
   return typeof limit === "number" ? rows.slice(0, limit) : rows;
 }
 
@@ -247,17 +262,21 @@ function swapRows(snapshot) {
 // ---------------------------------------------------------------------------
 
 function psiRow(psi) {
-  if (!psi) return { stallPercent: 0, severity: "ok" };
-  var stall = Math.max(Number(psi.some_avg60) || 0, Number(psi.full_avg60) || 0);
+  if (!psi || psi.available === false || typeof psi.some_avg60 !== "number"
+      || !isFinite(psi.some_avg60) || psi.some_avg60 < 0) {
+    return { stallPercent: 0, severity: "unavailable", available: false };
+  }
+  var stall = Math.max(psi.some_avg60, Number(psi.full_avg60) || 0);
   var severity = "ok";
   if (stall >= 20) severity = "critical";
   else if (stall >= 6) severity = "warning";
   else if (stall >= 1) severity = "notice";
-  return { stallPercent: stall, severity: severity };
+  return { stallPercent: stall, severity: severity, available: true };
 }
 
 function psiLabel(row) {
-  if (!row || row.severity === "ok") return "None";
+  if (!row || row.severity === "unavailable" || row.available === false) return "Unavailable";
+  if (row.severity === "ok") return "None";
   return row.stallPercent.toFixed(1) + "%";
 }
 
@@ -272,7 +291,12 @@ function parseSnapshot(raw) {
   } catch (e) {
     return null;
   }
-  if (!data || typeof data !== "object" || !data.mem_total) return null;
+  if (!data || typeof data !== "object") return null;
+  // A fresh daemon snapshot with invalid memory metrics is still useful: it
+  // tells the panel the sensor is unreadable. Do not reject it and keep an old
+  // healthy reading on screen.
+  if (data.state === "unknown" && data.memory_reading_valid === false) return data;
+  if (!data.mem_total) return null;
   return data;
 }
 
@@ -307,6 +331,13 @@ function summaryLine(result) {
 // Free-memory gauge target
 // ---------------------------------------------------------------------------
 
+function freePercentLabel(snapshot) {
+  if (!snapshot || snapshot.state === "unknown" || snapshot.memory_reading_valid === false) return "--%";
+  var percent = Number(snapshot.free_percent);
+  if (!isFinite(percent)) return "--%";
+  return Math.round(percent) + "%";
+}
+
 function freeFraction(snapshot) {
   if (!snapshot || !snapshot.mem_total) return 1;
   return Math.max(0, Math.min(1, Number(snapshot.free_percent || 0) / 100));
@@ -330,6 +361,7 @@ if (typeof module !== "undefined" && module.exports) {
     isUrgent: isUrgent,
     isWarning: isWarning,
     forecastRow: forecastRow,
+    forecastForSnapshot: forecastForSnapshot,
     horizonLabel: horizonLabel,
     reclaimableGroups: reclaimableGroups,
     protectedGroups: protectedGroups,
@@ -340,6 +372,7 @@ if (typeof module !== "undefined" && module.exports) {
     parseResult: parseResult,
     parseJsonLine: parseJsonLine,
     summaryLine: summaryLine,
+    freePercentLabel: freePercentLabel,
     freeFraction: freeFraction,
     usedFraction: usedFraction
   };
