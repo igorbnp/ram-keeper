@@ -66,9 +66,21 @@ def build_snapshot(victim_anon_mb, victim_file_mb, state, free_pct):
 print("== 1. the cap is derived from the victim's size, not fixed ==")
 s = rk.Steward()
 teto = s.max_victim_slice()
-print(f"  max_victim_slice = {teto//MB} MB ({s.config['max_victim_fraction']}% of 8 GB)")
-check("cap is positive and bounded", 0 < teto <= 2 * 1024 * MB,
-      f"{teto//MB}MB")
+frac = s.config["max_victim_fraction"]
+total = int(rk.meminfo().get("MemTotal", 0) or 0)
+print(f"  max_victim_slice = {teto//MB} MB ({frac}% of {total//MB} MB)")
+# Machine-independent invariants: an absolute byte ceiling turns this suite into
+# a test of the runner's RAM. A 16 GB CI box legitimately plans a 3995 MB ceiling
+# where an 8 GB laptop plans 2047 MB; what must hold everywhere is the relation.
+check("cap is positive", teto > 0, f"{teto//MB}MB")
+check("planning cap is the configured fraction of MemTotal",
+      total > 0 and teto == int(frac * total // 100),
+      f"{teto//MB}MB vs {frac}% of {total//MB}MB")
+check("cap tracks the victim, not a fixed number",
+      s.max_victim_slice(400 * MB) == int(frac * 400 * MB // 100)
+      and s.max_victim_slice(400 * MB) < 400 * MB,
+      f"{s.max_victim_slice(400 * MB)//MB}MB of 400MB")
+check("cap is zero for an empty victim", s.max_victim_slice(0) == 0)
 
 print("\n== 2. the exact shape that killed the browser ==")
 # critical, one 300MB-anon victim with a little cache: previously asked 1521MB.

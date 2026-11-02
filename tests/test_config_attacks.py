@@ -6,7 +6,11 @@ produced or could produce; none of them may crash the daemon, and none may
 silently turn protection off.
 
 These run against a temporary config path, never the live one.
+
+The CI matrix starts at Python 3.9, where `bytes | str` in an annotation is
+evaluated at import time and raises TypeError; PEP 563 fixes that.
 """
+from __future__ import annotations
 
 import json
 import os
