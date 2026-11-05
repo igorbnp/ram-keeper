@@ -1025,6 +1025,10 @@ class Steward:
         # An imminent crossing is pressure the floor does not show yet. Treat
         # it as its own state so the daemon acts before the number moves rather
         # than after — which is the entire reason for having a forecast.
+        # Remember a stall that this promotion hides. The small-gap trending
+        # path would otherwise return without touching the cache the stall
+        # was supposed to drop.
+        psi_stalling = state == "stalling"
         if state in ("ok", "stalling") and self.last_forecast.urgency == "imminent":
             state = "trending"
 
@@ -1067,6 +1071,7 @@ class Steward:
             "reclaimable_total": sum(g.reclaimable for g in victims),
             "checked_at": time.time(),
             "version": self.started_version,
+            "psi_stalling": psi_stalling,
         }
 
     # -- reclamation -----------------------------------------------------
@@ -1271,8 +1276,11 @@ class Steward:
         # Inside the margin the 512 MB floor would ask for MORE, not less.
         # A forecast that close to the floor waits; it does not lunge.
         if state == "trending" and not force and not trending_sized:
-            return {"acted": False, "reason": "trending within floor margin",
-                    "actions": []}
+            if snap.get("psi_stalling"):
+                cache_only = True
+            else:
+                return {"acted": False, "reason": "trending within floor margin",
+                        "actions": []}
 
         if force:
             needed = int(self.config["max_reclaim_per_pass"])

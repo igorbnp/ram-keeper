@@ -249,6 +249,41 @@ def test_stalling_drops_cache_and_leaves_anonymous_memory():
     assert result["actions"]
 
 
+def test_stall_with_an_imminent_forecast_and_a_small_gap_drops_cache(monkeypatch):
+    """A stall promoted to trending must still try cache when the gap is small."""
+    steward = steward_with()
+    total = 8192 * MB
+    available = int(total * 18.9 / 100)
+    monkeypatch.setattr(rk, "meminfo", lambda: {
+        "MemTotal": total, "MemAvailable": available, "Cached": 400 * MB})
+    monkeypatch.setattr(rk, "psi", lambda resource="memory": {
+        "available": True, "some_avg60": 8.0})
+    monkeypatch.setattr(rk, "zram_stats", lambda: {"devices": []})
+    monkeypatch.setattr(rk, "user_root", lambda: Path("/no-such-cgroup"))
+    group = rk.Cgroup(
+        path=Path("/no-such-cgroup/app-stall.scope"),
+        name="app-stall.scope", kind="scope", label="stall",
+        current=800 * MB, anon=700 * MB, reclaimable=100 * MB, file=100 * MB,
+        reclaimable_file=100 * MB)
+    monkeypatch.setattr(rk, "scan", lambda *args, **kwargs: [group])
+
+    class _Imminent:
+        urgency = "imminent"
+
+        def as_dict(self):
+            return {"urgency": "imminent", "horizon_seconds": 40}
+
+    monkeypatch.setattr(steward.tracker, "forecast", lambda target: _Imminent())
+    recorder = Recorder()
+    steward.reclaim_from = recorder
+    snap = steward.snapshot()
+    assert snap["state"] == "trending"
+    result = steward.relieve(snap)
+    assert recorder.asks, "a stall with a small remainder made no attempt"
+    assert recorder.cache_only == [True]
+    assert result["acted"] is True
+
+
 def test_stalling_with_imminent_forecast_becomes_trending(monkeypatch):
     steward = steward_with()
     total = 8000 * MB
