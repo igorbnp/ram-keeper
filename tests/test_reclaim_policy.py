@@ -194,6 +194,34 @@ def test_vanished_cgroup_reports_zero_freed(tmp_path):
         f"a vanished cgroup was reported as {action.outcome!r}")
 
 
+def test_trending_inside_the_margin_does_not_ask_for_the_floor():
+    steward = steward_with(max_reclaim_per_pass=4096 * MB)
+    recorder = Recorder()
+    steward.reclaim_from = recorder
+    total = 8192 * MB
+    floor = int(total * 18 / 100)
+    group = make_group("app-near.scope", current=800 * MB, anon=700 * MB,
+                       reclaimable=100 * MB)
+    close = make_snapshot(
+        [group], state="trending", free_percent=18.9, total=total,
+        available=floor + 76 * MB,
+        forecast={"urgency": "imminent", "horizon_seconds": 40})
+    result = steward.relieve(close)
+    assert recorder.asks == []
+    assert result["reason"] == "trending within floor margin"
+    assert result["acted"] is False
+
+    recorder.asks.clear()
+    wide = make_snapshot(
+        [group], state="trending", free_percent=22.0, total=total,
+        available=floor + 300 * MB,
+        forecast={"urgency": "imminent", "horizon_seconds": 40})
+    steward.relieve(wide)
+    asked = sum(amount for _, amount in recorder.asks)
+    assert asked > 0
+    assert asked < 512 * MB
+
+
 def test_stalling_drops_cache_and_leaves_anonymous_memory():
     steward = steward_with(anon_reclaim_cooldown=0, max_reclaim_per_pass=4096 * MB,
                            max_victim_fraction=60)

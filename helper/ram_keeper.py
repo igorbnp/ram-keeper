@@ -1188,6 +1188,7 @@ class Steward:
         # Without this, a forecast on a machine with 3.6 GB free fell through to
         # the 64 MB floor and reclaimed from a healthy system — the forecast
         # would have been the cause of the pressure it exists to prevent.
+        trending_sized = False
         if (state == "trending"
                 and forecast.get("urgency") in ("soon", "imminent")
                 and forecast.get("horizon_seconds")
@@ -1204,6 +1205,13 @@ class Steward:
             headroom = self.max_victim_slice()
             slice_of_gap = gap // 3 if horizon < 600 else min(gap // 3, headroom // 2)
             needed = max(min(slice_of_gap, headroom), 64 * 1024 * 1024)
+            trending_sized = True
+
+        # Inside the margin the 512 MB floor would ask for MORE, not less.
+        # A forecast that close to the floor waits; it does not lunge.
+        if state == "trending" and not force and not trending_sized:
+            return {"acted": False, "reason": "trending within floor margin",
+                    "actions": []}
 
         if force:
             needed = int(self.config["max_reclaim_per_pass"])
