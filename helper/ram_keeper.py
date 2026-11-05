@@ -965,7 +965,7 @@ class Steward:
         # An imminent crossing is pressure the floor does not show yet. Treat
         # it as its own state so the daemon acts before the number moves rather
         # than after — which is the entire reason for having a forecast.
-        if state == "ok" and self.last_forecast.urgency == "imminent":
+        if state in ("ok", "stalling") and self.last_forecast.urgency == "imminent":
             state = "trending"
 
         # MemAvailable already excludes reclaimable cache, so the honest split of
@@ -1158,9 +1158,14 @@ class Steward:
             return {"acted": False,
                     "reason": "memory reading unavailable; refusing to reclaim",
                     "actions": []}
-        if state in ("ok", "stalling") and not force:
+        if state == "ok" and not force:
             return {"acted": False, "reason": f"no pressure (state={state}, free={free_percent}%)",
                     "actions": []}
+        # PSI says the machine is waiting, but the floor is not crossed and the
+        # forecast is not imminent. Drop cache only: swapping anon here is what
+        # turns a stall into the thrash the stall was warning about.
+        if state == "stalling" and not force:
+            cache_only = True
 
         # How much do we actually need? Under real pressure the deficit is the
         # honest number: ask for the shortfall plus headroom, not a fixed
@@ -1391,7 +1396,7 @@ class Steward:
                 # one cgroup), so ticking at the 5s pressure rate for it just
                 # bought a full 51-cgroup walk and a `swapon` subprocess every
                 # five seconds, forever, doing nothing.
-                pressure = snap["state"] in ("tight", "critical", "trending")
+                pressure = snap["state"] in ("tight", "critical", "trending", "stalling")
                 self._sleep(self.config["interval_pressure"] if pressure
                             else self.config["interval_idle"])
 

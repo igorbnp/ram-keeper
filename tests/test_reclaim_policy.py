@@ -194,6 +194,40 @@ def test_vanished_cgroup_reports_zero_freed(tmp_path):
         f"a vanished cgroup was reported as {action.outcome!r}")
 
 
+def test_stalling_drops_cache_and_leaves_anonymous_memory():
+    steward = steward_with(anon_reclaim_cooldown=0, max_reclaim_per_pass=4096 * MB,
+                           max_victim_fraction=60)
+    recorder = Recorder()
+    steward.reclaim_from = recorder
+    group = make_group("app-stall.scope", current=800 * MB, anon=700 * MB,
+                       reclaimable=100 * MB)
+    result = steward.relieve(make_snapshot([group], state="stalling", free_percent=20.0))
+    assert recorder.asks
+    assert recorder.cache_only == [True]
+    assert result["actions"]
+
+
+def test_stalling_with_imminent_forecast_becomes_trending(monkeypatch):
+    steward = steward_with()
+    total = 8000 * MB
+    monkeypatch.setattr(rk, "meminfo", lambda: {
+        "MemTotal": total, "MemAvailable": 2000 * MB, "Cached": 100 * MB})
+    monkeypatch.setattr(rk, "psi", lambda resource="memory": {
+        "available": True, "some_avg60": 8.0})
+    monkeypatch.setattr(rk, "zram_stats", lambda: {"devices": []})
+    monkeypatch.setattr(rk, "user_root", lambda: Path("/no-such-cgroup"))
+    monkeypatch.setattr(rk, "scan", lambda *args, **kwargs: [])
+
+    class _Imminent:
+        urgency = "imminent"
+
+        def as_dict(self):
+            return {"urgency": "imminent", "horizon_seconds": 30}
+
+    monkeypatch.setattr(steward.tracker, "forecast", lambda target: _Imminent())
+    assert steward.snapshot()["state"] == "trending"
+
+
 def test_gone_or_denied_does_not_spend_the_budget():
     class _Reply:
         def __init__(self):
