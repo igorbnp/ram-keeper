@@ -194,6 +194,20 @@ def test_vanished_cgroup_reports_zero_freed(tmp_path):
         f"a vanished cgroup was reported as {action.outcome!r}")
 
 
+def test_cache_sweep_ignores_unreachable_anon_and_runs_without_cache_first():
+    group = make_group("app-noswap.scope", current=4100 * MB, anon=4000 * MB,
+                       reclaimable=100 * MB, swapable=False)
+    steward = steward_with(cache_first=False, max_reclaim_per_pass=4096 * MB,
+                           max_victim_fraction=100, anon_reclaim_cooldown=0)
+    recorder = Recorder()
+    steward.reclaim_from = recorder
+    snap = make_snapshot([group], state="critical", free_percent=5.0)
+    steward.relieve(snap, force=True, cache_only=True)
+    assert recorder.asks, "Drop cache did nothing when cache_first is off"
+    assert recorder.cache_only == [True]
+    assert recorder.asks[0][1] == 64 * MB
+
+
 def test_trending_inside_the_margin_does_not_ask_for_the_floor():
     steward = steward_with(max_reclaim_per_pass=4096 * MB)
     recorder = Recorder()

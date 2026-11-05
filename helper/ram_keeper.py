@@ -1233,12 +1233,14 @@ class Steward:
         # service that is itself protected.
         _never = set(self.config["never_reclaim"])
         _floor = int(self.config["min_target_bytes"])
-        available = sum((g.get("reclaimable") or 0) + (g.get("anon") or 0)
-                        for g in snap_groups
-                        if not g.get("protected")
-                        and not names_match(g.get("name") or "", _never)
-                        and not is_inviolable(g.get("name") or "")
-                        and (g.get("current") or 0) > _floor)
+        available = sum(
+            (g.get("reclaimable") or 0)
+            + ((g.get("anon") or 0) if (not cache_only and g.get("swapable", True)) else 0)
+            for g in snap_groups
+            if not g.get("protected")
+            and not names_match(g.get("name") or "", _never)
+            and not is_inviolable(g.get("name") or "")
+            and (g.get("current") or 0) > _floor)
         # No floor when there is nothing reachable: a phantom budget reads as
         # work the pass could do, on a pass that can do nothing.
         if available > 0:
@@ -1283,7 +1285,7 @@ class Steward:
                       and g.current > self.config["min_target_bytes"]]
 
         # Pass 1: page cache, cheapest and invisible to the user.
-        if self.config["cache_first"]:
+        if self.config["cache_first"] or cache_only:
             for group in sorted(candidates, key=lambda g: g.reclaimable, reverse=True):
                 if budget <= 0:
                     break
