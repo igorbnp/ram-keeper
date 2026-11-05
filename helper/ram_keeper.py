@@ -472,6 +472,7 @@ INVIOABLE_PROTECTED = frozenset({
     "session",                        # any session-* scope
     "quickshell",                     # the shell that draws this panel
     "ram-keeper",                     # ourselves
+    "ram-keeper-notify",              # the notifier; a different unit from the daemon
     # systemd --user's own manager. It is a leaf cgroup holding the thing that
     # would have to act on a problem, so making it a victim is self-defeating:
     # reclaiming from it stalls every unit the user has.
@@ -480,18 +481,18 @@ INVIOABLE_PROTECTED = frozenset({
 
 
 def is_inviolable(name: str) -> bool:
-    """True for cgroups no config file may ever hand to a reclaim sweep."""
-    if name in INVIOABLE_PROTECTED:
+    """True for cgroups no config file may ever hand to a reclaim sweep.
+
+    `names_match` understands `app-quickshell-<pid>.scope`. A suffix strip
+    alone leaves that name unprotected. `session-N.scope` is numbered per
+    login, so the session prefix stays as its own check and is not a
+    substring search (an app named `minha-session` is not the session).
+    """
+    if not isinstance(name, str) or not name:
+        return False
+    if names_match(name, INVIOABLE_PROTECTED):
         return True
-    # Strip every systemd unit suffix, not just two: session.slice has to
-    # reduce to "session", which .removesuffix(".scope") alone does not do.
-    base = name
-    for suffix in (".service", ".scope", ".slice"):
-        base = base.removesuffix(suffix)
-    if base in INVIOABLE_PROTECTED:
-        return True
-    # session.slice, and the compositor's own session-N.scope which is numbered
-    # per login, so the exact name cannot be hard-coded.
+    base = _strip_unit_suffix(name.strip())
     return base == "session" or base.startswith("session-")
 
 
