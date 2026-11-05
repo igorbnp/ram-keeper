@@ -872,11 +872,15 @@ class Action:
         return self.outcome in ("ok", "eagain")
 
 
+def manifest_path() -> Path:
+    """The manifest shipped next to this plugin, on disk."""
+    return Path(__file__).resolve().parent.parent / "manifest.json"
+
+
 def plugin_version() -> str:
     """The version the installed manifest claims, or nothing if it is unreadable."""
-    path = Path(__file__).resolve().parent.parent / "manifest.json"
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(manifest_path().read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return ""
     version = data.get("version") if isinstance(data, dict) else ""
@@ -899,6 +903,10 @@ class Steward:
     # Injectable so a test can walk several passes without waiting.
     _clock: object = field(default=time.monotonic, repr=False, compare=False)
     _anon_ready_at: dict = field(default_factory=dict, repr=False, compare=False)
+    # Captured once. A later edit of manifest.json must not make this process
+    # claim it is already the new build: the panel compares this string with
+    # the file it reads itself, and restarts the unit when they differ.
+    started_version: str = field(default_factory=plugin_version, repr=False, compare=False)
 
     # -- logging ---------------------------------------------------------
     def log(self, event: dict) -> None:
@@ -1041,7 +1049,7 @@ class Steward:
             "groups": [asdict(g) | {"path": str(g.path)} for g in groups],
             "reclaimable_total": sum(g.reclaimable for g in victims),
             "checked_at": time.time(),
-            "version": plugin_version(),
+            "version": self.started_version,
         }
 
     # -- reclamation -----------------------------------------------------

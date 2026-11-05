@@ -18,8 +18,16 @@ import "Model.js" as Model
 Item {
   id: root
 
-  property var manifest: null
   property var shell: null
+
+  // The installed manifest, read by this panel. The shell does not have to
+  // inject one: a missing injection used to make the version check a no-op.
+  readonly property string manifestPath: {
+    var helper = decodeURIComponent(
+      String(Qt.resolvedUrl("../helper/ram_keeper.py")).replace(/^file:\/\//, ""))
+    return helper.replace("/helper/ram_keeper.py", "/manifest.json")
+  }
+  property string diskVersion: ""
 
   // Quattro sanitizes third-party manifests, so resolve the helper from this
   // component and decode the file URL before handing it to a process.
@@ -82,8 +90,15 @@ Item {
     if (parsed.checked_at) root.lastHeartbeat = parsed.checked_at
     root.noteHeartbeat()
     root.daemonActive()
-    if (parsed.version && root.manifest && root.manifest.version
-        && String(parsed.version) !== String(root.manifest.version)
+    root.considerVersionRestart()
+  }
+
+  // The daemon publishes the version it loaded at start. This file is the
+  // version on disk now. They differ after `omarchy plugin update` until the
+  // unit is restarted. One restart per shell start: the flag is not cleared.
+  function considerVersionRestart() {
+    var running = root.snapshot && root.snapshot.version ? String(root.snapshot.version) : ""
+    if (running && root.diskVersion && running !== root.diskVersion
         && !root.pausedByUser && !root.versionRestarted) {
       root.versionRestarted = true
       root.lastError = "Restarting protection so it matches this version"
@@ -92,6 +107,24 @@ Item {
         versionRestart.running = true
       }
     }
+  }
+
+  function refreshManifest() {
+    if (!manifestReader || manifestReader.running) return
+    manifestReader.command = ["cat", root.manifestPath]
+    manifestReader.running = true
+  }
+
+  function applyManifest(raw) {
+    var parsed = null
+    try {
+      parsed = JSON.parse(String(raw || ""))
+    } catch (e) {
+      return
+    }
+    if (!parsed || !parsed.version) return
+    root.diskVersion = String(parsed.version)
+    root.considerVersionRestart()
   }
 
   // ---------------------------------------------------------------------
@@ -216,6 +249,14 @@ Item {
   //     re-deliver here either, and the panel froze at its first reading.
   // Reading the path directly always resolves the current inode. Five kilobytes
   // every five seconds is nothing.
+  Process {
+    id: manifestReader
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.applyManifest(text)
+    }
+  }
+
   Process {
     id: stateReader
     // Command assigned in refresh(), not here: a declaration-time command
@@ -355,6 +396,7 @@ Item {
       root.pollTicks += 1;
       root.daemonActive();
       root.refresh();
+      root.refreshManifest();
     }
   }
 
@@ -366,6 +408,7 @@ Item {
     pauseRead.command = ["test", "-f", root.pauseFlagPath]
     pauseRead.running = true
     root.refresh()
+    root.refreshManifest()
   }
 
   Timer {

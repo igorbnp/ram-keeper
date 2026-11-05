@@ -237,6 +237,11 @@ if 'activeAction === "relieve"' not in panel or 'activeAction === "sweep"' not i
     print("  FAIL both action buttons share one Working label")
 else:
     print("  ok   each action button has its own Working label")
+if re.search(r"root\.manifest\b", service) or "manifest.json" not in service:
+    fails += 1
+    print("  FAIL the panel still depends on an injected manifest")
+else:
+    print("  ok   the panel reads manifest.json itself")
 if "paused-by-user" not in service or "pauseKnown" not in service:
     fails += 1
     print("  FAIL the pause is not remembered across a shell restart")

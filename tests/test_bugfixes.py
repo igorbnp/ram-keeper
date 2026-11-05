@@ -375,12 +375,17 @@ def test_manual_action_publishes_a_fresh_snapshot(monkeypatch):
     assert [snap["state"] for snap in published] == ["ok", "ok"]
 
 
-def test_snapshot_carries_the_manifest_version():
+def test_daemon_keeps_the_version_it_started_with(tmp_path, monkeypatch):
+    """A manifest edited after startup must not masquerade as the running code."""
     import ram_keeper as rk
-    manifest = json.loads((Path(rk.__file__).resolve().parent.parent / "manifest.json").read_text(encoding="utf-8"))
-    assert rk.plugin_version() == manifest["version"]
-    snap = rk.Steward(config=rk.load_config()).snapshot()
-    assert snap["version"] == manifest["version"]
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps({"version": "1.2.0"}), encoding="utf-8")
+    monkeypatch.setattr(rk, "manifest_path", lambda: manifest)
+    steward = rk.Steward(config=rk.load_config())
+    assert steward.snapshot()["version"] == "1.2.0"
+    manifest.write_text(json.dumps({"version": "1.3.0"}), encoding="utf-8")
+    assert rk.plugin_version() == "1.3.0"
+    assert steward.snapshot()["version"] == "1.2.0"
 
 
 def test_removing_a_default_stays_removed(monkeypatch, tmp_path):
