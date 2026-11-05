@@ -1403,6 +1403,11 @@ class Steward:
                     pause = float(self.config.get("anon_reclaim_cooldown", 90.0))
                 except (TypeError, ValueError):
                     pause = 90.0
+                # Critical is the state that cannot wait a minute and a half
+                # for the same victim. The ceiling is per cgroup, and a
+                # shorter configured pause stays shorter.
+                if state == "critical" and math.isfinite(pause):
+                    pause = min(pause, 15.0)
                 if math.isfinite(pause) and pause > 0:
                     self._anon_ready_at[group.name] = self._clock() + pause
 

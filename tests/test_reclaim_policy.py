@@ -525,6 +525,52 @@ def test_anon_cooldown_holds_while_an_untouchable_culprit_keeps_pressure():
         "the manual button was blocked by the pause")
 
 
+def test_critical_shortens_the_per_victim_pause_to_fifteen_seconds():
+    clock = _Clock()
+    steward = steward_with(anon_reclaim_cooldown=90, max_reclaim_per_pass=200 * MB,
+                           max_victim_fraction=25, cache_first=False)
+    steward._clock = clock
+    recorder = Recorder()
+    steward.reclaim_from = recorder
+    first = make_group("app-first.scope", current=900 * MB, anon=900 * MB, reclaimable=0)
+    second = make_group("app-second.scope", current=800 * MB, anon=800 * MB, reclaimable=0)
+    snap = make_snapshot([first, second], state="critical", free_percent=5.0)
+
+    def asked(name):
+        return [amount for victim, amount in recorder.asks if victim == name]
+
+    steward.relieve(snap)
+    assert asked("app-first.scope") == [200 * MB]
+    assert asked("app-first.scope")[0] <= steward.max_victim_slice(900 * MB)
+    assert asked("app-second.scope") == []
+
+    clock.now = 5
+    steward.relieve(snap)
+    assert asked("app-first.scope") == [200 * MB]
+    assert asked("app-second.scope") == [200 * MB]
+    assert asked("app-second.scope")[0] <= steward.max_victim_slice(800 * MB)
+
+    clock.now = 14
+    steward.relieve(snap)
+    assert len(asked("app-first.scope")) == 1
+
+    clock.now = 15
+    steward.relieve(snap)
+    assert len(asked("app-first.scope")) == 2
+    assert asked("app-first.scope")[-1] <= steward.max_victim_slice(900 * MB)
+
+    quiet_clock = _Clock()
+    quiet = steward_with(anon_reclaim_cooldown=90, max_reclaim_per_pass=200 * MB,
+                         max_victim_fraction=25, cache_first=False)
+    quiet._clock = quiet_clock
+    quiet_rec = Recorder()
+    quiet.reclaim_from = quiet_rec
+    quiet.relieve(make_snapshot([first], state="tight", free_percent=12.0))
+    quiet_clock.now = 15
+    quiet.relieve(make_snapshot([first], state="tight", free_percent=12.0))
+    assert [name for name, _ in quiet_rec.asks].count("app-first.scope") == 1
+
+
 def test_anon_pass_requires_free_zram():
     steward = steward_with(max_reclaim_per_pass=4096 * MB, max_victim_fraction=60,
                            anon_reclaim_cooldown=0)
