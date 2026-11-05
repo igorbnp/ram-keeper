@@ -1060,49 +1060,49 @@ class TestSleep:
         s = rk.Steward()
         with patch("time.sleep") as mock_sleep:
             s._sleep(0)
-            mock_sleep.assert_called_once_with(20.0)
+            assert [call.args[0] for call in mock_sleep.call_args_list] == [1.0] * 20
 
     def test_rejects_negative(self):
         """Should reject negative values and use default."""
         s = rk.Steward()
         with patch("time.sleep") as mock_sleep:
             s._sleep(-5.0)
-            mock_sleep.assert_called_once_with(20.0)
+            assert [call.args[0] for call in mock_sleep.call_args_list] == [1.0] * 20
 
     def test_rejects_nan(self):
         """Should reject NaN and use default."""
         s = rk.Steward()
         with patch("time.sleep") as mock_sleep:
             s._sleep(float("nan"))
-            mock_sleep.assert_called_once_with(20.0)
+            assert [call.args[0] for call in mock_sleep.call_args_list] == [1.0] * 20
 
     def test_rejects_inf(self):
         """Should reject infinity and use default."""
         s = rk.Steward()
         with patch("time.sleep") as mock_sleep:
             s._sleep(float("inf"))
-            mock_sleep.assert_called_once_with(20.0)
+            assert [call.args[0] for call in mock_sleep.call_args_list] == [1.0] * 20
 
     def test_rejects_string(self):
         """Should reject string values and use default."""
         s = rk.Steward()
         with patch("time.sleep") as mock_sleep:
             s._sleep("abc")
-            mock_sleep.assert_called_once_with(20.0)
+            assert [call.args[0] for call in mock_sleep.call_args_list] == [1.0] * 20
 
     def test_rejects_none(self):
         """Should reject None and use default."""
         s = rk.Steward()
         with patch("time.sleep") as mock_sleep:
             s._sleep(None)
-            mock_sleep.assert_called_once_with(20.0)
+            assert [call.args[0] for call in mock_sleep.call_args_list] == [1.0] * 20
 
     def test_caps_at_3600(self):
         """Should cap sleep at 3600 seconds."""
         s = rk.Steward()
         with patch("time.sleep") as mock_sleep:
             s._sleep(7200.0)
-            mock_sleep.assert_called_once_with(3600.0)
+            assert [call.args[0] for call in mock_sleep.call_args_list] == [1.0] * 3600
 
 
 # ---------------------------------------------------------------------------

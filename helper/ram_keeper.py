@@ -1481,22 +1481,21 @@ class Steward:
             value = 20.0
         if not (value == value) or value <= 0 or value == float("inf"):
             value = 20.0
-        deadline = time.monotonic() + min(value, 3600.0)
+        remaining = min(value, 3600.0)
         try:
             seen = config_path().stat().st_mtime
         except OSError:
             seen = None
-        while True:
+        while remaining > 0:
             try:
                 current = config_path().stat().st_mtime
             except OSError:
                 current = None
             if seen is not None and current != seen:
                 return
-            left = deadline - time.monotonic()
-            if left <= 0:
-                return
-            time.sleep(min(1.0, left))
+            step = min(1.0, remaining)
+            time.sleep(step)
+            remaining -= step
 
 
 # ---------------------------------------------------------------------------
