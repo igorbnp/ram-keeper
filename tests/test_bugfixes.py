@@ -348,3 +348,28 @@ class TestBug10_EffectiveNegative:
             )
             assert action.freed >= 0, \
                 f"effective não deveria ser negativo, obtido {action.freed}"
+
+
+def test_manual_action_publishes_a_fresh_snapshot(monkeypatch):
+    published = []
+
+    class Fake:
+        def relieve(self, force=True):
+            return {"acted": False, "actions": []}
+
+        def sweep_cache(self):
+            return {"acted": False, "actions": []}
+
+        def snapshot(self):
+            return {"mem_total": 1, "state": "ok"}
+
+        def publish(self, snap):
+            published.append(snap)
+
+    monkeypatch.setattr("ram_keeper.Steward", lambda: Fake())
+    import ram_keeper as rk
+    monkeypatch.setattr(sys, "argv", ["ram-keeper", "--relieve"])
+    assert rk.main() == 0
+    monkeypatch.setattr(sys, "argv", ["ram-keeper", "--sweep-cache"])
+    assert rk.main() == 0
+    assert [snap["state"] for snap in published] == ["ok", "ok"]

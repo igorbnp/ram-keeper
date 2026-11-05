@@ -286,7 +286,7 @@ Panel {
 
           Button {
             width: (parent.width - Style.space(8)) / 2
-            text: root.busy ? "Working…" : "Free memory now"
+            text: root.keeper && root.keeper.activeAction === "relieve" ? "Working…" : "Free memory now"
             // `keeper` is null until the service loads. `!root.busy` alone is
             // then true, which INVERTS the guard and leaves an enabled button
             // whose handler throws on a null object.
@@ -298,7 +298,7 @@ Panel {
 
           Button {
             width: (parent.width - Style.space(8)) / 2
-            text: "Drop cache"
+            text: root.keeper && root.keeper.activeAction === "sweep" ? "Working…" : "Drop cache"
             enabled: root.actionsReady && !root.busy
             foreground: root.foreground
             accent: root.accentColor

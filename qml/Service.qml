@@ -42,6 +42,7 @@ Item {
   property bool loaded: false
   property string lastError: ""
   property bool busy: false
+  property string activeAction: ""
   property string lastResult: ""
 
   // Whether the systemd unit is actually running. Read back from systemctl
@@ -69,7 +70,6 @@ Item {
   function applySnapshot(raw) {
     var parsed = Model.parseSnapshot(raw)
     if (!parsed) return          // partial write or not published yet; keep last good
-    root.lastError = ""
     root.snapshot = parsed
     root.loaded = true
     // checked_at is the daemon's own clock at the moment it measured, so a
@@ -86,6 +86,7 @@ Item {
   function relieve() {
     if (root.busy) return
     root.busy = true
+    root.activeAction = "relieve"
     actionProc.command = ["python3", root.helperPath, "--relieve"]
     actionProc.running = true
   }
@@ -93,6 +94,7 @@ Item {
   function sweep() {
     if (root.busy) return
     root.busy = true
+    root.activeAction = "sweep"
     actionProc.command = ["python3", root.helperPath, "--sweep-cache"]
     actionProc.running = true
   }
@@ -212,6 +214,7 @@ Item {
     }
     onExited: {
       root.busy = false
+      root.activeAction = ""
       actionDoneTimer.restart()
     }
   }
@@ -244,7 +247,10 @@ Item {
     id: actionDoneTimer
     interval: 9000
     repeat: false
-    onTriggered: root.lastResult = ""
+    onTriggered: {
+      root.lastResult = ""
+      root.lastError = ""
+    }
   }
 
   Timer {

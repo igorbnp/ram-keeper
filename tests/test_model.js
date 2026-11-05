@@ -207,6 +207,8 @@ check("action result reports freed and swapped",
     === "freed 1.00 GB · moved 512 MB to zram",
   M.summaryLine({ acted: true, freed: 1073741824, swapped_out: 536870912 }));
 check("null result is safe", M.summaryLine(null) === "");
+check("empty action output is not a comfortable result", M.parseResult("") === null);
+check("blank action output is not a comfortable result", M.parseResult("   ") === null);
 
 
 console.log("\n== candidates are ordered by what we would actually recover ==");

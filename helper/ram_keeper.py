@@ -1566,10 +1566,12 @@ def main() -> int:
 
     if args.relieve:
         print(json.dumps(steward.relieve(force=True), default=str))
+        steward.publish(steward.snapshot())
         return 0
 
     if args.sweep_cache:
         print(json.dumps(steward.sweep_cache(), default=str))
+        steward.publish(steward.snapshot())
         return 0
 
     if args.daemon:

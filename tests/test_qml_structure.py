@@ -224,5 +224,19 @@ if not critical or not unknown or critical.group(1) == unknown.group(1):
 else:
     print("  ok   Model.js unknown glyph differs from critical")
 
+service = (QML_DIR / "Service.qml").read_text(encoding="utf-8")
+panel = (QML_DIR / "Panel.qml").read_text(encoding="utf-8")
+apply = service.split("function applySnapshot", 1)[1].split("function relieve", 1)[0]
+if 'lastError = ""' in apply:
+    fails += 1
+    print("  FAIL a snapshot poll clears the action error")
+else:
+    print("  ok   a snapshot poll keeps the action error")
+if 'activeAction === "relieve"' not in panel or 'activeAction === "sweep"' not in panel:
+    fails += 1
+    print("  FAIL both action buttons share one Working label")
+else:
+    print("  ok   each action button has its own Working label")
+
 print("\n" + ("QML structure ok" if fails == 0 else "%d file(s) suspect" % fails))
 assert fails == 0, f"Test failed: {fails} failures"

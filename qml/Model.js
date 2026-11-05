@@ -301,9 +301,11 @@ function parseSnapshot(raw) {
 }
 
 function parseResult(raw) {
+  var text = String(raw == null ? "" : raw).trim();
+  if (!text) return null;
   var data = null;
   try {
-    data = JSON.parse(raw || "{}");
+    data = JSON.parse(text);
   } catch (e) {
     return null;
   }
