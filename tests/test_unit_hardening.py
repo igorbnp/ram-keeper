@@ -252,6 +252,11 @@ def test_systemd_executes_the_rendered_execstart(tmp_path, dirname):
 # 3. The installer must not carry a second copy of the renderer
 # ---------------------------------------------------------------------------
 
+def test_quote_path_escapes_a_dollar():
+    quoted = render_unit.quote_path("/home/x/with${USER}brace")
+    assert quoted == '"/home/x/with$${USER}brace"'
+
+
 def test_installer_delegates_to_the_shared_renderer():
     script = (PLUGIN / "install.sh").read_text(encoding="utf-8")
     assert "helper/render_unit.py" in script, (

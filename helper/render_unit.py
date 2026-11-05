@@ -57,7 +57,8 @@ def _check(arg: str, what: str) -> None:
 def quote_path(arg: str, what: str = "path") -> str:
     """One systemd argument: literal, escaped and quoted when it needs to be."""
     _check(arg, what)
-    escaped = arg.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%")
+    escaped = (arg.replace("\\", "\\\\").replace('"', '\\"')
+               .replace("%", "%%").replace("$", "$$"))
     if all(ch in SAFE_CHARS for ch in arg):
         return escaped                      # nothing to quote, nothing to escape
     return '"' + escaped + '"'
