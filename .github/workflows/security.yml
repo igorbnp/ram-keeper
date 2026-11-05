@@ -1,5 +1,8 @@
 name: Security
 
+permissions:
+  contents: read
+
 on:
   push:
     branches: [main, master]
@@ -32,12 +35,12 @@ jobs:
 
       - name: Run Bandit (Python security linter)
         run: |
-          bandit -r helper/ -f json -o bandit-report.json || true
+          bandit -r helper/ -f json -o bandit-report.json
           bandit -r helper/ -ll
 
       - name: Run Safety (dependency vulnerability check)
         run: |
-          safety check --full-report || true
+          safety check --full-report
 
       - name: Upload Bandit report
         if: always()

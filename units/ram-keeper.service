@@ -40,6 +40,7 @@ ProtectHome=read-only
 ReadOnlyPaths=-%h/.config/ram-keeper
 ReadWritePaths=-%h/.local/state/ram-keeper
 PrivateTmp=yes
+IPAddressDeny=any
 RestrictSUIDSGID=yes
 RestrictRealtime=yes
 LockPersonality=yes

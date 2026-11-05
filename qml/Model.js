@@ -101,7 +101,7 @@ function stateGlyph(state) {
     case "tight": return "󰗚";      // gauge
     case "stalling": return "󰅜";   // history / clock
     case "trending": return "󰔡";   // trending down
-    case "unknown": return "󰅚";   // question — deliberately not the calm glyph
+    case "unknown": return "󰋗";   // question, not the critical slash
     default: return "󰍛";           // memory
   }
 }

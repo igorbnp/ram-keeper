@@ -169,8 +169,11 @@ if [[ -f "$HOME/.config/systemd/user/ram-keeper-notify.service" ]]; then
     warn "notifier did not start (alerts off, protection unaffected)"
   fi
   if [[ -x "$NOTIFY_SRC" ]]; then
-    bash -n "$NOTIFY_SRC" && ok "notifier script parses" \
-      || warn "notifier script has a syntax error"
+    if bash -n "$NOTIFY_SRC"; then
+      ok "notifier script parses"
+    else
+      warn "notifier script has a syntax error"
+    fi
   fi
 fi
 

@@ -252,6 +252,12 @@ def test_systemd_executes_the_rendered_execstart(tmp_path, dirname):
 # 3. The installer must not carry a second copy of the renderer
 # ---------------------------------------------------------------------------
 
+def test_units_deny_ip():
+    for name in ("ram-keeper.service", "ram-keeper-notify.service.in"):
+        text = (PLUGIN / "units" / name).read_text(encoding="utf-8")
+        assert "IPAddressDeny=any" in text, name
+
+
 def test_quote_path_escapes_a_dollar():
     quoted = render_unit.quote_path("/home/x/with${USER}brace")
     assert quoted == '"/home/x/with$${USER}brace"'

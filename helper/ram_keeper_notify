@@ -44,17 +44,16 @@ PYTHON3="${RAM_KEEPER_PYTHON:-/usr/bin/python3}"
 # switch or a skill reinstall must not leave the notifier pointing at a stale
 # path.
 skill_path() {
-  local found
-  for root in "${HERMES_HOME:-$HOME/.hermes}"; do
-    for candidate in "$root/skills/ram-memory-diagnosis/SKILL.md" \
-                     "$root/profiles/"*/skills/ram-memory-diagnosis/SKILL.md; do
-      [[ -f "$candidate" ]] && { echo "$candidate"; return 0; }
-    done
-    found="$root/skills/ram-memory-diagnosis/SKILL.md"
+  local root candidate
+  root="${HERMES_HOME:-$HOME/.hermes}"
+  for candidate in "$root/skills/ram-memory-diagnosis/SKILL.md" \
+                   "$root/profiles/"*/skills/ram-memory-diagnosis/SKILL.md; do
+    [[ -f "$candidate" ]] && { echo "$candidate"; return 0; }
   done
-  echo "$found"
+  echo "$root/skills/ram-memory-diagnosis/SKILL.md"
 }
-readonly SKILL_PATH="$(skill_path)"
+SKILL_PATH="$(skill_path)"
+readonly SKILL_PATH
 
 mkdir -p "$FLAG_DIR"
 

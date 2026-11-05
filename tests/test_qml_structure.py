@@ -215,5 +215,14 @@ for path in sorted(QML_DIR.glob("*.qml")):
     else:
         print("  ok   %s" % path.name)
 
+model = (QML_DIR / "Model.js").read_text(encoding="utf-8")
+critical = re.search(r'case "critical": return "([^"]*)"', model)
+unknown = re.search(r'case "unknown": return "([^"]*)"', model)
+if not critical or not unknown or critical.group(1) == unknown.group(1):
+    fails += 1
+    print("  FAIL Model.js unknown glyph matches critical")
+else:
+    print("  ok   Model.js unknown glyph differs from critical")
+
 print("\n" + ("QML structure ok" if fails == 0 else "%d file(s) suspect" % fails))
 assert fails == 0, f"Test failed: {fails} failures"

@@ -32,6 +32,12 @@ jobs:
             bash -n "$f"
           done
 
+      - name: shellcheck
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq shellcheck
+          shellcheck install.sh helper/ram_keeper_notify
+
       - name: node tests (panel data shaping)
         run: |
           sudo apt-get update -qq
