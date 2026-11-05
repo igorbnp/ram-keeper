@@ -24,68 +24,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: python syntax
-        run: |
-          python3 -m compileall -q helper tests
-          echo "--- shell syntax ---"
-          for f in install.sh helper/ram_keeper_notify tests/*.sh; do
-            bash -n "$f"
-          done
-
-      - name: shellcheck
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq shellcheck
-          shellcheck install.sh helper/ram_keeper_notify
-
-      - name: node tests (panel data shaping)
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq nodejs
-          node tests/test_model.js
-          node tests/test_unknown_ui.js
-
-      # These five are the portable half. test_forecast.py runs everything
-      # before its live probe without RAM_KEEPER_LIVE, and reports the rest as
-      # skipped: they need cgroup v2, zram and a compositor.
-      - name: forecast and hostile-config suites
-        run: |
-          python3 tests/test_forecast.py
-          python3 tests/test_config_hostile.py
-          python3 tests/test_inviolable.py
-          python3 tests/test_resilience.py
-
-      # The pass-budget suite stubs reclaim_from, so it asserts the accounting
-      # without moving any real memory — that part belongs on a runner.
-      - name: pass budget
-        run: python3 tests/test_pass_budget.py
-
-      - name: notifier end-to-end (stub binaries)
-        run: bash tests/test_notifier_e2e.sh
-
-      # The unit-test suites. They were never part of CI before, so ~200 tests
-      # existed but were never executed on a runner. Live-only cases skip
-      # themselves; everything else must pass.
-      - name: unit tests (pytest)
-        run: |
-          python3 -m pip install --quiet pytest
-          python3 tests/test_critical_metrics.py
-          python3 -m pytest -q tests/test_ram_keeper_core.py \
-            tests/test_integration.py tests/test_process_guardian.py \
-            tests/test_bugfixes.py tests/test_reclaim_policy.py \
-            tests/test_config_attacks.py tests/test_unit_hardening.py
-
-      - name: qml structure
-        run: python3 tests/test_qml_structure.py
-
-      - name: installer renders hostile paths
-        run: bash tests/test_hostile_install_path.sh
-
-      - name: installer starts an inactive service
-        run: bash tests/test_installer_inactive_start.sh
-
-      - name: request sizing and safe OOM-test mode
-        run: python3 tests/test_no_oom_kill.py
+      - name: Run the suite
+        run: bash tests/ci-suite.sh
 
   skipped-here:
     name: what this runner cannot verify

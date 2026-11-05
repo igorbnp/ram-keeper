@@ -350,6 +350,29 @@ class TestBug10_EffectiveNegative:
                 f"effective não deveria ser negativo, obtido {action.freed}"
 
 
+def test_release_and_ci_share_one_suite_list():
+    root = Path(__file__).resolve().parent.parent
+    release = (root / ".github/workflows/release.yml").read_text(encoding="utf-8")
+    workflow = (root / ".github/workflows/test.yml").read_text(encoding="utf-8")
+    suite = (root / "tests/ci-suite.sh").read_text(encoding="utf-8")
+    assert "tests/ci-suite.sh" in release
+    assert "tests/ci-suite.sh" in workflow
+    for command in (
+        "node tests/test_model.js",
+        "node tests/test_unknown_ui.js",
+        "bash tests/test_notifier_e2e.sh",
+        "python3 tests/test_forecast.py",
+        "python3 tests/test_no_oom_kill.py",
+        "python3 tests/test_qml_structure.py",
+        "python3 tests/test_pass_budget.py",
+        "python3 tests/test_critical_metrics.py",
+        "shellcheck install.sh",
+    ):
+        assert command in suite
+        assert command not in release
+        assert command not in workflow
+
+
 def test_manual_action_publishes_a_fresh_snapshot(monkeypatch):
     published = []
 
