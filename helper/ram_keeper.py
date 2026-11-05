@@ -410,6 +410,12 @@ DEFAULT_CONFIG = {
     "protected": [
         "wayland-wm@hyprland.desktop",
         "quickshell",
+        "pipewire.service",
+        "syncthing.service",
+        "ollama.service",
+        "hermes",
+        "hermes-gateway",
+        "sia",
         "ram-keeper",
     ],
     # Seconds to let a cgroup settle after a reclaim request before measuring

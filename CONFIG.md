@@ -72,9 +72,12 @@ services that keep your session alive:
 ```
   wayland-wm@hyprland.desktop   the compositor; a dead WM is a dead desktop
   quickshell                    the shell that draws the panel
-  pipewire.service              audio
-  syncthing.service             file sync
+  pipewire.service              audio (not pipewire-pulse, and not a name that only shares the prefix)
+  syncthing.service             file sync (not syncthing-server)
   ollama.service                local model server
+  hermes                        the Hermes gateway process
+  hermes-gateway                the gateway when it is its own unit
+  sia                           SIA
   ram-keeper                    the daemon itself
   ```
 
@@ -152,8 +155,9 @@ should let apps keep much more resident.
 **Less RAM (4 GB)** — raise `target_free_percent` to `25`, drop
 `interval_pressure` to `3`. Reclaim earlier and more eagerly.
 
-**A local LLM server you want resident** (llama-server, ollama): add its unit
-to `never_reclaim`. A model that has been swapped out has to be read back from
+**A local LLM server you want resident** (llama-server): add its unit
+to `never_reclaim`. `ollama.service` is already in the default protected list.
+A model that has been swapped out has to be read back from
 zram before it can answer, and that is the one workload where paying RAM is
 worth it:
 

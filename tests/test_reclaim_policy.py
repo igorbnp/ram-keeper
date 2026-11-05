@@ -258,9 +258,41 @@ def test_config_names_match_real_cgroups(cgroup, wanted):
 @pytest.mark.parametrize("cgroup,wanted", [
     ("app-firefox-1.scope", "spotify"),
     ("syncthing.service", "syncthing-server"),
+    ("syncthing-server.service", "syncthing"),
+    ("pipewire-pulse.service", "pipewire.service"),
+    ("hermes-gateway.service", "hermes"),
+    ("siamese.service", "sia"),
+    ("asia.service", "sia"),
 ])
 def test_config_names_do_not_over_match(cgroup, wanted):
     assert not rk.names_match(cgroup, {wanted})
+
+
+@pytest.mark.parametrize("cgroup,wanted", [
+    ("pipewire.service", "pipewire.service"),
+    ("syncthing.service", "syncthing.service"),
+    ("ollama.service", "ollama.service"),
+    ("hermes.service", "hermes"),
+    ("app-hermes-1043.scope", "hermes"),
+    ("hermes-gateway.service", "hermes-gateway"),
+    ("sia.service", "sia"),
+    ("app-sia-1043.scope", "sia"),
+])
+def test_documented_units_match_the_real_cgroup(cgroup, wanted):
+    assert rk.names_match(cgroup, {wanted})
+
+
+def test_defaults_protect_what_the_docs_name():
+    protected = set(rk.DEFAULT_CONFIG["protected"])
+    for name in ("pipewire.service", "syncthing.service", "ollama.service",
+                 "hermes", "hermes-gateway", "sia"):
+        assert name in protected
+    for cgroup in ("pipewire.service", "syncthing.service", "ollama.service",
+                   "hermes.service", "hermes-gateway.service", "sia.service"):
+        assert rk.names_match(cgroup, protected)
+    for stranger in ("pipewire-pulse.service", "syncthing-server.service",
+                     "siamese.service"):
+        assert not rk.names_match(stranger, protected)
 
 
 def test_scan_honours_protection_by_short_name(tmp_path):

@@ -243,8 +243,10 @@ Click the bar widget (or `omarchy-shell shell toggle ram-keeper`). It shows:
 - **Available to reclaim** — the processes the daemon would take from, largest
   first, with their sizes.
 - **Never reclaimed** — what's protected and why it's still listed: Hyprland,
-  the Hermes gateway, SIA, Syncthing. Transparency about what it's choosing not
-  to touch.
+  the shell, PipeWire, Syncthing, Ollama, the Hermes gateway, SIA, and the
+  daemon. A name protects that unit only: `syncthing` does not cover
+  `syncthing-server`, and `hermes` does not cover `hermes-gateway` (that one
+  is listed on its own). Transparency about what it's choosing not to touch.
 
 Right-click the bar widget to toggle the percentage on and off.
 
