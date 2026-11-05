@@ -810,16 +810,18 @@ class TrendTracker:
         """
         if len(window) < 4:
             return ""
-        first, last = window[0], window[-1]
-        span = last[0] - first[0]
-        if span <= 1.0:
-            return ""
+        last = window[-1]
         best_name, best_rate = "", 0.0
         for name, value in last[2].items():
-            start = first[2].get(name)
-            if start is None:
-                continue           # process appeared mid-window: not a trend
-            rate = (value - start) / span
+            # Present in the last few samples, measured from when it appeared.
+            # Requiring it in the first sample hid a leak that started later.
+            if any(name not in sample[2] for sample in window[-3:]):
+                continue
+            first = next(sample for sample in window if name in sample[2])
+            span = last[0] - first[0]
+            if span < 15.0:
+                continue
+            rate = (value - first[2][name]) / span
             if rate > best_rate:
                 best_name, best_rate = name, rate
         # Only name a culprit when the growth is real, not noise.

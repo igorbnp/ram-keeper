@@ -127,6 +127,18 @@ f6 = t6.forecast(1000 * MB)
 print(f"  culprit={f6.culprit!r}")
 check("a process that appeared mid-window is not blamed",
       "brand-new" not in f6.culprit, repr(f6.culprit))
+print("\n== 6b. a leak that starts during the window is still named ==")
+clock6b = FakeClock()
+t6b = rk.TrendTracker(clock=clock6b)
+for i in range(4):
+    clock6b.advance(10)
+    groups = {"steady.scope": 100 * MB}
+    if i >= 1:
+        groups["leak.scope"] = 100 * MB + (i - 1) * 80 * MB
+    t6b.record(int(3000 * MB - i * 80 * MB), groups)
+f6b = t6b.forecast(500 * MB)
+print(f"  culprit={f6b.culprit!r}")
+check("a leak that started mid-window is named", "leak" in f6b.culprit, repr(f6b.culprit))
 # ---------------------------------------------------------------------------
 # Everything below needs a real desktop: cgroup v2, zram, and a live compositor.
 # A GitHub runner has none of those, so asserting on the host's own report there
