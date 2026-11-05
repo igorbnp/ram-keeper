@@ -71,12 +71,11 @@ def user_root() -> Path:
     hierarchy layout, or a future Omarchy migration changes the path shape.
     """
     uid = os.getuid()
-    slices = sorted(CGROOT.glob(f"user.slice/user-{uid}.slice"))
-    if slices:
-        return slices[0]
-    # Fall back to the first user slice present (containers, unusual setups).
-    for candidate in sorted(CGROOT.glob("user.slice/user-*.slice")):
-        return candidate
+    own = CGROOT / "user.slice" / f"user-{uid}.slice"
+    if own.is_dir():
+        return own
+    # Another user's slice is not this session. Scanning it would reclaim
+    # memory that belongs to someone else.
     return CGROOT / "user.slice"
 
 
@@ -299,11 +298,15 @@ def scan(root: Path, protected: set[str], min_bytes: int) -> list[Cgroup]:
 def meminfo() -> dict:
     values: dict[str, int] = {}
     try:
-        for line in Path("/proc/meminfo").read_text().splitlines():
+        lines = Path("/proc/meminfo").read_text().splitlines()
+    except OSError:
+        return values
+    for line in lines:
+        try:
             key, rest = line.split(":", 1)
             values[key] = int(rest.split()[0]) * 1024
-    except (OSError, ValueError, IndexError):
-        pass
+        except (ValueError, IndexError):
+            continue
     return values
 
 
@@ -355,21 +358,21 @@ def zram_stats() -> dict:
     """
     devices = []
     try:
-        out = subprocess.run(["swapon", "--show=NAME,TYPE,SIZE,USED,PRIO",
-                              "--noheadings", "--bytes"],
-                             capture_output=True, text=True, timeout=5).stdout
-        for line in out.strip().splitlines():
+        # /proc/swaps reports Size and Used in KiB. No swapon process.
+        lines = Path("/proc/swaps").read_text().splitlines()
+        for line in lines[1:]:
             parts = line.split()
-            if len(parts) >= 4:
-                name = parts[0]
-                devices.append({
-                    "name": name,
-                    "type": parts[1],
-                    "size": int(parts[2]) if parts[2].isdigit() else 0,
-                    "used": int(parts[3]) if parts[3].isdigit() else 0,
-                    "ram_backed": "zram" in name.lower(),
-                })
-    except (OSError, subprocess.SubprocessError, ValueError):
+            if len(parts) < 4:
+                continue
+            name = parts[0]
+            devices.append({
+                "name": name,
+                "type": parts[1],
+                "size": int(parts[2]) * 1024,
+                "used": int(parts[3]) * 1024,
+                "ram_backed": "zram" in name.lower(),
+            })
+    except (OSError, ValueError, IndexError):
         pass
     return {"devices": devices,
             "used": sum(d["used"] for d in devices),
@@ -1406,7 +1409,7 @@ class Steward:
                 # Only states that relieve() will actually act on. `stalling`
                 # is refused by relieve (the stall is not attributable to any
                 # one cgroup), so ticking at the 5s pressure rate for it just
-                # bought a full 51-cgroup walk and a `swapon` subprocess every
+                # bought a full 51-cgroup walk and a swap read every
                 # five seconds, forever, doing nothing.
                 pressure = snap["state"] in ("tight", "critical", "trending", "stalling")
                 self._sleep(self.config["interval_pressure"] if pressure

@@ -142,6 +142,14 @@ class TestUserRoot:
         # Should at least return a path (may not exist in test env)
         assert isinstance(result, Path)
 
+    def test_does_not_borrow_another_users_slice(self, tmp_path, monkeypatch):
+        import os
+        cgroup = tmp_path / "cgroup"
+        (cgroup / "user.slice" / "user-1.slice").mkdir(parents=True)
+        monkeypatch.setattr(rk, "CGROOT", cgroup)
+        monkeypatch.setattr(os, "getuid", lambda: 4242)
+        assert rk.user_root() == cgroup / "user.slice"
+
 
 # ---------------------------------------------------------------------------
 # Tests: human_label
@@ -361,11 +369,9 @@ class TestMeminfo:
         meminfo_content = "MemTotal: 8026562560 kB\nMemAvailable: notanumber kB\nCached: 1500000000 kB\n"
         with patch("pathlib.Path.read_text", return_value=meminfo_content):
             result = rk.meminfo()
-        # The function should not crash; result is a dict (possibly empty or partial)
-        assert isinstance(result, dict)
-        # MemTotal should be parsed (it comes before the malformed line)
-        if result:
-            assert result.get("MemTotal") == 8026562560 * 1024
+        assert result.get("MemTotal") == 8026562560 * 1024
+        assert result.get("Cached") == 1500000000 * 1024
+        assert "MemAvailable" not in result
 
 
 # ---------------------------------------------------------------------------
@@ -415,24 +421,27 @@ class TestZramStats:
         assert "used" in result
         assert "size" in result
 
-    def test_handles_subprocess_error(self):
-        """Should return empty result on subprocess error."""
-        with patch("subprocess.run", side_effect=OSError):
+    def test_handles_unreadable_swaps(self):
+        """Should return empty result when /proc/swaps cannot be read."""
+        with patch("pathlib.Path.read_text", side_effect=OSError):
             result = rk.zram_stats()
             assert result["devices"] == []
             assert result["used"] == 0
 
-    def test_parses_swapon_output(self):
-        """Should parse swapon output correctly."""
-        swapon_output = "/dev/zram0 partition 8025796608 2950127616 0\n/swap/swapfile file 8027074560 7417856 -2\n"
-        mock_result = MagicMock()
-        mock_result.stdout = swapon_output
-        with patch("subprocess.run", return_value=mock_result):
+    def test_parses_proc_swaps(self):
+        """Size and Used in /proc/swaps are KiB."""
+        swaps = (
+            "Filename\tType\tSize\tUsed\tPriority\n"
+            "/dev/zram0 partition 7837688 2880984 100\n"
+            "/swap/swapfile file 7838930 7244 -2\n"
+        )
+        with patch("pathlib.Path.read_text", return_value=swaps):
             result = rk.zram_stats()
             assert len(result["devices"]) == 2
-            assert result["used"] == 2950127616 + 7417856
-            assert result["ram_used"] == 2950127616
-            assert result["disk_used"] == 7417856
+            assert result["ram_used"] == 2880984 * 1024
+            assert result["disk_used"] == 7244 * 1024
+            assert result["devices"][0]["ram_backed"] is True
+            assert result["devices"][1]["ram_backed"] is False
 
 
 # ---------------------------------------------------------------------------

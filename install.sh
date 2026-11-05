@@ -180,8 +180,8 @@ fi
 
 if "$PYTHON" "$PLUGIN_DIR/helper/ram_keeper.py" --once >/dev/null 2>&1; then
   SNAP="$("$PYTHON" "$PLUGIN_DIR/helper/ram_keeper.py" --once 2>/dev/null)"
-  FREE="$(printf '%s' "$SNAP" | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin)["free_percent"])' 2>/dev/null || echo '?')"
-  STATE="$(printf '%s' "$SNAP" | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin)["state"])' 2>/dev/null || echo '?')"
+  FREE="$(printf '%s' "$SNAP" | "$PYTHON" -c 'import json,sys; print(json.load(sys.stdin)["free_percent"])' 2>/dev/null || echo '?')"
+  STATE="$(printf '%s' "$SNAP" | "$PYTHON" -c 'import json,sys; print(json.load(sys.stdin)["state"])' 2>/dev/null || echo '?')"
   ok "memory readable: ${FREE}% free, state=$STATE"
 else
   warn "the helper could not produce a snapshot — run: $PYTHON $PLUGIN_DIR/helper/ram_keeper.py --once"

@@ -86,14 +86,14 @@ Item {
   function relieve() {
     if (root.busy) return
     root.busy = true
-    actionProc.command = ["/usr/bin/python3", root.helperPath, "--relieve"]
+    actionProc.command = ["python3", root.helperPath, "--relieve"]
     actionProc.running = true
   }
 
   function sweep() {
     if (root.busy) return
     root.busy = true
-    actionProc.command = ["/usr/bin/python3", root.helperPath, "--sweep-cache"]
+    actionProc.command = ["python3", root.helperPath, "--sweep-cache"]
     actionProc.running = true
   }
 
