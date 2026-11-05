@@ -206,7 +206,8 @@ def human_label(name: str) -> str:
     return label or name
 
 
-def scan(root: Path, protected: set[str], min_bytes: int) -> list[Cgroup]:
+def scan(root: Path, protected: set[str], min_bytes: int,
+         never: set[str] | None = None) -> list[Cgroup]:
     """Enumerate reclaimable leaf cgroups under the user's own hierarchy."""
     found: list[Cgroup] = []
     if not root.is_dir():
@@ -271,6 +272,7 @@ def scan(root: Path, protected: set[str], min_bytes: int) -> list[Cgroup]:
             kind = "service"
 
         is_protected = (names_match(name, protected)
+                        or names_match(name, never or set())
                         or is_inviolable(name))
         found.append(Cgroup(
             path=cgroup_dir,
@@ -461,6 +463,11 @@ DEFAULT_CONFIG = {
     "never_reclaim": [
         "localsearch-3.service",
     ],
+    # Names the user took off the default lists. A non-empty protected list is
+    # merged back with the defaults, so removing "ollama" from that list would
+    # not stick. This list is subtracted after the merge. Inviolable names are
+    # refused.
+    "unprotect": [],
 }
 
 # The compositor and the shell can never be handed to a reclaim sweep, whatever
@@ -638,7 +645,7 @@ def load_config() -> dict:
                 if key not in DEFAULT_CONFIG:
                     _CONFIG_WARNINGS.append(f"unknown setting {key!r} ignored")
                     continue
-                if key in ("protected", "never_reclaim"):
+                if key in ("protected", "never_reclaim", "unprotect"):
                     cfg[key] = _coerce_strlist(key, value, DEFAULT_CONFIG[key])
                     # Merge, never replace. If a user adds their own app to
                     # `protected`, replacing the default list would silently
@@ -647,7 +654,7 @@ def load_config() -> dict:
                     # compositor. Adding to the defaults is also what the user
                     # meant. An explicit empty list is still honoured, since
                     # that is an unambiguous statement.
-                    if value:
+                    if value and key != "unprotect":
                         merged = list(DEFAULT_CONFIG[key])
                         for item in cfg[key]:
                             if item not in merged:
@@ -675,6 +682,19 @@ def load_config() -> dict:
             "interval_pressure must be below interval_idle; "
             f"pressure interval set to {max(0.5, cfg['interval_idle'] / 2)}s")
         cfg["interval_pressure"] = max(0.5, cfg["interval_idle"] / 2)
+
+    blocked = []
+    for name in cfg.get("unprotect") or []:
+        if is_inviolable(name):
+            _CONFIG_WARNINGS.append(f"{name} stays protected")
+            continue
+        blocked.append(name)
+    cfg["unprotect"] = blocked
+    if blocked:
+        cfg["protected"] = [item for item in cfg["protected"]
+                            if not names_match(item, blocked)]
+        cfg["never_reclaim"] = [item for item in cfg["never_reclaim"]
+                                if not names_match(item, blocked)]
 
     for warning in _CONFIG_WARNINGS:
         print(f"ram-keeper config: {warning}", file=sys.stderr)
@@ -935,7 +955,7 @@ class Steward:
 
         protected = set(self.config["protected"])
         never = set(self.config["never_reclaim"])
-        groups = scan(user_root(), protected, int(self.config["min_target_bytes"]))
+        groups = scan(user_root(), protected, int(self.config["min_target_bytes"]), never)
 
         victims = [g for g in groups if not g.protected and not names_match(g.name, never)]
         victims.sort(key=lambda g: g.reclaimable, reverse=True)
@@ -1383,18 +1403,20 @@ class Steward:
         """
         self.log({"event": "start", "pid": os.getpid(), "cgroup": self_cgroup()})
         consecutive_failures = 0
-        last_reload = 0.0
-        reload_interval = 300.0
+        seen_mtime = None
 
         while True:
             try:
-                # Pick up an edited config occasionally. Without this the only
-                # way a threshold change takes effect is a restart, and a user
-                # who tuned it would reasonably assume it was live.
-                now = time.monotonic()
-                if now - last_reload > reload_interval:
+                # A panel click writes the config and should be visible on the
+                # next pass, not five minutes later. The sleep also returns
+                # early when the file's mtime changes.
+                try:
+                    mtime = config_path().stat().st_mtime
+                except OSError:
+                    mtime = None
+                if mtime != seen_mtime:
                     self.config = load_config()
-                    last_reload = now
+                    seen_mtime = mtime
                     if _CONFIG_WARNINGS:
                         self.log({"event": "config-warning",
                                   "warnings": list(_CONFIG_WARNINGS)})
@@ -1447,7 +1469,22 @@ class Steward:
             value = 20.0
         if not (value == value) or value <= 0 or value == float("inf"):
             value = 20.0
-        time.sleep(min(value, 3600.0))
+        deadline = time.monotonic() + min(value, 3600.0)
+        try:
+            seen = config_path().stat().st_mtime
+        except OSError:
+            seen = None
+        while True:
+            try:
+                current = config_path().stat().st_mtime
+            except OSError:
+                current = None
+            if seen is not None and current != seen:
+                return
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return
+            time.sleep(min(1.0, left))
 
 
 # ---------------------------------------------------------------------------
@@ -1520,11 +1557,75 @@ def add_never_reclaim(name: str) -> list[str]:
         if name not in names:
             names.append(name)
         existing["never_reclaim"] = names
+        raw_unprotect = existing.get("unprotect")
+        if isinstance(raw_unprotect, str):
+            raw_unprotect = [raw_unprotect]
+        if not isinstance(raw_unprotect, list):
+            raw_unprotect = []
+        existing["unprotect"] = [
+            v.strip() for v in raw_unprotect
+            if isinstance(v, str) and v.strip() and not names_match(v, [name])
+        ]
 
         tmp = path.with_suffix(".tmp")
         tmp.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
         tmp.replace(path)
     return names
+
+
+def remove_protection(name: str) -> list[str]:
+    """Take one name off both lists, and keep a default from coming back.
+
+    The stored protected list is merged with the defaults whenever it is
+    non-empty, so deleting ollama from that list would not last. The name is
+    recorded in `unprotect`, which is subtracted after the merge. An inviolable
+    name is refused.
+    """
+    name = (name or "").strip()
+    if not name or any(ord(ch) < 32 or ord(ch) == 127 for ch in name):
+        raise ValueError("cgroup name must be one non-blank line")
+    if is_inviolable(name):
+        raise ValueError(f"{name} stays protected")
+
+    path = config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_suffix(".lock")
+    with open(lock_path, "a", encoding="utf-8") as lock_handle:
+        try:
+            import fcntl
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        except (ImportError, OSError):
+            pass
+
+        existing: dict = {}
+        try:
+            loaded = json.loads(path.read_bytes().decode("utf-8-sig"))
+            if isinstance(loaded, dict):
+                existing = loaded
+        except (OSError, ValueError, UnicodeDecodeError, RecursionError):
+            existing = {}
+
+        def _listed(key: str) -> list[str]:
+            current = existing.get(key)
+            if isinstance(current, str):
+                current = [current]
+            if not isinstance(current, list):
+                current = []
+            return [v.strip() for v in current if isinstance(v, str) and v.strip()]
+
+        if "protected" in existing:
+            existing["protected"] = [v for v in _listed("protected") if not names_match(v, [name])]
+        if "never_reclaim" in existing:
+            existing["never_reclaim"] = [v for v in _listed("never_reclaim") if not names_match(v, [name])]
+        gone = _listed("unprotect")
+        if not any(names_match(v, [name]) for v in gone):
+            gone.append(name)
+        existing["unprotect"] = gone
+
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
+        tmp.replace(path)
+    return existing["unprotect"]
 
 
 def main() -> int:
@@ -1539,7 +1640,26 @@ def main() -> int:
                         help="drop reclaimable page cache now")
     parser.add_argument("--protected-add", metavar="CGROUP",
                         help="add a cgroup to the never-reclaim list")
+    parser.add_argument("--protected-remove", metavar="CGROUP",
+                        help="stop protecting a cgroup the defaults would keep")
     args = parser.parse_args()
+
+    if args.protected_add and args.protected_remove:
+        print("ram-keeper: pass only one of --protected-add and --protected-remove",
+              file=sys.stderr)
+        return 2
+
+    if args.protected_remove:
+        try:
+            lst = remove_protection(args.protected_remove)
+        except ValueError as exc:
+            print(f"ram-keeper: {exc}", file=sys.stderr)
+            return 2
+        except OSError as exc:
+            print(f"ram-keeper: could not write config: {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps({"unprotect": lst}))
+        return 0
 
     if args.protected_add:
         try:

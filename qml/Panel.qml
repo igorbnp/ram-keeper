@@ -498,6 +498,21 @@ Panel {
             }
 
             Text {
+              anchors.right: sizeText.left
+              anchors.rightMargin: Style.space(8)
+              anchors.verticalCenter: parent.verticalCenter
+              text: "Release"
+              color: root.accentColor
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
+              MouseArea {
+                anchors.fill: parent
+                onClicked: if (root.keeper) root.keeper.unprotect(modelData.key)
+              }
+            }
+
+            Text {
+              id: sizeText
               anchors.right: parent.right
               anchors.verticalCenter: parent.verticalCenter
               text: Model.formatBytes(modelData.bytes)

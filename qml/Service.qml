@@ -95,6 +95,12 @@ Item {
     actionProc.running = true
   }
 
+  function unprotect(name) {
+    if (!name || protectProc.running) return
+    protectProc.command = ["python3", root.helperPath, "--protected-remove", name]
+    protectProc.running = true
+  }
+
   function sweep() {
     if (root.busy) return
     root.busy = true
@@ -210,6 +216,14 @@ Item {
     }
     onExited: function(code) {
       if (code !== 0 && root.loaded) root.daemonActive()
+    }
+  }
+
+  Process {
+    id: protectProc
+    onExited: function(exitCode) {
+      if (exitCode !== 0) root.lastError = "Could not release that app"
+      root.refresh()
     }
   }
 

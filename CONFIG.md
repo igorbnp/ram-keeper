@@ -114,6 +114,14 @@ python3 ~/.config/omarchy/plugins/io.github.igorbnp.ram-keeper/helper/ram_keeper
   --protected-add your-app
 ```
 
+To stop protecting one of the defaults (not the compositor, the shell, or the
+daemon), use the Release control in the panel, or:
+
+```bash
+python3 ~/.config/omarchy/plugins/io.github.igorbnp.ram-keeper/helper/ram_keeper.py \
+  --protected-remove ollama
+```
+
 To find a cgroup name:
 
 ```bash

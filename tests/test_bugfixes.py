@@ -373,3 +373,47 @@ def test_manual_action_publishes_a_fresh_snapshot(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["ram-keeper", "--sweep-cache"])
     assert rk.main() == 0
     assert [snap["state"] for snap in published] == ["ok", "ok"]
+
+
+def test_removing_a_default_stays_removed(monkeypatch, tmp_path):
+    import ram_keeper as rk
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text("{}\n", encoding="utf-8")
+    monkeypatch.setenv("RAM_KEEPER_CONFIG", str(cfg_path))
+    monkeypatch.setattr(sys, "argv", ["ram-keeper", "--protected-remove", "ollama"])
+    assert rk.main() == 0
+    loaded = rk.load_config()
+    assert not any(rk.names_match(name, ["ollama"]) for name in loaded["protected"])
+    assert any(rk.names_match(name, ["pipewire"]) for name in loaded["protected"])
+    monkeypatch.setattr(sys, "argv", ["ram-keeper", "--protected-remove", "quickshell"])
+    assert rk.main() == 2
+
+
+def test_scan_marks_never_reclaim_as_protected(tmp_path):
+    import ram_keeper as rk
+    leaf = tmp_path / "localsearch-3.service"
+    leaf.mkdir()
+    (leaf / "memory.current").write_text("200000000")
+    (leaf / "memory.stat").write_text("anon 1\nfile 1\ninactive_file 1\n")
+    (leaf / "pids.current").write_text("1")
+    found = rk.scan(tmp_path, set(), 1, {"localsearch-3.service"})
+    assert found and found[0].protected is True
+
+
+def test_sleep_returns_when_the_config_changes(monkeypatch, tmp_path):
+    import os
+    import ram_keeper as rk
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text("{}\n", encoding="utf-8")
+    monkeypatch.setenv("RAM_KEEPER_CONFIG", str(cfg_path))
+    slept = []
+
+    def fake_sleep(seconds):
+        slept.append(seconds)
+        cfg_path.write_text('{"unprotect": ["ollama"]}\n', encoding="utf-8")
+        os.utime(cfg_path, None)
+
+    monkeypatch.setattr(rk.time, "sleep", fake_sleep)
+    steward = rk.Steward(config=rk.load_config())
+    steward._sleep(30)
+    assert slept and sum(slept) < 30
