@@ -1376,7 +1376,12 @@ class Steward:
         # giving up 500MB in one go is far cheaper than ten processes each
         # faulting a little back in, and it keeps the reclaimed pages
         # together in zram where the compressor works on a contiguous run.
-        if budget > 0 and not cache_only and zram_has_room(snap.get("zram")):
+        skipped_anon = ""
+        if budget > 0 and not cache_only and not zram_has_room(snap.get("zram")):
+            # Disk swap is not a fallback. Cache was the action that was
+            # allowed; anonymous pages stay where they are, and the pass says so.
+            skipped_anon = "no-zram-room"
+        elif budget > 0 and not cache_only and zram_has_room(snap.get("zram")):
             for group in sorted(candidates, key=lambda g: g.anon, reverse=True):
                 if budget <= 0:
                     break
@@ -1421,9 +1426,13 @@ class Steward:
 
         real = [a for a in actions if a.freed > 0]
         self.actions_today += len(real)
+        reason = f"state={state}, free={free_percent}%, target={target_free}%"
+        if skipped_anon:
+            reason = "No ram-backed swap with room, so app memory was not moved to disk swap"
         summary = {
             "acted": bool(real),
-            "reason": f"state={state}, free={free_percent}%, target={target_free}%",
+            "reason": reason,
+            "skipped_anon": skipped_anon,
             "requested": needed,
             "freed": sum(a.freed for a in real),
             "swapped_out": sum(a.swapped_out for a in real),
@@ -1431,6 +1440,9 @@ class Steward:
         }
         if real:
             self.log({"event": "reclaim", **summary})
+        if skipped_anon:
+            self.log({"event": "anon-skipped", "skipped_anon": skipped_anon,
+                      "reason": reason, "state": state})
         return summary
 
     def sweep_cache(self) -> dict:
@@ -1440,6 +1452,26 @@ class Steward:
         is what the button in the panel promises.
         """
         return self.relieve(force=True, cache_only=True)
+
+    def supervise_once(self) -> dict:
+        """One measurement, one reclaim when there is pressure, then publish.
+
+        The panel and the notifier read the file this writes. Publishing
+        before the pass used to let them say a reclaim was under way on a
+        pass that had refused to move anything.
+        """
+        snap = self.snapshot()
+        if snap["state"] == "ok":
+            relief = {"acted": False, "reason": "no pressure", "skipped_anon": ""}
+        else:
+            relief = self.relieve(snap)
+        snap["relief"] = {
+            "acted": bool(relief.get("acted")),
+            "reason": str(relief.get("reason") or ""),
+            "skipped_anon": str(relief.get("skipped_anon") or ""),
+        }
+        self.publish(snap)
+        return snap
 
     # -- loop ------------------------------------------------------------
     def run_forever(self) -> None:
@@ -1471,10 +1503,7 @@ class Steward:
                         self.log({"event": "config-warning",
                                   "warnings": list(_CONFIG_WARNINGS)})
 
-                snap = self.snapshot()
-                self.publish(snap)
-                if snap["state"] != "ok":
-                    self.relieve(snap)
+                snap = self.supervise_once()
 
                 consecutive_failures = 0
                 # Only states that relieve() will actually act on. `stalling`

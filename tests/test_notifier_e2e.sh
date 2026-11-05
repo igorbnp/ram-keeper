@@ -209,6 +209,27 @@ check "a user pause produced no toast" "$(toast_count)" "0"
 unset RAM_KEEPER_DAEMON_POLL RAM_KEEPER_PRESSURE_POLL
 
 echo
+echo "== 4c. critical without an action does not claim it is reclaiming =="
+new_case no-reclaim
+printf '%s\n' '{"state":"critical","free_percent":5.0,"relief":{"acted":false,"skipped_anon":"no-zram-room"}}' \
+  >"$CASE/.local/state/ram-keeper/state.json"
+export RAM_KEEPER_DAEMON_POLL=1 RAM_KEEPER_PRESSURE_POLL=1
+P="$(launch)"
+sleep 3
+if grep -q 'reclaiming now' "$STUB/toasts"; then
+  bad "the toast said reclaiming now when nothing was reclaimed"
+else
+  ok "the toast did not claim a reclaim"
+fi
+if grep -q 'disk swap' "$STUB/toasts"; then
+  ok "the toast says app memory stayed off disk swap"
+else
+  bad "the toast hid the reason"
+fi
+kill -TERM -"$P" 2>/dev/null || true
+unset RAM_KEEPER_DAEMON_POLL RAM_KEEPER_PRESSURE_POLL
+
+echo
 echo "== 6. a clean stop removes its pidfile =="
 new_case cleanup
 P="$(launch)"

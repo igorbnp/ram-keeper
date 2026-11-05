@@ -227,7 +227,11 @@ if not isinstance(d, dict):
 free = d.get("free_percent")
 if isinstance(free, bool) or not isinstance(free, (int, float)):
     raise SystemExit(1)
-print("%s\t%s" % (d.get("state") or "unknown", free))' 2>/dev/null
+relief = d.get("relief") if isinstance(d.get("relief"), dict) else {}
+acted = relief.get("acted")
+acted_s = "yes" if acted is True else "no" if acted is False else ""
+skipped = relief.get("skipped_anon") if isinstance(relief.get("skipped_anon"), str) else ""
+print("%s\t%s\t%s\t%s" % (d.get("state") or "unknown", free, acted_s, skipped))' 2>/dev/null
 }
 
 watch_pressure() {
@@ -235,7 +239,7 @@ watch_pressure() {
   while true; do
     [[ -f "$STATE_DIR/state.json" ]] || { sleep "$PRESSURE_POLL"; continue; }
 
-    local snapshot state free fields
+    local snapshot state free fields rest acted skipped body
     snapshot="$(cat "$STATE_DIR/state.json" 2>/dev/null)"
     if ! fields="$(snapshot_fields "$snapshot")" || [[ -z "$fields" ]]; then
       # A partial write or a corrupt file is not "critical". Say nothing.
@@ -243,7 +247,17 @@ watch_pressure() {
       continue
     fi
     state="${fields%%$'\t'*}"
-    free="${fields#*$'\t'}"
+    rest="${fields#*$'\t'}"
+    free="${rest%%$'\t'*}"
+    rest="${rest#*$'\t'}"
+    acted="${rest%%$'\t'*}"
+    skipped="${rest#*$'\t'}"
+    # A snapshot with only state and free leaves acted equal to free. Treat
+    # that as "the pass did not say it acted".
+    if [[ "$acted" == "$free" ]]; then
+      acted=""
+      skipped=""
+    fi
 
     # Only on the transition INTO critical, not every poll while critical. A
     # single dip is normal and self-correcting; the daemon handles it silently,
@@ -251,9 +265,16 @@ watch_pressure() {
     if [[ "$state" == "critical" && "$last_state" != "critical" ]] \
        && should_announce pressure-critical; then
       log_event "pressure-critical"
+      if [[ "$acted" == "yes" ]]; then
+        body="Only ${free}% free. RAM Keeper is reclaiming now. Click if the machine feels slow."
+      elif [[ "$skipped" == "no-zram-room" ]]; then
+        body="Only ${free}% free. App memory was not moved to disk swap."
+      else
+        body="Only ${free}% free. Click if the machine feels slow."
+      fi
       send critical "$ALERT_GLYPH" \
         "Memory is critically low" \
-        "Only ${free}% free. RAM Keeper is reclaiming now. Click if the machine feels slow." \
+        "$body" \
         "$(agent_action "RAM Keeper reported critical memory pressure: only ${free}% of RAM free. Use the ram-memory-diagnosis skill to explain what is using the memory and whether anything needs to change.")"
     fi
     last_state="$state"

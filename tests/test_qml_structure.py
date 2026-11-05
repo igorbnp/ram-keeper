@@ -252,6 +252,11 @@ if 'modelData.action === "protect"' not in panel or 'modelData.action === "relea
     print("  FAIL a row is missing its protect or release button")
 else:
     print("  ok   each row has its own protect or release button")
+if "Model.watchLine" not in panel:
+    fails += 1
+    print("  FAIL the footer does not use the snapshot's own sentence")
+else:
+    print("  ok   the footer uses the snapshot's own sentence")
 if "function protect(" not in service:
     fails += 1
     print("  FAIL the panel cannot ask to protect an app")

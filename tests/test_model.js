@@ -145,6 +145,15 @@ const freeRows = M.reclaimableGroups({
   ]
 });
 check("a reclaimable row can be protected", freeRows[0] && freeRows[0].action === "protect");
+const blocked = {
+  state: "critical",
+  relief: { acted: false, skipped_anon: "no-zram-room" }
+};
+check("a blocked swap is not called reclaiming",
+  M.watchLine(blocked, true).indexOf("disk swap") >= 0
+  && M.watchLine(blocked, true).indexOf("reclaiming now") < 0);
+check("a manual result does not call a blocked swap comfortable",
+  M.summaryLine({ acted: false, skipped_anon: "no-zram-room" }).indexOf("disk swap") >= 0);
 const quickshellVictim = snap.groups.filter(g => !g.protected && /quickshell/i.test(g.name));
 check("protected excludes quickshell from victims", quickshellVictim.length === 0,
   quickshellVictim.map(g => g.name).join(", "));
@@ -281,6 +290,7 @@ try {
     M.protectedGroups(s, 4); M.swapRows(s); M.psiRow(s && s.psi);
     M.psiLabel(M.psiRow(s && s.psi)); M.forecastRow(s && s.forecast);
     M.forecastForSnapshot(s); M.freePercentLabel(s); M.freeFraction(s);
+    M.watchLine(s, rand() > 0.5);
     M.usedFraction(s); M.stateLabel(s && s.state); M.stateGlyph(s && s.state);
     M.parseJsonLine(JSON.stringify(s || {})); M.formatBytes(s && s.mem_total);
 

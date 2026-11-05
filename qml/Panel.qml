@@ -550,9 +550,7 @@ Panel {
 
           Text {
             width: parent.width
-            text: root.daemonUp
-              ? "Watching automatically · nothing needed from you"
-              : "Automatic protection is paused"
+            text: Model.watchLine(root.snap, root.daemonUp)
             color: root.daemonUp ? Qt.darker(root.foreground, 1.5) : root.urgentColor
             font.family: Style.font.family
             font.pixelSize: Style.font.caption

@@ -597,6 +597,48 @@ def test_anon_pass_requires_free_zram():
     assert recorder.asks[1][1] >= 16 * MB
 
 
+def test_critical_without_zram_room_does_not_push_to_disk_swap():
+    shapes = [
+        {"devices": [{"name": "/dev/zram0", "ram_backed": True,
+                      "size": 200 * MB, "used": 200 * MB}]},
+        {"devices": [{"name": "/swap/swapfile", "ram_backed": False,
+                      "size": 8192 * MB, "used": 0}]},
+        {"devices": []},
+    ]
+    for zram in shapes:
+        steward = steward_with(max_reclaim_per_pass=4096 * MB, max_victim_fraction=60,
+                               anon_reclaim_cooldown=0)
+        recorder = Recorder()
+        steward.reclaim_from = recorder
+        group = make_group("app-disk.scope", current=800 * MB, anon=700 * MB,
+                           reclaimable=100 * MB)
+        result = steward.relieve(make_snapshot([group], state="critical",
+                                               free_percent=5.0, zram=zram))
+        assert recorder.cache_only == [True], recorder.asks
+        assert result["skipped_anon"] == "no-zram-room"
+        assert "disk swap" in result["reason"]
+        logged = steward.log_path.read_text(encoding="utf-8")
+        assert "no-zram-room" in logged
+
+    steward = steward_with(max_reclaim_per_pass=4096 * MB, max_victim_fraction=60,
+                           anon_reclaim_cooldown=0)
+    recorder = Recorder()
+    steward.reclaim_from = recorder
+    bare = make_group("app-anon.scope", current=800 * MB, anon=800 * MB, reclaimable=0)
+    result = steward.relieve(make_snapshot(
+        [bare], state="critical", free_percent=5.0, zram={"devices": []}))
+    assert recorder.asks == []
+    assert result["acted"] is False
+    assert result["skipped_anon"] == "no-zram-room"
+    published = {}
+    steward.publish = lambda snap: published.update(snap)
+    steward.snapshot = lambda: make_snapshot(
+        [bare], state="critical", free_percent=5.0, zram={"devices": []})
+    steward.supervise_once()
+    assert published["relief"]["acted"] is False
+    assert published["relief"]["skipped_anon"] == "no-zram-room"
+
+
 def test_scan_honours_protection_by_short_name(tmp_path):
     root = tmp_path / "user.slice" / "user-1000.slice"
     app = root / "app-Spotify-1043.scope"

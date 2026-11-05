@@ -331,12 +331,26 @@ function parseJsonLine(line) {
 
 function summaryLine(result) {
   if (!result) return "";
+  if (result.skipped_anon === "no-zram-room" && !result.acted) {
+    return "App memory was not moved to disk swap";
+  }
   if (!result.acted) return "Nothing to do — memory is comfortable";
   var parts = [];
   if (result.freed > 0) parts.push("freed " + formatBytes(result.freed));
   if (result.swapped_out > 0) parts.push("moved " + formatBytes(result.swapped_out) + " to zram");
+  if (result.skipped_anon === "no-zram-room") parts.push("app memory was not moved to disk swap");
   if (parts.length === 0) parts.push("no change");
   return parts.join(" · ");
+}
+
+function watchLine(snapshot, daemonUp) {
+  if (!daemonUp) return "Automatic protection is paused";
+  var relief = snapshot && snapshot.relief;
+  if (relief && relief.skipped_anon === "no-zram-room") {
+    if (relief.acted) return "Dropped cache. App memory was not moved to disk swap.";
+    return "Memory is tight. App memory was not moved to disk swap.";
+  }
+  return "Watching automatically · nothing needed from you";
 }
 
 // ---------------------------------------------------------------------------
@@ -384,6 +398,7 @@ if (typeof module !== "undefined" && module.exports) {
     parseResult: parseResult,
     parseJsonLine: parseJsonLine,
     summaryLine: summaryLine,
+    watchLine: watchLine,
     freePercentLabel: freePercentLabel,
     freeFraction: freeFraction,
     usedFraction: usedFraction
