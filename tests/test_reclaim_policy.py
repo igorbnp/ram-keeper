@@ -194,6 +194,31 @@ def test_vanished_cgroup_reports_zero_freed(tmp_path):
         f"a vanished cgroup was reported as {action.outcome!r}")
 
 
+def test_gone_or_denied_does_not_spend_the_budget():
+    class _Reply:
+        def __init__(self):
+            self.names = []
+
+        def __call__(self, group, amount, cache_only=False):
+            self.names.append(group.name)
+            outcome = "gone" if "gone" in group.name else "denied" if "denied" in group.name else "ok"
+            freed = 0 if outcome in ("gone", "denied") else amount
+            return rk.Action(label=group.label, requested=amount, freed=freed,
+                             swapped_out=0, outcome=outcome)
+
+    steward = steward_with(max_reclaim_per_pass=200 * MB, max_victim_fraction=100,
+                           anon_reclaim_cooldown=0, cache_first=False)
+    reply = _Reply()
+    steward.reclaim_from = reply
+    groups = [
+        make_group("app-gone.scope", current=800 * MB, anon=800 * MB, reclaimable=0),
+        make_group("app-denied.scope", current=500 * MB, anon=500 * MB, reclaimable=0),
+        make_group("app-live.scope", current=400 * MB, anon=400 * MB, reclaimable=0),
+    ]
+    steward.relieve(make_snapshot(groups))
+    assert reply.names == ["app-gone.scope", "app-denied.scope", "app-live.scope"]
+
+
 def test_cache_write_uses_swappiness_zero_and_falls_back(tmp_path, monkeypatch):
     import errno
     steward = steward_with()

@@ -1280,8 +1280,11 @@ class Steward:
                     continue
                 action = self.reclaim_from(group, ask, cache_only=True)
                 actions.append(action)
-                budget -= ask      # kernel-visible bytes: the ceiling is what we ASK for
-                asked_bytes[group.name] = asked_bytes.get(group.name, 0) + ask
+                # A cgroup that vanished, or one we may not write, did not take
+                # any of the budget. Charging it anyway ends the pass on a miss.
+                if action.outcome not in ("gone", "denied"):
+                    budget -= ask
+                    asked_bytes[group.name] = asked_bytes.get(group.name, 0) + ask
 
         # Pass 2: anonymous memory to zram. Target the single biggest holder
         # rather than spreading thin slices across everything: one process
@@ -1307,15 +1310,16 @@ class Steward:
                         continue
                 action = self.reclaim_from(group, ask)
                 actions.append(action)
+                if action.outcome in ("gone", "denied"):
+                    continue
                 budget -= ask          # kernel-visible bytes: the ceiling is on what we ASK for
                 asked_bytes[group.name] = asked_bytes.get(group.name, 0) + ask
-                if action.outcome not in ("gone", "denied"):
-                    try:
-                        pause = float(self.config.get("anon_reclaim_cooldown", 90.0))
-                    except (TypeError, ValueError):
-                        pause = 90.0
-                    if math.isfinite(pause) and pause > 0:
-                        self._anon_ready_at[group.name] = self._clock() + pause
+                try:
+                    pause = float(self.config.get("anon_reclaim_cooldown", 90.0))
+                except (TypeError, ValueError):
+                    pause = 90.0
+                if math.isfinite(pause) and pause > 0:
+                    self._anon_ready_at[group.name] = self._clock() + pause
 
         # Pass 3: cgroups with swap disabled are NOT reclaimed.
         # Asking them for anon is a guaranteed EAGAIN that wastes the pass's budget.
