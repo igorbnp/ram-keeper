@@ -7,7 +7,12 @@ from pathlib import Path
 PLUGIN = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PLUGIN / "helper"))
 
-import json, sys, subprocess
+import json, os, subprocess, tempfile
+from pathlib import Path as _Path
+
+_CFG_DIR = tempfile.mkdtemp(prefix="rk-config-")
+os.environ["RAM_KEEPER_CONFIG"] = str(_Path(_CFG_DIR) / "config.json")
+os.environ.setdefault("RAM_KEEPER_STATE_DIR", tempfile.mkdtemp(prefix="rk-state-"))
 
 # ---------------------------------------------------------------------------
 # This suite exercises the live machine: it runs the daemon, reads real
@@ -27,15 +32,16 @@ elif _os.environ.get("RAM_KEEPER_LIVE") != "1":
 
 
 def main():
-    REAL = Path.home()/".config/ram-keeper/config.json"
-    backup = REAL.read_text() if REAL.exists() else None
+    cfg_path = _Path(os.environ["RAM_KEEPER_CONFIG"])
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
 
     HELPER = str(PLUGIN / "helper" / "ram_keeper.py")
     def victims_with(cfg):
-        REAL.parent.mkdir(parents=True, exist_ok=True)
-        REAL.write_text(json.dumps(cfg))
+        cfg_path.write_text(json.dumps(cfg))
+        env = os.environ.copy()
+        env["RAM_KEEPER_CONFIG"] = str(cfg_path)
         out = subprocess.run(["/usr/bin/python3", HELPER, "--once"],
-                             capture_output=True, text=True, timeout=60)
+                             capture_output=True, text=True, timeout=60, env=env)
         d = json.loads(out.stdout)
         v = [g["name"] for g in d["groups"] if not g["protected"]]
         return d, v
@@ -83,8 +89,7 @@ def main():
             print(f"  {'ok  ' if ok else 'FAIL'} is_inviolable({n!r}) = {got} (expected {expect})")
         print("\nALL PASS" if failures == 0 else f"\n{failures} FAILURES")
     finally:
-        if backup is not None: REAL.write_text(backup)
-        elif REAL.exists(): REAL.unlink()
+        pass
 
 
 if __name__ == "__main__":

@@ -11,6 +11,10 @@ set -uo pipefail
 
 PLUGIN="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RENDER="$PLUGIN/helper/render_unit.py"
+# The throwaway units run the real helper. Point them at an empty config so
+# they cannot read the owner's file.
+export RAM_KEEPER_CONFIG="${RAM_KEEPER_CONFIG:-$(mktemp "${TMPDIR:-/tmp}/rk-config.XXXXXX")}"
+export RAM_KEEPER_STATE_DIR="${RAM_KEEPER_STATE_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/rk-state.XXXXXX")}"
 fails=0
 B="$(mktemp -d)"
 UNIT_DIR="$HOME/.config/systemd/user"
@@ -33,6 +37,8 @@ run_unit() {  # run_unit <label> <execstart-line>
     echo "Description=ram-keeper hostile path probe"
     echo "[Service]"
     echo "Type=oneshot"
+    echo "Environment=RAM_KEEPER_CONFIG=$RAM_KEEPER_CONFIG"
+    echo "Environment=RAM_KEEPER_STATE_DIR=$RAM_KEEPER_STATE_DIR"
     echo "$line"
   } >"$UNIT_DIR/$unit.service"
   systemctl --user daemon-reload >/dev/null 2>&1

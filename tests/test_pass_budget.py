@@ -22,6 +22,7 @@ from pathlib import Path
 # Steward objects, and a pass that "frees" memory would append a fabricated
 # reclaim event to the production log.
 os.environ.setdefault("RAM_KEEPER_STATE_DIR", tempfile.mkdtemp(prefix="rk-test-state-"))
+os.environ.setdefault("RAM_KEEPER_CONFIG", str(Path(tempfile.mkdtemp(prefix="rk-config-")) / "config.json"))
 
 PLUGIN = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PLUGIN / "helper"))

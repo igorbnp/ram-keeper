@@ -10,7 +10,11 @@ from pathlib import Path
 PLUGIN = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PLUGIN / "helper"))
 
-import json, os, subprocess, sys, time
+import json, os, subprocess, sys, tempfile, time
+from pathlib import Path as _EarlyPath
+
+os.environ.setdefault("RAM_KEEPER_CONFIG", str(_EarlyPath(tempfile.mkdtemp(prefix="rk-config-")) / "config.json"))
+os.environ.setdefault("RAM_KEEPER_STATE_DIR", tempfile.mkdtemp(prefix="rk-state-"))
 
 # ---------------------------------------------------------------------------
 # This suite exercises the live machine: it runs the daemon, reads real

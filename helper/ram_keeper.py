@@ -462,6 +462,16 @@ def is_inviolable(name: str) -> bool:
 
 
 def config_path() -> Path:
+    """Where the user's config lives.
+
+    `RAM_KEEPER_CONFIG` points at another file so a test can load and write a
+    throwaway config. Without it, the suite used to overwrite the real
+    `~/.config/ram-keeper/config.json` and, if the daemon reloaded in that
+    window, act on the hostile values.
+    """
+    override = os.environ.get("RAM_KEEPER_CONFIG")
+    if override:
+        return Path(override)
     return Path.home() / ".config" / "ram-keeper" / "config.json"
 
 

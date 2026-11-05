@@ -4,7 +4,11 @@ predicts the crossing time. Then feed it noise and check it does NOT cry wolf.
 Then run it on the live machine.
 """
 import json
-import os, subprocess, sys, time
+import os, subprocess, sys, tempfile, time
+from pathlib import Path as _Path
+
+os.environ.setdefault("RAM_KEEPER_CONFIG", str(_Path(tempfile.mkdtemp(prefix="rk-config-")) / "config.json"))
+os.environ.setdefault("RAM_KEEPER_STATE_DIR", tempfile.mkdtemp(prefix="rk-state-"))
 
 import sys
 from pathlib import Path
