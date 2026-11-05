@@ -375,6 +375,14 @@ def test_manual_action_publishes_a_fresh_snapshot(monkeypatch):
     assert [snap["state"] for snap in published] == ["ok", "ok"]
 
 
+def test_snapshot_carries_the_manifest_version():
+    import ram_keeper as rk
+    manifest = json.loads((Path(rk.__file__).resolve().parent.parent / "manifest.json").read_text(encoding="utf-8"))
+    assert rk.plugin_version() == manifest["version"]
+    snap = rk.Steward(config=rk.load_config()).snapshot()
+    assert snap["version"] == manifest["version"]
+
+
 def test_removing_a_default_stays_removed(monkeypatch, tmp_path):
     import ram_keeper as rk
     cfg_path = tmp_path / "config.json"

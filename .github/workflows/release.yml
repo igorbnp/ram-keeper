@@ -6,11 +6,13 @@ on:
       - "v*.*.*"
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   release:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
     steps:
       - uses: actions/checkout@v4
@@ -21,6 +23,18 @@ jobs:
           ver=$(python3 -c "import json;print(json.load(open('manifest.json'))['version'])")
           echo "tag=$tag manifest=$ver"
           [ "$tag" = "$ver" ] || { echo "::error::tag $tag does not match manifest version $ver"; exit 1; }
+
+      - name: Run the test suite
+        run: |
+          python3 -m pip install --quiet pytest
+          python3 -m pytest -q tests/test_ram_keeper_core.py \
+            tests/test_integration.py tests/test_process_guardian.py \
+            tests/test_bugfixes.py tests/test_reclaim_policy.py \
+            tests/test_config_attacks.py tests/test_unit_hardening.py \
+            tests/test_config_isolation.py
+          python3 tests/test_critical_metrics.py
+          python3 tests/test_qml_structure.py
+          python3 tests/test_pass_budget.py
 
       - name: Build the source archives
         run: |

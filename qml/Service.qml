@@ -53,6 +53,7 @@ Item {
   property bool daemonUp: false
   property bool pausedByUser: false
   property bool pauseKnown: false
+  property bool versionRestarted: false
   // Wall-clock of the last snapshot the daemon published.
   property double lastHeartbeat: 0
   // Incremented by the poll timer and surfaced over IPC, so a stalled panel is
@@ -81,6 +82,16 @@ Item {
     if (parsed.checked_at) root.lastHeartbeat = parsed.checked_at
     root.noteHeartbeat()
     root.daemonActive()
+    if (parsed.version && root.manifest && root.manifest.version
+        && String(parsed.version) !== String(root.manifest.version)
+        && !root.pausedByUser && !root.versionRestarted) {
+      root.versionRestarted = true
+      root.lastError = "Restarting protection so it matches this version"
+      if (!versionRestart.running) {
+        versionRestart.command = ["systemctl", "--user", "restart", root.unitName]
+        versionRestart.running = true
+      }
+    }
   }
 
   // ---------------------------------------------------------------------
@@ -277,6 +288,13 @@ Item {
       root.pauseKnown = true
       root.daemonActive()
       if (!root.pausedByUser) startDaemonTimer.restart()
+    }
+  }
+
+  Process {
+    id: versionRestart
+    onExited: function(exitCode) {
+      if (exitCode !== 0) root.lastError = "Could not restart protection for this version"
     }
   }
 

@@ -872,6 +872,17 @@ class Action:
         return self.outcome in ("ok", "eagain")
 
 
+def plugin_version() -> str:
+    """The version the installed manifest claims, or nothing if it is unreadable."""
+    path = Path(__file__).resolve().parent.parent / "manifest.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    version = data.get("version") if isinstance(data, dict) else ""
+    return version if isinstance(version, str) else ""
+
+
 @dataclass
 class Steward:
     config: dict = field(default_factory=load_config)
@@ -1030,6 +1041,7 @@ class Steward:
             "groups": [asdict(g) | {"path": str(g.path)} for g in groups],
             "reclaimable_total": sum(g.reclaimable for g in victims),
             "checked_at": time.time(),
+            "version": plugin_version(),
         }
 
     # -- reclamation -----------------------------------------------------
