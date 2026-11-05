@@ -24,10 +24,9 @@ os.environ.setdefault("RAM_KEEPER_STATE_DIR", tempfile.mkdtemp(prefix="rk-state-
 # ---------------------------------------------------------------------------
 import os as _os
 import sys
-if not _os.path.exists("/sys/fs/cgroup/user.slice") or not _os.environ.get("CI"):
-    pass
-elif _os.environ.get("RAM_KEEPER_LIVE") != "1":
-    print("  --   live suite skipped (no RAM_KEEPER_LIVE on a CI runner)")
+if (not _os.path.exists("/sys/fs/cgroup/user.slice")
+        or (_os.environ.get("CI") and _os.environ.get("RAM_KEEPER_LIVE") != "1")):
+    print("  --   live suite skipped (no user cgroup, or CI without RAM_KEEPER_LIVE=1)")
     sys.exit(0)
 
 
@@ -62,7 +61,9 @@ hog = "b=[bytearray(1024*1024) for _ in range(400)]\nimport time\ntime.sleep(45)
 subprocess.run(["systemd-run", "--user", "--unit=ramtest-race", "/usr/bin/python3", "-c", hog],
                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 time.sleep(3)
-victim = "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/app.slice/ramtest-race.service"
+_uid = os.getuid()
+victim = (f"/sys/fs/cgroup/user.slice/user-{_uid}.slice/"
+          f"user@{_uid}.service/app.slice/ramtest-race.service")
 check("victim cgroup exists", Path(victim).is_dir())
 subprocess.run(["systemctl", "--user", "stop", "ramtest-race"], capture_output=True)
 # Immediately scan: the cgroup is gone or mid-teardown.

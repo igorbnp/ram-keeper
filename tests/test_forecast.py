@@ -146,10 +146,6 @@ check("a leak that started mid-window is named", "leak" in f6b.culprit, repr(f6b
 # tests/run-all.sh on the development machine.
 # ---------------------------------------------------------------------------
 
-if os.environ.get("RAM_KEEPER_LIVE") != "1":
-    print("\n== live probe skipped (set RAM_KEEPER_LIVE=1 on a desktop) ==")
-    assert fails == 0, f"Test failed: {fails} failures"
-
 print("\n== 7. a slow decline is 'soon', not 'imminent' ==")
 clock7 = FakeClock()
 t7 = rk.TrendTracker(clock=clock7)
@@ -160,6 +156,10 @@ for i in range(15):
 f7 = t7.forecast(1400 * MB)
 print(f"  horizon={f7.horizon_seconds:.0f}s urgency={f7.urgency}")
 check("slow decline is not imminent", f7.urgency != "imminent", f7.urgency)
+if os.environ.get("RAM_KEEPER_LIVE") != "1":
+    print("\n== live probe skipped (set RAM_KEEPER_LIVE=1 on a desktop) ==")
+    print("\nALL PASS" if fails == 0 else f"\n{fails} FAILURES")
+    sys.exit(0 if fails == 0 else 1)
 print("\n== 7. the live machine reports a forecast ==")
 out = subprocess.run(["/usr/bin/python3",
                       str(PLUGIN / "helper" / "ram_keeper.py"),

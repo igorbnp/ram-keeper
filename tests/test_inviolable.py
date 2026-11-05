@@ -22,11 +22,9 @@ os.environ.setdefault("RAM_KEEPER_STATE_DIR", tempfile.mkdtemp(prefix="rk-state-
 # ---------------------------------------------------------------------------
 import os as _os
 import sys
-if not _os.path.exists("/sys/fs/cgroup/user.slice") or not _os.environ.get("CI"):
-    pass
-elif _os.environ.get("RAM_KEEPER_LIVE") != "1":
-    print("  --   live suite skipped (no RAM_KEEPER_LIVE on a CI runner)")
-    import sys
+if (not _os.path.exists("/sys/fs/cgroup/user.slice")
+        or (_os.environ.get("CI") and _os.environ.get("RAM_KEEPER_LIVE") != "1")):
+    print("  --   live suite skipped (no user cgroup, or CI without RAM_KEEPER_LIVE=1)")
     sys.exit(0)
 
 
