@@ -139,8 +139,18 @@ Item {
     actionProc.running = true
   }
 
+  property string listVerb: "release"
+
+  function protect(name) {
+    if (!name || protectProc.running) return
+    root.listVerb = "protect"
+    protectProc.command = ["python3", root.helperPath, "--protected-add", name]
+    protectProc.running = true
+  }
+
   function unprotect(name) {
     if (!name || protectProc.running) return
+    root.listVerb = "release"
     protectProc.command = ["python3", root.helperPath, "--protected-remove", name]
     protectProc.running = true
   }
@@ -274,7 +284,11 @@ Item {
   Process {
     id: protectProc
     onExited: function(exitCode) {
-      if (exitCode !== 0) root.lastError = "Could not release that app"
+      if (exitCode !== 0) {
+        root.lastError = root.listVerb === "protect"
+          ? "Could not protect that app"
+          : "Could not release that app"
+      }
       root.refresh()
     }
   }

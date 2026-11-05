@@ -127,6 +127,24 @@ const compositorVictims = snap.groups.filter(g => !g.protected && (
 check("protected excludes the compositor from victims",
   compositorVictims.length === 0,
   compositorVictims.map(g => g.name).join(", "));
+
+const actionRows = M.protectedGroups({
+  groups: [
+    { name: "session-2.scope", label: "session", protected: true, inviolable: true, current: 400 * 1024 * 1024 },
+    { name: "ollama.service", label: "ollama", protected: true, inviolable: false, current: 800 * 1024 * 1024 }
+  ]
+});
+check("an inviolable row has no button",
+  actionRows.find(r => r.key === "session-2.scope").action === "");
+check("a protected row can be released",
+  actionRows.find(r => r.key === "ollama.service").action === "release");
+const freeRows = M.reclaimableGroups({
+  groups: [
+    { name: "app-Firefox-1.scope", label: "Firefox", protected: false, inviolable: false,
+      current: 900 * 1024 * 1024, anon: 800 * 1024 * 1024, reclaimable: 100 * 1024 * 1024 }
+  ]
+});
+check("a reclaimable row can be protected", freeRows[0] && freeRows[0].action === "protect");
 const quickshellVictim = snap.groups.filter(g => !g.protected && /quickshell/i.test(g.name));
 check("protected excludes quickshell from victims", quickshellVictim.length === 0,
   quickshellVictim.map(g => g.name).join(", "));

@@ -93,6 +93,7 @@ class Cgroup:
     swap: int = 0
     reclaimable: int = 0      # file pages we could drop for free
     protected: bool = False   # exempt by configuration or by role
+    inviolable: bool = False  # no panel button may take this protection off
     swapable: bool = True     # False when MemorySwapMax=0 (anon can never be reclaimed)
     pids: int = 0
 
@@ -271,9 +272,10 @@ def scan(root: Path, protected: set[str], min_bytes: int,
         else:
             kind = "service"
 
+        inviolable = is_inviolable(name)
         is_protected = (names_match(name, protected)
                         or names_match(name, never or set())
-                        or is_inviolable(name))
+                        or inviolable)
         found.append(Cgroup(
             path=cgroup_dir,
             name=name,
@@ -286,6 +288,7 @@ def scan(root: Path, protected: set[str], min_bytes: int,
             swap=swap,
             reclaimable=reclaimable,
             protected=is_protected,
+            inviolable=inviolable,
             swapable=swapable,
             pids=pids,
         ))

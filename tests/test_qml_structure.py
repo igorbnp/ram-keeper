@@ -247,6 +247,16 @@ if "paused-by-user" not in service or "pauseKnown" not in service:
     print("  FAIL the pause is not remembered across a shell restart")
 else:
     print("  ok   the pause is remembered across a shell restart")
+if 'modelData.action === "protect"' not in panel or 'modelData.action === "release"' not in panel:
+    fails += 1
+    print("  FAIL a row is missing its protect or release button")
+else:
+    print("  ok   each row has its own protect or release button")
+if "function protect(" not in service:
+    fails += 1
+    print("  FAIL the panel cannot ask to protect an app")
+else:
+    print("  ok   the panel can ask to protect an app")
 if "root.daemonUp ? root.foreground : root.urgentColor" not in panel:
     fails += 1
     print("  FAIL the off button keeps the on colour at rest")

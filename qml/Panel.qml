@@ -450,6 +450,22 @@ Panel {
             }
 
             Text {
+              anchors.right: reclaimSize.left
+              anchors.rightMargin: Style.space(8)
+              anchors.verticalCenter: parent.verticalCenter
+              visible: modelData.action === "protect"
+              text: "Protect"
+              color: root.accentColor
+              font.family: Style.font.family
+              font.pixelSize: Style.font.bodySmall
+              MouseArea {
+                anchors.fill: parent
+                onClicked: if (root.keeper) root.keeper.protect(modelData.key)
+              }
+            }
+
+            Text {
+              id: reclaimSize
               anchors.right: parent.right
               anchors.verticalCenter: parent.verticalCenter
               text: Model.formatBytes(modelData.bytes)
@@ -501,6 +517,7 @@ Panel {
               anchors.right: sizeText.left
               anchors.rightMargin: Style.space(8)
               anchors.verticalCenter: parent.verticalCenter
+              visible: modelData.action === "release"
               text: "Release"
               color: root.accentColor
               font.family: Style.font.family

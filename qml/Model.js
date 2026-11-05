@@ -181,6 +181,12 @@ function horizonLabel(seconds) {
 // Only things that can actually give something back: unprotected, above the
 // noise floor, and not already empty. Sorted by what we'd recover, so the
 // panel leads with the process that matters.
+function rowAction(group) {
+  if (!group || group.inviolable === true) return "";
+  if (group.protected === true) return "release";
+  return "protect";
+}
+
 function reclaimableGroups(snapshot, limit) {
   if (!snapshot || !snapshot.groups) return [];
   var rows = snapshot.groups
@@ -201,6 +207,8 @@ function reclaimableGroups(snapshot, limit) {
         swapable: g.swapable !== false,
         give: give,
         protected: g.protected === true,
+        inviolable: g.inviolable === true,
+        action: rowAction(g),
         kind: g.kind || ""
       };
     });
@@ -225,6 +233,8 @@ function protectedGroups(snapshot, limit) {
         cache: g.reclaimable || 0,
         swap: g.swap || 0,
         protected: true,
+        inviolable: g.inviolable === true,
+        action: rowAction(g),
         kind: g.kind || ""
       };
     });
