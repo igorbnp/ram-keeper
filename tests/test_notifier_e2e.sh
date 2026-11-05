@@ -187,6 +187,18 @@ count="$(grep -c 'RAM protection stopped' "$STUB/toasts")"
 unset RAM_KEEPER_DAEMON_POLL RAM_KEEPER_PRESSURE_POLL
 
 echo
+echo "== 6b. a pause the user asked for is not an alarm =="
+new_case user-pause
+export RAM_KEEPER_DAEMON_POLL=1 RAM_KEEPER_PRESSURE_POLL=2
+P="$(launch)"
+sleep 2
+touch "$CASE/.local/state/ram-keeper/paused-by-user"
+echo inactive >"$STUB/systemctl_state"
+sleep 3
+check "a user pause produced no toast" "$(toast_count)" "0"
+unset RAM_KEEPER_DAEMON_POLL RAM_KEEPER_PRESSURE_POLL
+
+echo
 echo "== 6. a clean stop removes its pidfile =="
 new_case cleanup
 P="$(launch)"

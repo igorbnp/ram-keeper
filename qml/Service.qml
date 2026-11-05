@@ -37,6 +37,8 @@ Item {
   // always with an empty trend history so the forecast showed nothing.
   readonly property string statePath:
     Quickshell.env("HOME") + "/.local/state/ram-keeper/state.json"
+  readonly property string pauseFlagPath:
+    Quickshell.env("HOME") + "/.local/state/ram-keeper/paused-by-user"
 
   property var snapshot: ({})
   property bool loaded: false
@@ -49,6 +51,8 @@ Item {
   // rather than assumed from our own start/stop calls, so the panel tells the
   // truth even if the unit was stopped from outside the panel.
   property bool daemonUp: false
+  property bool pausedByUser: false
+  property bool pauseKnown: false
   // Wall-clock of the last snapshot the daemon published.
   property double lastHeartbeat: 0
   // Incremented by the poll timer and surfaced over IPC, so a stalled panel is
@@ -140,6 +144,10 @@ Item {
   // reported "Automatic protection is paused" while the daemon was running.
   // A UI that lies about whether protection is on is worse than no indicator.
   function daemonActive() {
+    if (root.pausedByUser) {
+      root.daemonUp = false
+      return
+    }
     var now = Date.now() / 1000;
     root.daemonUp = (now - root.lastHeartbeat) < 180;
   }
@@ -154,16 +162,23 @@ Item {
   }
 
   function startDaemon() {
-    if (!daemonStart.running) {
-      daemonStart.command = ["systemctl", "--user", "start", root.unitName]
-      daemonStart.running = true
+    root.pausedByUser = false
+    root.daemonUp = false
+    if (!pauseClear.running) {
+      pauseClear.command = ["rm", "-f", root.pauseFlagPath]
+      pauseClear.running = true
     }
   }
 
   function stopDaemon() {
-    if (!daemonStop.running) {
-      daemonStop.command = ["systemctl", "--user", "stop", root.unitName]
-      daemonStop.running = true
+    root.pausedByUser = true
+    root.daemonUp = false
+    root.lastHeartbeat = 0
+    if (!pauseWrite.running) {
+      pauseWrite.command = ["python3", "-c",
+        "import pathlib,sys; pathlib.Path(sys.argv[1]).parent.mkdir(parents=True, exist_ok=True); pathlib.Path(sys.argv[1]).write_text('1\\n')",
+        root.pauseFlagPath]
+      pauseWrite.running = true
     }
   }
 
@@ -216,6 +231,38 @@ Item {
       root.busy = false
       root.activeAction = ""
       actionDoneTimer.restart()
+    }
+  }
+
+  Process {
+    id: pauseWrite
+    onExited: function(exitCode) {
+      if (exitCode !== 0) root.lastError = "Could not remember that protection is paused"
+      if (!daemonStop.running) {
+        daemonStop.command = ["systemctl", "--user", "stop", root.unitName]
+        daemonStop.running = true
+      }
+    }
+  }
+
+  Process {
+    id: pauseClear
+    onExited: function(exitCode) {
+      if (exitCode !== 0) root.lastError = "Could not clear the pause"
+      if (!daemonStart.running) {
+        daemonStart.command = ["systemctl", "--user", "start", root.unitName]
+        daemonStart.running = true
+      }
+    }
+  }
+
+  Process {
+    id: pauseRead
+    onExited: function(code) {
+      root.pausedByUser = (code === 0)
+      root.pauseKnown = true
+      root.daemonActive()
+      if (!root.pausedByUser) startDaemonTimer.restart()
     }
   }
 
@@ -284,7 +331,8 @@ Item {
     // Bring the daemon up on first load so the protection exists before the
     // user ever needs it. If the unit is missing, say so once instead of
     // failing silently on every check.
-    startDaemonTimer.restart()
+    pauseRead.command = ["test", "-f", root.pauseFlagPath]
+    pauseRead.running = true
     root.refresh()
   }
 
@@ -292,7 +340,9 @@ Item {
     id: startDaemonTimer
     interval: 600
     repeat: false
-    onTriggered: root.startDaemon()
+    onTriggered: {
+      if (root.pauseKnown && !root.pausedByUser) root.startDaemon()
+    }
   }
 
   // ---------------------------------------------------------------------

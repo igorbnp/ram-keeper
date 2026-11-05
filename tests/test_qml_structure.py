@@ -237,6 +237,16 @@ if 'activeAction === "relieve"' not in panel or 'activeAction === "sweep"' not i
     print("  FAIL both action buttons share one Working label")
 else:
     print("  ok   each action button has its own Working label")
+if "paused-by-user" not in service or "pauseKnown" not in service:
+    fails += 1
+    print("  FAIL the pause is not remembered across a shell restart")
+else:
+    print("  ok   the pause is remembered across a shell restart")
+if "root.daemonUp ? root.foreground : root.urgentColor" not in panel:
+    fails += 1
+    print("  FAIL the off button keeps the on colour at rest")
+else:
+    print("  ok   the off button uses the warning colour at rest")
 
 print("\n" + ("QML structure ok" if fails == 0 else "%d file(s) suspect" % fails))
 assert fails == 0, f"Test failed: {fails} failures"

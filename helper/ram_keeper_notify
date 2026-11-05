@@ -144,6 +144,9 @@ watch_daemon() {
   while true; do
     if systemctl --user is-active --quiet "$UNIT"; then
       was_alive=1
+    elif [[ -f "$STATE_DIR/paused-by-user" ]]; then
+      # The panel wrote this before it stopped the unit. A pause is not a crash.
+      was_alive=0
     elif [[ "$was_alive" == "1" ]]; then
       # Only speak if it was alive and has now stopped. A unit disabled at
       # login is a choice, not a failure, and must not nag.

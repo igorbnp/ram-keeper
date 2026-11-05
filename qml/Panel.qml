@@ -174,7 +174,7 @@ Panel {
               iconText: "󰐲"
               tooltipText: !root.actionsReady ? "Not connected"
                 : (root.daemonUp ? "Automatic protection is on" : "Automatic protection is off")
-              foreground: root.foreground
+              foreground: root.daemonUp ? root.foreground : root.urgentColor
               hoverColor: root.daemonUp ? root.foreground : root.urgentColor
               enabled: root.actionsReady
               onClicked: {
