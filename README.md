@@ -313,7 +313,9 @@ one that names them.
 - **"Drop cache" drops cache.** It once ran the anonymous passes too, so
   clicking it on a healthy desktop swapped out Chromium and the Hyprland
   launcher: 658 MB into zram for no memory benefit, under a button labelled
-  "Drop cache". It is now cache-only.
+  "Drop cache". It is now cache-only, and the cache write asks the kernel for
+  `swappiness=0`. If that kernel rejects the token, the same write is retried
+  as a plain byte count.
 - **The first version of this plugin killed a browser, and only sustained load
   revealed it.** The anon pass asked a cgroup for as much as all of its
   anonymous memory; under continuous load that became a 1.5 GB request against a

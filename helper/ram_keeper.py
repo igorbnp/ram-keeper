@@ -21,6 +21,7 @@ the user systemd unit. See CONFIG.md for the policy and thresholds.
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import math
 import os
@@ -1007,7 +1008,7 @@ class Steward:
         }
 
     # -- reclamation -----------------------------------------------------
-    def reclaim_from(self, group: Cgroup, amount: int) -> Action:
+    def reclaim_from(self, group: Cgroup, amount: int, cache_only: bool = False) -> Action:
         """Ask one cgroup to give back `amount`. Cache comes off first.
 
         Accounting rule: every number reported here must be something the
@@ -1022,18 +1023,29 @@ class Steward:
         before = _read_int(group.path / "memory.current", -1)
         before_swap = cgroup_swap(group.path)
         outcome = "unknown"
-        try:
-            with open(group.reclaim_file, "w", encoding="utf-8") as handle:
-                handle.write(str(amount))
-            outcome = "ok"
-        except FileNotFoundError:
-            outcome = "gone"
-        except PermissionError:
-            outcome = "denied"
-        except OSError as e:
-            # EAGAIN means "could not free that much right now" — the kernel
-            # still reclaimed everything it could. Not a failure.
-            outcome = "eagain" if e.errno == 11 else f"error:{e.errno}"
+        # A cache pass must not swap anonymous pages. `swappiness=0` asks the
+        # kernel for that. Older kernels reject the token with EINVAL; then
+        # the plain byte count is the only write they accept.
+        payloads = [f"{int(amount)} swappiness=0", str(int(amount))] if cache_only else [str(int(amount))]
+        for index, payload in enumerate(payloads):
+            try:
+                with open(group.reclaim_file, "w", encoding="utf-8") as handle:
+                    handle.write(payload)
+                outcome = "ok"
+                break
+            except FileNotFoundError:
+                outcome = "gone"
+                break
+            except PermissionError:
+                outcome = "denied"
+                break
+            except OSError as e:
+                if cache_only and index == 0 and e.errno == errno.EINVAL:
+                    continue
+                # EAGAIN means "could not free that much right now" — the kernel
+                # still reclaimed everything it could. Not a failure.
+                outcome = "eagain" if e.errno == 11 else f"error:{e.errno}"
+                break
 
         self._settle()
         after = _read_int(group.path / "memory.current", -1)
@@ -1266,7 +1278,7 @@ class Steward:
                 ask = min(budget, group.reclaimable, remaining_slice(group))
                 if ask < 16 * 1024 * 1024:
                     continue
-                action = self.reclaim_from(group, ask)
+                action = self.reclaim_from(group, ask, cache_only=True)
                 actions.append(action)
                 budget -= ask      # kernel-visible bytes: the ceiling is what we ASK for
                 asked_bytes[group.name] = asked_bytes.get(group.name, 0) + ask

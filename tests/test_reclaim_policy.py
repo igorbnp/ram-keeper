@@ -194,6 +194,41 @@ def test_vanished_cgroup_reports_zero_freed(tmp_path):
         f"a vanished cgroup was reported as {action.outcome!r}")
 
 
+def test_cache_write_uses_swappiness_zero_and_falls_back(tmp_path, monkeypatch):
+    import errno
+    steward = steward_with()
+    path, group = _fake_cgroup(tmp_path, current=100 * MB, with_reclaim_file=True)
+    writes = []
+    real_open = open
+
+    def fake_open(file, mode="r", *args, **kwargs):
+        if Path(file) == path / "memory.reclaim" and "w" in mode:
+            class _Handle:
+                def write(self, data):
+                    writes.append(data)
+                    if "swappiness=0" in data:
+                        raise OSError(errno.EINVAL, "old kernel")
+                    return len(data)
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *exc):
+                    return False
+            return _Handle()
+        return real_open(file, mode, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.open", fake_open)
+    action = steward.reclaim_from(group, 32 * MB, cache_only=True)
+    assert writes == [f"{32 * MB} swappiness=0", str(32 * MB)]
+    assert action.outcome == "ok"
+
+    writes.clear()
+    action = steward.reclaim_from(group, 32 * MB, cache_only=False)
+    assert writes == [str(32 * MB)]
+    assert action.outcome == "ok"
+
+
 def test_unreadable_after_value_is_not_treated_as_zero(tmp_path, monkeypatch):
     """A real 0 after a reclaim is meaningful; an unreadable file is not."""
     steward = steward_with()
