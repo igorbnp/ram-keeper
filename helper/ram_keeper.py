@@ -501,7 +501,7 @@ def is_inviolable(name: str) -> bool:
         return False
     if names_match(name, INVIOABLE_PROTECTED):
         return True
-    base = _strip_unit_suffix(name.strip())
+    base = _strip_unit_suffix(name.strip()).casefold()
     return base == "session" or base.startswith("session-")
 
 
@@ -1632,10 +1632,20 @@ def remove_protection(name: str) -> list[str]:
                 current = []
             return [v.strip() for v in current if isinstance(v, str) and v.strip()]
 
-        if "protected" in existing:
-            existing["protected"] = [v for v in _listed("protected") if not names_match(v, [name])]
-        if "never_reclaim" in existing:
-            existing["never_reclaim"] = [v for v in _listed("never_reclaim") if not names_match(v, [name])]
+        def _drop_name(key: str) -> None:
+            # An empty list is how load_config hears "forget the defaults".
+            # Releasing the last name the user wrote must remove the key, so
+            # the patterns come back. The removal itself lives in `unprotect`.
+            if key not in existing:
+                return
+            kept = [v for v in _listed(key) if not names_match(v, [name])]
+            if kept:
+                existing[key] = kept
+            else:
+                existing.pop(key, None)
+
+        _drop_name("protected")
+        _drop_name("never_reclaim")
         gone = _listed("unprotect")
         if not any(names_match(v, [name]) for v in gone):
             gone.append(name)

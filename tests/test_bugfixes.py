@@ -388,6 +388,38 @@ def test_daemon_keeps_the_version_it_started_with(tmp_path, monkeypatch):
     assert steward.snapshot()["version"] == "1.2.0"
 
 
+def test_release_does_not_erase_the_default_lists(monkeypatch, tmp_path):
+    """Scenarios A and B: an empty list on disk means 'drop the defaults'."""
+    import ram_keeper as rk
+    cfg_path = tmp_path / "config.json"
+    monkeypatch.setenv("RAM_KEEPER_CONFIG", str(cfg_path))
+
+    cfg_path.write_text(json.dumps({"never_reclaim": ["spotify"]}) + "\n", encoding="utf-8")
+    monkeypatch.setattr(sys, "argv", ["ram-keeper", "--protected-remove", "spotify"])
+    assert rk.main() == 0
+    stored = json.loads(cfg_path.read_text(encoding="utf-8"))
+    assert "never_reclaim" not in stored
+    assert any(rk.names_match(name, ["spotify"]) for name in stored["unprotect"])
+    loaded = rk.load_config()
+    assert any(rk.names_match(name, ["localsearch-3.service"]) for name in loaded["never_reclaim"])
+    assert not any(rk.names_match(name, ["spotify"]) for name in loaded["never_reclaim"])
+
+    cfg_path.write_text(json.dumps({"protected": ["spotify"]}) + "\n", encoding="utf-8")
+    assert rk.main() == 0
+    stored = json.loads(cfg_path.read_text(encoding="utf-8"))
+    assert "protected" not in stored
+    loaded = rk.load_config()
+    assert any(rk.names_match(name, ["ollama.service"]) for name in loaded["protected"])
+    assert any(rk.names_match(name, ["pipewire.service"]) for name in loaded["protected"])
+    assert not any(rk.names_match(name, ["spotify"]) for name in loaded["protected"])
+
+    kept = json.dumps({"protected": ["spotify"]}) + "\n"
+    cfg_path.write_text(kept, encoding="utf-8")
+    monkeypatch.setattr(sys, "argv", ["ram-keeper", "--protected-remove", "Session-2.scope"])
+    assert rk.main() == 2
+    assert cfg_path.read_text(encoding="utf-8") == kept
+
+
 def test_removing_a_default_stays_removed(monkeypatch, tmp_path):
     import ram_keeper as rk
     cfg_path = tmp_path / "config.json"
