@@ -35,14 +35,15 @@ def main():
     cfg_path = _Path(os.environ["RAM_KEEPER_CONFIG"])
     cfg_path.parent.mkdir(parents=True, exist_ok=True)
 
-    HELPER = str(PLUGIN / "helper" / "ram_keeper.py")
     def victims_with(cfg):
         cfg_path.write_text(json.dumps(cfg))
-        env = os.environ.copy()
-        env["RAM_KEEPER_CONFIG"] = str(cfg_path)
-        out = subprocess.run(["/usr/bin/python3", HELPER, "--once"],
-                             capture_output=True, text=True, timeout=60, env=env)
-        d = json.loads(out.stdout)
+        import importlib
+        if "ram_keeper" in sys.modules:
+            del sys.modules["ram_keeper"]
+        rk = importlib.import_module("ram_keeper")
+        # Measure now. A published state.json can be minutes old and would
+        # hide the config this test just wrote.
+        d = rk.Steward().snapshot()
         v = [g["name"] for g in d["groups"] if not g["protected"]]
         return d, v
     try:
@@ -91,9 +92,12 @@ def main():
             if not ok: failures += 1
             print(f"  {'ok  ' if ok else 'FAIL'} is_inviolable({n!r}) = {got} (expected {expect})")
         print("\nALL PASS" if failures == 0 else f"\n{failures} FAILURES")
-    finally:
-        pass
+        return failures
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(1 if main() else 0)
