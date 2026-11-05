@@ -587,7 +587,7 @@ def test_never_reclaim_is_excluded_from_the_published_victim_total(tmp_path, mon
                   label="ls", current=500 * MB, anon=0, reclaimable=300 * MB),
     ]
     monkeypatch.setattr(rk, "user_root", lambda: tmp_path)
-    monkeypatch.setattr(rk, "scan", lambda root, protected, min_bytes: groups)
+    monkeypatch.setattr(rk, "scan", lambda root, protected, min_bytes, never=None: groups)
     monkeypatch.setattr(rk, "meminfo", lambda: {"MemTotal": 8192 * MB,
                                                 "MemAvailable": 4096 * MB,
                                                 "Cached": 100 * MB})
