@@ -176,8 +176,10 @@ desktop session:
 | `jq`, `grep`, `md5sum` | the notifier only | coreutils / Arch |
 | `omarchy-notification-send` | desktop alerts | Omarchy |
 
-The daemon requires cgroup v2 and a `zram` device. `install.sh` checks both and
-says so plainly instead of failing later.
+The daemon requires cgroup v2. It moves anonymous memory only when a zram
+device still has free space (more than 64 MB). If zram is missing or full,
+that pass does not run, so apps are not pushed onto the disk swapfile.
+`install.sh` warns when `zram0` is absent.
 
 ## Install
 

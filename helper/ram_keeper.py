@@ -377,6 +377,29 @@ def zram_stats() -> dict:
             "ram_used": sum(d["used"] for d in devices if d["ram_backed"])}
 
 
+def zram_has_room(zram: dict | None, margin: int = 64 * 1024 * 1024) -> bool:
+    """True when some RAM-backed swap device can still take anonymous pages.
+
+    Disk swap does not count. A full zram, or no zram at all, must not push
+    app memory onto the slow swapfile.
+    """
+    if not isinstance(zram, dict):
+        return False
+    devices = zram.get("devices") or []
+    if not isinstance(devices, list):
+        return False
+    for dev in devices:
+        if not isinstance(dev, dict) or not dev.get("ram_backed"):
+            continue
+        try:
+            free = int(dev.get("size") or 0) - int(dev.get("used") or 0)
+        except (TypeError, ValueError):
+            continue
+        if free > margin:
+            return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -1253,7 +1276,7 @@ class Steward:
         # giving up 500MB in one go is far cheaper than ten processes each
         # faulting a little back in, and it keeps the reclaimed pages
         # together in zram where the compressor works on a contiguous run.
-        if budget > 0 and not cache_only:
+        if budget > 0 and not cache_only and zram_has_room(snap.get("zram")):
             for group in sorted(candidates, key=lambda g: g.anon, reverse=True):
                 if budget <= 0:
                     break

@@ -55,14 +55,16 @@ def snapshot(groups, state="critical", free_percent=4.0, total=8192 * MB,
     return {"state": state, "memory_reading_valid": True,
             "free_percent": free_percent, "mem_total": total,
             "mem_available": available, "mem_used": total - available,
-            "groups": groups, "forecast": forecast}
+            "groups": groups, "forecast": forecast,
+            "zram": {"devices": [{"name": "/dev/zram0", "ram_backed": True,
+                                  "size": 8192 * MB, "used": 0}]}}
 
 
 class Recorder:
     def __init__(self):
         self.asks = []
 
-    def __call__(self, victim, amount):
+    def __call__(self, victim, amount, cache_only=False):
         self.asks.append((victim.name, amount))
         return rk.Action(label=victim.label, requested=amount, freed=amount,
                          swapped_out=0, outcome="ok")

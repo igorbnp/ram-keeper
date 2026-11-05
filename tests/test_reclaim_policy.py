@@ -49,8 +49,13 @@ def make_group(name, current, anon=0, reclaimable=0, protected=False,
     }
 
 
+def _zram_room():
+    return {"devices": [{"name": "/dev/zram0", "ram_backed": True,
+                         "size": 8192 * MB, "used": 0}]}
+
+
 def make_snapshot(groups, state="critical", free_percent=5.0, total=8192 * MB,
-                  available=400 * MB, forecast=None):
+                  available=400 * MB, forecast=None, zram=None):
     return {
         "state": state,
         "memory_reading_valid": True,
@@ -60,6 +65,7 @@ def make_snapshot(groups, state="critical", free_percent=5.0, total=8192 * MB,
         "mem_used": total - available,
         "groups": groups,
         "forecast": forecast,
+        "zram": _zram_room() if zram is None else zram,
     }
 
 
@@ -68,10 +74,12 @@ class Recorder:
 
     def __init__(self):
         self.asks = []          # (group name, bytes asked)
+        self.cache_only = []
         self.budget_left = []
 
-    def __call__(self, group, amount):
+    def __call__(self, group, amount, cache_only=False):
         self.asks.append((group.name, amount))
+        self.cache_only.append(bool(cache_only))
         return rk.Action(label=group.label, requested=amount,
                          freed=amount, swapped_out=0, outcome="ok")
 
@@ -344,6 +352,32 @@ def test_anon_cooldown_holds_while_an_untouchable_culprit_keeps_pressure():
     steward.relieve(snap, force=True)
     assert asked("app-browser.scope") > after_wait, (
         "the manual button was blocked by the pause")
+
+
+def test_anon_pass_requires_free_zram():
+    steward = steward_with(max_reclaim_per_pass=4096 * MB, max_victim_fraction=60,
+                           anon_reclaim_cooldown=0)
+    recorder = Recorder()
+    steward.reclaim_from = recorder
+    group = make_group("app-disk.scope", current=800 * MB, anon=700 * MB,
+                       reclaimable=100 * MB)
+    full = {"devices": [{"name": "/dev/zram0", "ram_backed": True,
+                         "size": 200 * MB, "used": 200 * MB}]}
+    disk = {"devices": [{"name": "/swap/swapfile", "ram_backed": False,
+                         "size": 8192 * MB, "used": 0}]}
+    steward.relieve(make_snapshot([group], zram=full))
+    assert [amount for _, amount in recorder.asks] == [100 * MB], recorder.asks
+    recorder.asks.clear()
+    steward.relieve(make_snapshot([group], zram=disk))
+    assert [amount for _, amount in recorder.asks] == [100 * MB], recorder.asks
+    recorder.asks.clear()
+    steward.relieve(make_snapshot([group], zram={"devices": []}))
+    assert [amount for _, amount in recorder.asks] == [100 * MB]
+    recorder.asks.clear()
+    steward.relieve(make_snapshot([group]))
+    assert [name for name, _ in recorder.asks] == ["app-disk.scope", "app-disk.scope"]
+    assert recorder.asks[0][1] == 100 * MB
+    assert recorder.asks[1][1] >= 16 * MB
 
 
 def test_scan_honours_protection_by_short_name(tmp_path):

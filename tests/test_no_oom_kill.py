@@ -58,6 +58,8 @@ def build_snapshot(victim_anon_mb, victim_file_mb, state, free_pct):
         "state": state, "free_percent": free_pct,
         "mem_available": int(total * free_pct / 100), "mem_total": total,
         "cached": 0, "forecast": {"urgency": "none"},
+        "zram": {"devices": [{"name": "/dev/zram0", "ram_backed": True,
+                              "size": 8 * 1024 * MB, "used": 0}]},
         "groups": [{
             "name": "victim.scope", "label": "victim", "kind": "scope",
             "current": (victim_anon_mb + victim_file_mb) * MB,
