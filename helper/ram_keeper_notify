@@ -52,8 +52,6 @@ skill_path() {
   done
   echo "$root/skills/ram-memory-diagnosis/SKILL.md"
 }
-SKILL_PATH="$(skill_path)"
-readonly SKILL_PATH
 
 mkdir -p "$FLAG_DIR"
 
@@ -126,8 +124,14 @@ send() {
 #     does. An agent that cannot resolve skills by name should still be able to
 #     read the file.
 agent_action() {
-  local prompt="$1"
-  printf 'omarchy agent prompt %q' "Read and follow the skill at $SKILL_PATH.
+  local prompt="$1" skill lead
+  skill="$(skill_path)"
+  if [[ -n "$skill" && -f "$skill" ]]; then
+    lead="Read and follow the skill at $skill."
+  else
+    lead="Explain the memory situation from the numbers in this prompt."
+  fi
+  printf 'omarchy agent prompt %q' "$lead
 
 $prompt"
 }
@@ -220,8 +224,10 @@ except Exception:
     raise SystemExit(1)
 if not isinstance(d, dict):
     raise SystemExit(1)
-print("%s\t%s" % (d.get("state") or "unknown",
-                  "?" if d.get("free_percent") is None else d["free_percent"]))' 2>/dev/null
+free = d.get("free_percent")
+if isinstance(free, bool) or not isinstance(free, (int, float)):
+    raise SystemExit(1)
+print("%s\t%s" % (d.get("state") or "unknown", free))' 2>/dev/null
 }
 
 watch_pressure() {

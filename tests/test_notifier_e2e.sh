@@ -168,6 +168,16 @@ if kill -0 "$P" 2>/dev/null; then ok "the notifier survived the corrupt file"; e
 unset RAM_KEEPER_DAEMON_POLL RAM_KEEPER_PRESSURE_POLL
 
 echo
+echo "== 4b. a free percentage that is not a number is not a prompt =="
+new_case injected-free
+printf '{"state":"critical","free_percent":"${HOME}"}\n' >"$CASE/.local/state/ram-keeper/state.json"
+export RAM_KEEPER_DAEMON_POLL=1 RAM_KEEPER_PRESSURE_POLL=1
+P="$(launch)"
+sleep 3
+check "a non-numeric free percentage produced no toast" "$(toast_count)" "0"
+unset RAM_KEEPER_DAEMON_POLL RAM_KEEPER_PRESSURE_POLL
+
+echo
 echo "== 5. the daemon stopping is announced =="
 new_case daemon-down
 export RAM_KEEPER_DAEMON_POLL=1 RAM_KEEPER_PRESSURE_POLL=2
