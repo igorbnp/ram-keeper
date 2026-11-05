@@ -420,6 +420,18 @@ def test_release_does_not_erase_the_default_lists(monkeypatch, tmp_path):
     assert cfg_path.read_text(encoding="utf-8") == kept
 
 
+def test_compositor_spellings_cannot_be_released(monkeypatch, tmp_path):
+    import ram_keeper as rk
+    cfg_path = tmp_path / "config.json"
+    monkeypatch.setenv("RAM_KEEPER_CONFIG", str(cfg_path))
+    original = '{"protected": ["spotify"]}\n'
+    for name in ("app-Hyprland-1234.scope", "wayland-wm@Hyprland.service"):
+        cfg_path.write_text(original, encoding="utf-8")
+        monkeypatch.setattr(sys, "argv", ["ram-keeper", "--protected-remove", name])
+        assert rk.main() == 2
+        assert cfg_path.read_text(encoding="utf-8") == original
+
+
 def test_removing_a_default_stays_removed(monkeypatch, tmp_path):
     import ram_keeper as rk
     cfg_path = tmp_path / "config.json"

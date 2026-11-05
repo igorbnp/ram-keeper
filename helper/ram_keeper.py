@@ -492,6 +492,15 @@ INVIOABLE_PROTECTED = frozenset({
 })
 
 
+# uwsm may publish the compositor as app-Hyprland-<pid>.scope or as
+# wayland-wm@Hyprland.service, with any capitalisation. The instance has to
+# be Hyprland itself: hyprland-gtk-launch and wayland-wm@sway stay ordinary.
+_COMPOSITOR_UNIT = re.compile(
+    r"^wayland-wm@hyprland(?:\.desktop)?(?:\.(?:service|scope|slice|socket))?$",
+    re.IGNORECASE,
+)
+
+
 def is_inviolable(name: str) -> bool:
     """True for cgroups no config file may ever hand to a reclaim sweep.
 
@@ -499,10 +508,15 @@ def is_inviolable(name: str) -> bool:
     alone leaves that name unprotected. `session-N.scope` is numbered per
     login, so the session prefix stays as its own check and is not a
     substring search (an app named `minha-session` is not the session).
+    The compositor is recognised by the alias `hyprland` and by the
+    wayland-wm@ template, so a capitalised or unsuffixed unit is still
+    shielded, and a longer name that merely contains those letters is not.
     """
     if not isinstance(name, str) or not name:
         return False
-    if names_match(name, INVIOABLE_PROTECTED):
+    if names_match(name, INVIOABLE_PROTECTED) or names_match(name, ("hyprland",)):
+        return True
+    if _COMPOSITOR_UNIT.match(name.strip()):
         return True
     base = _strip_unit_suffix(name.strip()).casefold()
     return base == "session" or base.startswith("session-")
