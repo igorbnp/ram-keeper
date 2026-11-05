@@ -173,7 +173,7 @@ desktop session:
 | PSI (`/proc/pressure/memory`) | the stall signal | kernel 4.20+ |
 | `systemd` user units | supervision | Omarchy |
 | `zram` | compressed-RAM swap, the reclaim target | `zram-generator` (Arch) |
-| `jq`, `grep`, `md5sum` | the notifier only | coreutils / Arch |
+| `grep`, `md5sum` | the notifier only | coreutils / Arch |
 | `omarchy-notification-send` | desktop alerts | Omarchy |
 
 The daemon requires cgroup v2. It moves anonymous memory only when a zram
@@ -259,13 +259,13 @@ Right-click the bar widget to toggle the percentage on and off.
 systemctl --user status ram-keeper.service
 
 # what does it think is going on?
-python3 ~/.config/omarchy/plugins/ram-keeper/helper/ram_keeper.py --once
+python3 ~/.config/omarchy/plugins/io.github.igorbnp.ram-keeper/helper/ram_keeper.py --once
 
 # what has it done today?
 tail -5 ~/.local/state/ram-keeper/log.jsonl | python3 -m json.tool --json-lines
 
 # force one pass by hand
-python3 ~/.config/omarchy/plugins/ram-keeper/helper/ram_keeper.py --relieve
+python3 ~/.config/omarchy/plugins/io.github.igorbnp.ram-keeper/helper/ram_keeper.py --relieve
 ```
 
 ## Known limitations

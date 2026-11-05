@@ -110,7 +110,7 @@ cannot be removed by any config file.
 To protect something else, add it by the name you see in the panel:
 
 ```bash
-python3 ~/.config/omarchy/plugins/ram-keeper/helper/ram_keeper.py \
+python3 ~/.config/omarchy/plugins/io.github.igorbnp.ram-keeper/helper/ram_keeper.py \
   --protected-add your-app
 ```
 
@@ -163,7 +163,7 @@ zram before it can answer, and that is the one workload where paying RAM is
 worth it:
 
 ```bash
-python3 ~/.config/omarchy/plugins/ram-keeper/helper/ram_keeper.py \
+python3 ~/.config/omarchy/plugins/io.github.igorbnp.ram-keeper/helper/ram_keeper.py \
   --protected-add llama-server.service
 ```
 
@@ -181,7 +181,7 @@ journalctl --user -u ram-keeper -n 40
 **Nothing is ever reclaimed** — check the state and free memory:
 
 ```bash
-python3 ~/.config/omarchy/plugins/ram-keeper/helper/ram_keeper.py --once | \
+python3 ~/.config/omarchy/plugins/io.github.igorbnp.ram-keeper/helper/ram_keeper.py --once | \
   python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["state"], d["free_percent"], "reclaimable:", d["reclaimable_total"]//1048576, "MB")'
 ```
 
