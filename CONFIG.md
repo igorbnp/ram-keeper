@@ -29,6 +29,7 @@ the rest keep their defaults. Delete the file to return to defaults.
 |---|---|---|
 | `interval_idle` | `20.0` | Seconds between passes when healthy. |
 | `interval_pressure` | `5.0` | Seconds between passes under pressure. |
+| `anon_reclaim_cooldown` | `90.0` | Minimum seconds before the same cgroup can lose anonymous memory again. The manual button ignores this pause. Clamped to 0–600. `0` disables it. |
 | `reclaim_sleep` | `0.4` | Seconds to wait after asking a cgroup to give memory back, before measuring what actually came back. Cache reclaim is synchronous; anon→zram can take a moment to be accounted. Clamped to 0–5. |
 
 Reading cgroups is cheap (a few dozen small files), so `interval_idle` can go

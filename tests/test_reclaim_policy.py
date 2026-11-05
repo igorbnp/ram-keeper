@@ -295,6 +295,57 @@ def test_defaults_protect_what_the_docs_name():
         assert not rk.names_match(stranger, protected)
 
 
+class _Clock:
+    def __init__(self):
+        self.now = 0.0
+
+    def __call__(self):
+        return self.now
+
+
+def test_anon_cooldown_holds_while_an_untouchable_culprit_keeps_pressure():
+    """Several passes, free memory stays critical, the hog cannot be touched."""
+    clock = _Clock()
+    steward = steward_with(anon_reclaim_cooldown=90, max_reclaim_per_pass=4096 * MB,
+                           max_victim_fraction=60)
+    steward._clock = clock
+    recorder = Recorder()
+    steward.reclaim_from = recorder
+    hog = make_group("untouchable.scope", current=6800 * MB, anon=6800 * MB,
+                     reclaimable=0, protected=True)
+    browser = make_group("app-browser.scope", current=800 * MB, anon=700 * MB,
+                         reclaimable=0)
+    snap = make_snapshot([hog, browser], state="critical", free_percent=5.0)
+
+    def asked(name):
+        return sum(amount for victim, amount in recorder.asks if victim == name)
+
+    steward.relieve(snap)
+    assert asked("untouchable.scope") == 0
+    assert asked("app-browser.scope") > 0
+    first = asked("app-browser.scope")
+
+    clock.now = 5
+    steward.relieve(snap)
+    assert asked("app-browser.scope") == first, (
+        "a second pass inside the cooldown drained the same app again")
+
+    clock.now = 10
+    steward.relieve(snap)
+    assert asked("app-browser.scope") == first
+
+    clock.now = 90
+    steward.relieve(snap)
+    assert asked("app-browser.scope") > first, (
+        "the pause never expired")
+
+    after_wait = asked("app-browser.scope")
+    clock.now = 95
+    steward.relieve(snap, force=True)
+    assert asked("app-browser.scope") > after_wait, (
+        "the manual button was blocked by the pause")
+
+
 def test_scan_honours_protection_by_short_name(tmp_path):
     root = tmp_path / "user.slice" / "user-1000.slice"
     app = root / "app-Spotify-1043.scope"

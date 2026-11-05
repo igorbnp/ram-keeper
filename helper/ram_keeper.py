@@ -396,6 +396,10 @@ DEFAULT_CONFIG = {
     "interval_idle": 20.0,
     # Seconds between passes while under pressure.
     "interval_pressure": 5.0,
+    # Minimum seconds between anonymous reclaims of the SAME cgroup. Without
+    # this, an untouchable hog keeps free memory under the floor and every
+    # 5 s pass takes another 25% of the same browser until it is empty.
+    "anon_reclaim_cooldown": 90.0,
     # Hard ceiling on how much a single pass may reclaim, so one spike can't
     # turn into a system-wide swap storm.
     "max_reclaim_per_pass": 2 * 1024 * 1024 * 1024,
@@ -508,6 +512,7 @@ CONFIG_BOUNDS = {
     "min_target_bytes": (4 * 1024 * 1024, 4 * 1024 * 1024 * 1024),
     "interval_idle": (1.0, 3600.0),
     "interval_pressure": (0.5, 600.0),
+    "anon_reclaim_cooldown": (0.0, 600.0),
     "max_reclaim_per_pass": (16 * 1024 * 1024, 32 * 1024 * 1024 * 1024),
     "max_victim_fraction": (5, 60),
     "reclaim_sleep": (0.0, 5.0),
@@ -831,6 +836,9 @@ class Steward:
     last_forecast: Forecast = field(default_factory=Forecast)
     # Rotate the reclaim log at 4 MB; two generations are kept.
     max_log_bytes: int = 4 * 1024 * 1024
+    # Injectable so a test can walk several passes without waiting.
+    _clock: object = field(default=time.monotonic, repr=False, compare=False)
+    _anon_ready_at: dict = field(default_factory=dict, repr=False, compare=False)
 
     # -- logging ---------------------------------------------------------
     def log(self, event: dict) -> None:
@@ -1258,10 +1266,21 @@ class Steward:
                 ask = min(budget, group.anon, remaining_slice(group))
                 if ask < 16 * 1024 * 1024:
                     continue
+                if not force:
+                    ready_at = self._anon_ready_at.get(group.name, 0.0)
+                    if self._clock() < ready_at:
+                        continue
                 action = self.reclaim_from(group, ask)
                 actions.append(action)
                 budget -= ask          # kernel-visible bytes: the ceiling is on what we ASK for
                 asked_bytes[group.name] = asked_bytes.get(group.name, 0) + ask
+                if action.outcome not in ("gone", "denied"):
+                    try:
+                        pause = float(self.config.get("anon_reclaim_cooldown", 90.0))
+                    except (TypeError, ValueError):
+                        pause = 90.0
+                    if math.isfinite(pause) and pause > 0:
+                        self._anon_ready_at[group.name] = self._clock() + pause
 
         # Pass 3: cgroups with swap disabled are NOT reclaimed.
         # Asking them for anon is a guaranteed EAGAIN that wastes the pass's budget.
