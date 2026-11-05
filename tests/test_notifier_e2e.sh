@@ -230,6 +230,27 @@ kill -TERM -"$P" 2>/dev/null || true
 unset RAM_KEEPER_DAEMON_POLL RAM_KEEPER_PRESSURE_POLL
 
 echo
+echo "== 4d. critical with only protected apps names them =="
+new_case held
+printf '%s\n' '{"state":"critical","free_percent":5.0,"held_by":["ollama","hermes"],"relief":{"acted":false}}' \
+  >"$CASE/.local/state/ram-keeper/state.json"
+export RAM_KEEPER_DAEMON_POLL=1 RAM_KEEPER_PRESSURE_POLL=1
+P="$(launch)"
+sleep 3
+if grep -q 'ollama' "$STUB/toasts" && grep -q 'hermes' "$STUB/toasts"; then
+  ok "the toast names the protected apps holding memory"
+else
+  bad "the toast did not name the protected apps"
+fi
+if grep -q 'reclaiming now' "$STUB/toasts"; then
+  bad "the toast claimed a reclaim when no victim was reachable"
+else
+  ok "the toast did not claim a reclaim"
+fi
+kill -TERM -"$P" 2>/dev/null || true
+unset RAM_KEEPER_DAEMON_POLL RAM_KEEPER_PRESSURE_POLL
+
+echo
 echo "== 6. a clean stop removes its pidfile =="
 new_case cleanup
 P="$(launch)"

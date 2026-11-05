@@ -1032,6 +1032,26 @@ class Steward:
         if state in ("ok", "stalling") and self.last_forecast.urgency == "imminent":
             state = "trending"
 
+        # A critical machine whose only large cgroups are protected has
+        # nothing the pass can ask. Name those apps so the panel does not
+        # say that nothing is needed.
+        reachable_floor = 64 * 1024 * 1024
+        reachable = [
+            g for g in groups
+            if not g.protected and (g.reclaimable + g.anon) > reachable_floor
+        ]
+        held_by: list[str] = []
+        if state == "critical" and not reachable:
+            seen: list[str] = []
+            big = [g for g in groups
+                   if g.protected and g.current >= int(self.config["min_target_bytes"])]
+            big.sort(key=lambda g: g.current, reverse=True)
+            for holder in big:
+                label = (holder.label or holder.name or "").strip()
+                if label and label not in seen:
+                    seen.append(label)
+            held_by = seen[:8]
+
         # MemAvailable already excludes reclaimable cache, so the honest split of
         # "used" is: real anon+kernel, cache, then free-and-available. `Cached`
         # from meminfo includes pages held by processes' file mappings, and on a
@@ -1072,6 +1092,7 @@ class Steward:
             "checked_at": time.time(),
             "version": self.started_version,
             "psi_stalling": psi_stalling,
+            "held_by": held_by,
         }
 
     # -- reclamation -----------------------------------------------------

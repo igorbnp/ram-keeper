@@ -597,6 +597,38 @@ def test_anon_pass_requires_free_zram():
     assert recorder.asks[1][1] >= 16 * MB
 
 
+def test_critical_without_a_reachable_victim_names_the_protected_apps(monkeypatch):
+    steward = steward_with()
+    total = 8192 * MB
+    monkeypatch.setattr(rk, "meminfo", lambda: {
+        "MemTotal": total, "MemAvailable": int(total * 0.05), "Cached": 100 * MB})
+    monkeypatch.setattr(rk, "psi", lambda resource="memory": {
+        "available": True, "some_avg60": 0.0})
+    monkeypatch.setattr(rk, "zram_stats", lambda: {"devices": []})
+    monkeypatch.setattr(rk, "user_root", lambda: Path("/no-such-cgroup"))
+    holders = [
+        rk.Cgroup(path=Path("/no/ollama.service"), name="ollama.service",
+                  kind="service", label="ollama", current=6 * 1024 * MB,
+                  anon=6 * 1024 * MB, protected=True),
+        rk.Cgroup(path=Path("/no/hermes.service"), name="hermes.service",
+                  kind="service", label="hermes", current=1024 * MB,
+                  anon=1024 * MB, protected=True),
+        rk.Cgroup(path=Path("/no/app-small.scope"), name="app-small.scope",
+                  kind="scope", label="small", current=20 * MB, anon=20 * MB,
+                  protected=False),
+    ]
+    monkeypatch.setattr(rk, "scan", lambda *args, **kwargs: holders)
+    snap = steward.snapshot()
+    assert snap["state"] == "critical"
+    assert snap["held_by"] == ["ollama", "hermes"]
+
+    browser = rk.Cgroup(path=Path("/no/app-browser.scope"), name="app-browser.scope",
+                        kind="scope", label="browser", current=900 * MB,
+                        anon=900 * MB, protected=False)
+    monkeypatch.setattr(rk, "scan", lambda *args, **kwargs: holders + [browser])
+    assert steward.snapshot()["held_by"] == []
+
+
 def test_critical_without_zram_room_does_not_push_to_disk_swap():
     shapes = [
         {"devices": [{"name": "/dev/zram0", "ram_backed": True,

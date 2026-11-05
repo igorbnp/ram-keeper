@@ -345,6 +345,10 @@ function summaryLine(result) {
 
 function watchLine(snapshot, daemonUp) {
   if (!daemonUp) return "Automatic protection is paused";
+  var held = snapshot && Array.isArray(snapshot.held_by) ? snapshot.held_by : [];
+  if (held.length) {
+    return "Memory is critically low. Protected apps are holding it: " + held.join(", ");
+  }
   var relief = snapshot && snapshot.relief;
   if (relief && relief.skipped_anon === "no-zram-room") {
     if (relief.acted) return "Dropped cache. App memory was not moved to disk swap.";

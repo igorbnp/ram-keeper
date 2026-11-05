@@ -154,6 +154,14 @@ check("a blocked swap is not called reclaiming",
   && M.watchLine(blocked, true).indexOf("reclaiming now") < 0);
 check("a manual result does not call a blocked swap comfortable",
   M.summaryLine({ acted: false, skipped_anon: "no-zram-room" }).indexOf("disk swap") >= 0);
+const heldLine = M.watchLine({
+  state: "critical",
+  held_by: ["ollama", "hermes"],
+  groups: []
+}, true);
+check("critical without a victim names the protected apps",
+  heldLine.indexOf("ollama") >= 0 && heldLine.indexOf("hermes") >= 0
+  && heldLine.indexOf("nothing needed") < 0);
 const quickshellVictim = snap.groups.filter(g => !g.protected && /quickshell/i.test(g.name));
 check("protected excludes quickshell from victims", quickshellVictim.length === 0,
   quickshellVictim.map(g => g.name).join(", "));
