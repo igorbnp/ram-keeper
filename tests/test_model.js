@@ -77,6 +77,8 @@ console.log("\n== memory segments ==");
 const segs = M.memorySegments(snap);
 check("has segments", segs.length > 0);
 check("apps present", segs.some(s => s.key === "apps"));
+check("apps use the apps colour", segs.find(s => s.key === "apps").tone === "apps",
+      segs.find(s => s.key === "apps").tone);
 check("free present", segs.some(s => s.key === "free"));
 check("cache present when cache is non-zero",
       !snap["cached"] || segs.some(s => s.key === "cache"));
@@ -86,6 +88,9 @@ check("segments sum to MemTotal",
   Math.abs(totalSeg - snap.mem_total) < 4 * 1048576,
   `${totalSeg} vs ${snap.mem_total}`);
 const pcts = M.memoryPercentages(snap);
+check("percentage bar uses the apps colour",
+      pcts.find(s => s.key === "apps").tone === "apps",
+      pcts.find(s => s.key === "apps").tone);
 const sumPct = pcts.reduce((a, s) => a + s.fraction, 0);
 check("percentages sum to ~1", Math.abs(sumPct - 1) < 0.02, String(sumPct));
 check("empty snapshot is safe", M.memorySegments({}).length === 0);

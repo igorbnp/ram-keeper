@@ -57,7 +57,7 @@ function memorySegments(snapshot) {
   var parts = memoryParts(snapshot);
   if (!parts) return [];
   return [
-    { key: "apps", label: "Apps", bytes: parts.apps, tone: "primary" },
+    { key: "apps", label: "Apps", bytes: parts.apps, tone: "apps" },
     { key: "cache", label: "Cache", bytes: parts.cache, tone: "cache" },
     { key: "free", label: "Free", bytes: parts.free, tone: "free" }
   ].filter(function (s) { return s.bytes > 0; });
@@ -67,7 +67,7 @@ function memoryPercentages(snapshot) {
   var parts = memoryParts(snapshot);
   if (!parts) return [];
   return [
-    { key: "apps", label: "Apps", fraction: parts.apps / parts.total, tone: "primary" },
+    { key: "apps", label: "Apps", fraction: parts.apps / parts.total, tone: "apps" },
     { key: "cache", label: "Cache", fraction: parts.cache / parts.total, tone: "cache" },
     { key: "free", label: "Free", fraction: parts.free / parts.total, tone: "free" }
   ].filter(function (s) { return s.fraction > 0.001; });
