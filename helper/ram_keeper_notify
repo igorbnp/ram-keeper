@@ -44,17 +44,14 @@ PYTHON3="${RAM_KEEPER_PYTHON:-/usr/bin/python3}"
 # switch or a skill reinstall must not leave the notifier pointing at a stale
 # path.
 skill_path() {
-  local found
-  for root in "${HERMES_HOME:-$HOME/.hermes}"; do
-    for candidate in "$root/skills/ram-memory-diagnosis/SKILL.md" \
-                     "$root/profiles/"*/skills/ram-memory-diagnosis/SKILL.md; do
-      [[ -f "$candidate" ]] && { echo "$candidate"; return 0; }
-    done
-    found="$root/skills/ram-memory-diagnosis/SKILL.md"
+  local root candidate
+  root="${HERMES_HOME:-$HOME/.hermes}"
+  for candidate in "$root/skills/ram-memory-diagnosis/SKILL.md" \
+                   "$root/profiles/"*/skills/ram-memory-diagnosis/SKILL.md; do
+    [[ -f "$candidate" ]] && { echo "$candidate"; return 0; }
   done
-  echo "$found"
+  echo "$root/skills/ram-memory-diagnosis/SKILL.md"
 }
-readonly SKILL_PATH="$(skill_path)"
 
 mkdir -p "$FLAG_DIR"
 
@@ -127,8 +124,14 @@ send() {
 #     does. An agent that cannot resolve skills by name should still be able to
 #     read the file.
 agent_action() {
-  local prompt="$1"
-  printf 'omarchy agent prompt %q' "Read and follow the skill at $SKILL_PATH.
+  local prompt="$1" skill lead
+  skill="$(skill_path)"
+  if [[ -n "$skill" && -f "$skill" ]]; then
+    lead="Read and follow the skill at $skill."
+  else
+    lead="Explain the memory situation from the numbers in this prompt."
+  fi
+  printf 'omarchy agent prompt %q' "$lead
 
 $prompt"
 }
@@ -145,6 +148,9 @@ watch_daemon() {
   while true; do
     if systemctl --user is-active --quiet "$UNIT"; then
       was_alive=1
+    elif [[ -f "$STATE_DIR/paused-by-user" ]]; then
+      # The panel wrote this before it stopped the unit. A pause is not a crash.
+      was_alive=0
     elif [[ "$was_alive" == "1" ]]; then
       # Only speak if it was alive and has now stopped. A unit disabled at
       # login is a choice, not a failure, and must not nag.
@@ -218,8 +224,22 @@ except Exception:
     raise SystemExit(1)
 if not isinstance(d, dict):
     raise SystemExit(1)
-print("%s\t%s" % (d.get("state") or "unknown",
-                  "?" if d.get("free_percent") is None else d["free_percent"]))' 2>/dev/null
+free = d.get("free_percent")
+if isinstance(free, bool) or not isinstance(free, (int, float)):
+    raise SystemExit(1)
+relief = d.get("relief") if isinstance(d.get("relief"), dict) else {}
+acted = relief.get("acted")
+acted_s = "yes" if acted is True else "no" if acted is False else ""
+skipped = relief.get("skipped_anon") if isinstance(relief.get("skipped_anon"), str) else ""
+raw_held = d.get("held_by") if isinstance(d.get("held_by"), list) else []
+names = []
+for item in raw_held:
+    if not isinstance(item, str):
+        continue
+    clean = "".join(ch for ch in item if ch.isprintable() and ch not in "\t\r\n").strip()
+    if clean:
+        names.append(clean[:80])
+print("%s\t%s\t%s\t%s\t%s" % (d.get("state") or "unknown", free, acted_s, skipped, ", ".join(names[:8])))' 2>/dev/null
 }
 
 watch_pressure() {
@@ -227,7 +247,7 @@ watch_pressure() {
   while true; do
     [[ -f "$STATE_DIR/state.json" ]] || { sleep "$PRESSURE_POLL"; continue; }
 
-    local snapshot state free fields
+    local snapshot state free fields rest acted skipped held body
     snapshot="$(cat "$STATE_DIR/state.json" 2>/dev/null)"
     if ! fields="$(snapshot_fields "$snapshot")" || [[ -z "$fields" ]]; then
       # A partial write or a corrupt file is not "critical". Say nothing.
@@ -235,7 +255,27 @@ watch_pressure() {
       continue
     fi
     state="${fields%%$'\t'*}"
-    free="${fields#*$'\t'}"
+    rest="${fields#*$'\t'}"
+    free="${rest%%$'\t'*}"
+    rest="${rest#*$'\t'}"
+    acted="${rest%%$'\t'*}"
+    rest="${rest#*$'\t'}"
+    skipped="${rest%%$'\t'*}"
+    held="${rest#*$'\t'}"
+    # No further field: the strip leaves the previous value in place.
+    if [[ "$held" == "$skipped" ]]; then
+      held=""
+    fi
+    if [[ "$skipped" == "$acted" ]]; then
+      skipped=""
+    fi
+    # A snapshot with only state and free leaves acted equal to free. Treat
+    # that as "the pass did not say it acted".
+    if [[ "$acted" == "$free" ]]; then
+      acted=""
+      skipped=""
+      held=""
+    fi
 
     # Only on the transition INTO critical, not every poll while critical. A
     # single dip is normal and self-correcting; the daemon handles it silently,
@@ -243,9 +283,18 @@ watch_pressure() {
     if [[ "$state" == "critical" && "$last_state" != "critical" ]] \
        && should_announce pressure-critical; then
       log_event "pressure-critical"
+      if [[ -n "$held" ]]; then
+        body="Only ${free}% free. Protected apps are holding the memory: ${held}."
+      elif [[ "$acted" == "yes" ]]; then
+        body="Only ${free}% free. RAM Keeper is reclaiming now. Click if the machine feels slow."
+      elif [[ "$skipped" == "no-zram-room" ]]; then
+        body="Only ${free}% free. App memory was not moved to disk swap."
+      else
+        body="Only ${free}% free. Click if the machine feels slow."
+      fi
       send critical "$ALERT_GLYPH" \
         "Memory is critically low" \
-        "Only ${free}% free. RAM Keeper is reclaiming now. Click if the machine feels slow." \
+        "$body" \
         "$(agent_action "RAM Keeper reported critical memory pressure: only ${free}% of RAM free. Use the ram-memory-diagnosis skill to explain what is using the memory and whether anything needs to change.")"
     fi
     last_state="$state"

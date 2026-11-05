@@ -1,8 +1,13 @@
 """Critical memory accounting regressions; standard-library unittest only."""
+import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+
+os.environ.setdefault("RAM_KEEPER_CONFIG", str(Path(tempfile.mkdtemp(prefix="rk-config-")) / "config.json"))
+os.environ.setdefault("RAM_KEEPER_STATE_DIR", tempfile.mkdtemp(prefix="rk-state-"))
 
 PLUGIN = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PLUGIN / "helper"))
@@ -63,7 +68,7 @@ class CriticalMemoryTests(unittest.TestCase):
             "swap": 0, "swapable": True, "pids": 1, "protected": False,
         }
         calls = []
-        def fake_reclaim(group, amount):
+        def fake_reclaim(group, amount, cache_only=False):
             calls.append(amount)
             return rk.Action(group.label, amount, 0, 0, "ok", 0)
         steward.reclaim_from = fake_reclaim
@@ -117,7 +122,7 @@ class CriticalMemoryTests(unittest.TestCase):
         peer = rk.Cgroup(path=Path("/nonexistent-peer"), name="peer.scope", kind="scope",
                          label="peer", current=300 * MB, anon=300 * MB)
         calls = []
-        def fake_reclaim(candidate, amount):
+        def fake_reclaim(candidate, amount, cache_only=False):
             calls.append(amount)
             return rk.Action(candidate.label, amount, amount, 0, "ok", amount)
         steward.reclaim_from = fake_reclaim
@@ -125,6 +130,8 @@ class CriticalMemoryTests(unittest.TestCase):
         snapshot = {
             "state": "critical", "free_percent": 1.0, "mem_total": 8 * GB,
             "mem_available": 80 * MB, "forecast": {},
+            "zram": {"devices": [{"name": "/dev/zram0", "ram_backed": True,
+                                  "size": 8 * GB, "used": 0}]},
             "groups": [
                 {k: v for k, v in rk.asdict(item).items() if k != "path"}
                 | {"path": str(item.path)} for item in (group, peer)

@@ -215,5 +215,58 @@ for path in sorted(QML_DIR.glob("*.qml")):
     else:
         print("  ok   %s" % path.name)
 
+model = (QML_DIR / "Model.js").read_text(encoding="utf-8")
+critical = re.search(r'case "critical": return "([^"]*)"', model)
+unknown = re.search(r'case "unknown": return "([^"]*)"', model)
+if not critical or not unknown or critical.group(1) == unknown.group(1):
+    fails += 1
+    print("  FAIL Model.js unknown glyph matches critical")
+else:
+    print("  ok   Model.js unknown glyph differs from critical")
+
+service = (QML_DIR / "Service.qml").read_text(encoding="utf-8")
+panel = (QML_DIR / "Panel.qml").read_text(encoding="utf-8")
+apply = service.split("function applySnapshot", 1)[1].split("function relieve", 1)[0]
+if 'lastError = ""' in apply:
+    fails += 1
+    print("  FAIL a snapshot poll clears the action error")
+else:
+    print("  ok   a snapshot poll keeps the action error")
+if 'activeAction === "relieve"' not in panel or 'activeAction === "sweep"' not in panel:
+    fails += 1
+    print("  FAIL both action buttons share one Working label")
+else:
+    print("  ok   each action button has its own Working label")
+if re.search(r"root\.manifest\b", service) or "manifest.json" not in service:
+    fails += 1
+    print("  FAIL the panel still depends on an injected manifest")
+else:
+    print("  ok   the panel reads manifest.json itself")
+if "paused-by-user" not in service or "pauseKnown" not in service:
+    fails += 1
+    print("  FAIL the pause is not remembered across a shell restart")
+else:
+    print("  ok   the pause is remembered across a shell restart")
+if 'modelData.action === "protect"' not in panel or 'modelData.action === "release"' not in panel:
+    fails += 1
+    print("  FAIL a row is missing its protect or release button")
+else:
+    print("  ok   each row has its own protect or release button")
+if "Model.watchLine" not in panel:
+    fails += 1
+    print("  FAIL the footer does not use the snapshot's own sentence")
+else:
+    print("  ok   the footer uses the snapshot's own sentence")
+if "function protect(" not in service:
+    fails += 1
+    print("  FAIL the panel cannot ask to protect an app")
+else:
+    print("  ok   the panel can ask to protect an app")
+if "root.daemonUp ? root.foreground : root.urgentColor" not in panel:
+    fails += 1
+    print("  FAIL the off button keeps the on colour at rest")
+else:
+    print("  ok   the off button uses the warning colour at rest")
+
 print("\n" + ("QML structure ok" if fails == 0 else "%d file(s) suspect" % fails))
 assert fails == 0, f"Test failed: {fails} failures"

@@ -173,11 +173,13 @@ desktop session:
 | PSI (`/proc/pressure/memory`) | the stall signal | kernel 4.20+ |
 | `systemd` user units | supervision | Omarchy |
 | `zram` | compressed-RAM swap, the reclaim target | `zram-generator` (Arch) |
-| `jq`, `grep`, `md5sum` | the notifier only | coreutils / Arch |
+| `grep`, `md5sum` | the notifier only | coreutils / Arch |
 | `omarchy-notification-send` | desktop alerts | Omarchy |
 
-The daemon requires cgroup v2 and a `zram` device. `install.sh` checks both and
-says so plainly instead of failing later.
+The daemon requires cgroup v2. It moves anonymous memory only when a zram
+device still has free space (more than 64 MB). If zram is missing or full,
+that pass does not run, so apps are not pushed onto the disk swapfile.
+`install.sh` warns when `zram0` is absent.
 
 ## Install
 
@@ -243,8 +245,10 @@ Click the bar widget (or `omarchy-shell shell toggle ram-keeper`). It shows:
 - **Available to reclaim** — the processes the daemon would take from, largest
   first, with their sizes.
 - **Never reclaimed** — what's protected and why it's still listed: Hyprland,
-  the Hermes gateway, SIA, Syncthing. Transparency about what it's choosing not
-  to touch.
+  the shell, PipeWire, Syncthing, Ollama, the Hermes gateway, SIA, and the
+  daemon. A name protects that unit only: `syncthing` does not cover
+  `syncthing-server`, and `hermes` does not cover `hermes-gateway` (that one
+  is listed on its own). Transparency about what it's choosing not to touch.
 
 Right-click the bar widget to toggle the percentage on and off.
 
@@ -255,13 +259,13 @@ Right-click the bar widget to toggle the percentage on and off.
 systemctl --user status ram-keeper.service
 
 # what does it think is going on?
-python3 ~/.config/omarchy/plugins/ram-keeper/helper/ram_keeper.py --once
+python3 ~/.config/omarchy/plugins/io.github.igorbnp.ram-keeper/helper/ram_keeper.py --once
 
 # what has it done today?
 tail -5 ~/.local/state/ram-keeper/log.jsonl | python3 -m json.tool --json-lines
 
 # force one pass by hand
-python3 ~/.config/omarchy/plugins/ram-keeper/helper/ram_keeper.py --relieve
+python3 ~/.config/omarchy/plugins/io.github.igorbnp.ram-keeper/helper/ram_keeper.py --relieve
 ```
 
 ## Known limitations
@@ -309,7 +313,9 @@ one that names them.
 - **"Drop cache" drops cache.** It once ran the anonymous passes too, so
   clicking it on a healthy desktop swapped out Chromium and the Hyprland
   launcher: 658 MB into zram for no memory benefit, under a button labelled
-  "Drop cache". It is now cache-only.
+  "Drop cache". It is now cache-only, and the cache write asks the kernel for
+  `swappiness=0`. If that kernel rejects the token, the same write is retried
+  as a plain byte count.
 - **The first version of this plugin killed a browser, and only sustained load
   revealed it.** The anon pass asked a cgroup for as much as all of its
   anonymous memory; under continuous load that became a 1.5 GB request against a

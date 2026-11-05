@@ -348,3 +348,152 @@ class TestBug10_EffectiveNegative:
             )
             assert action.freed >= 0, \
                 f"effective não deveria ser negativo, obtido {action.freed}"
+
+
+def test_release_and_ci_share_one_suite_list():
+    root = Path(__file__).resolve().parent.parent
+    release = (root / ".github/workflows/release.yml").read_text(encoding="utf-8")
+    workflow = (root / ".github/workflows/test.yml").read_text(encoding="utf-8")
+    suite = (root / "tests/ci-suite.sh").read_text(encoding="utf-8")
+    assert "tests/ci-suite.sh" in release
+    assert "tests/ci-suite.sh" in workflow
+    for command in (
+        "node tests/test_model.js",
+        "node tests/test_unknown_ui.js",
+        "bash tests/test_notifier_e2e.sh",
+        "python3 tests/test_forecast.py",
+        "python3 tests/test_no_oom_kill.py",
+        "python3 tests/test_qml_structure.py",
+        "python3 tests/test_pass_budget.py",
+        "python3 tests/test_critical_metrics.py",
+        "shellcheck install.sh",
+    ):
+        assert command in suite
+        assert command not in release
+        assert command not in workflow
+
+
+def test_manual_action_publishes_a_fresh_snapshot(monkeypatch):
+    published = []
+
+    class Fake:
+        def relieve(self, force=True):
+            return {"acted": False, "actions": []}
+
+        def sweep_cache(self):
+            return {"acted": False, "actions": []}
+
+        def snapshot(self):
+            return {"mem_total": 1, "state": "ok"}
+
+        def publish(self, snap):
+            published.append(snap)
+
+    monkeypatch.setattr("ram_keeper.Steward", lambda: Fake())
+    import ram_keeper as rk
+    monkeypatch.setattr(sys, "argv", ["ram-keeper", "--relieve"])
+    assert rk.main() == 0
+    monkeypatch.setattr(sys, "argv", ["ram-keeper", "--sweep-cache"])
+    assert rk.main() == 0
+    assert [snap["state"] for snap in published] == ["ok", "ok"]
+
+
+def test_daemon_keeps_the_version_it_started_with(tmp_path, monkeypatch):
+    """A manifest edited after startup must not masquerade as the running code."""
+    import ram_keeper as rk
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps({"version": "1.2.0"}), encoding="utf-8")
+    monkeypatch.setattr(rk, "manifest_path", lambda: manifest)
+    steward = rk.Steward(config=rk.load_config())
+    assert steward.snapshot()["version"] == "1.2.0"
+    manifest.write_text(json.dumps({"version": "1.3.0"}), encoding="utf-8")
+    assert rk.plugin_version() == "1.3.0"
+    assert steward.snapshot()["version"] == "1.2.0"
+
+
+def test_release_does_not_erase_the_default_lists(monkeypatch, tmp_path):
+    """Scenarios A and B: an empty list on disk means 'drop the defaults'."""
+    import ram_keeper as rk
+    cfg_path = tmp_path / "config.json"
+    monkeypatch.setenv("RAM_KEEPER_CONFIG", str(cfg_path))
+
+    cfg_path.write_text(json.dumps({"never_reclaim": ["spotify"]}) + "\n", encoding="utf-8")
+    monkeypatch.setattr(sys, "argv", ["ram-keeper", "--protected-remove", "spotify"])
+    assert rk.main() == 0
+    stored = json.loads(cfg_path.read_text(encoding="utf-8"))
+    assert "never_reclaim" not in stored
+    assert any(rk.names_match(name, ["spotify"]) for name in stored["unprotect"])
+    loaded = rk.load_config()
+    assert any(rk.names_match(name, ["localsearch-3.service"]) for name in loaded["never_reclaim"])
+    assert not any(rk.names_match(name, ["spotify"]) for name in loaded["never_reclaim"])
+
+    cfg_path.write_text(json.dumps({"protected": ["spotify"]}) + "\n", encoding="utf-8")
+    assert rk.main() == 0
+    stored = json.loads(cfg_path.read_text(encoding="utf-8"))
+    assert "protected" not in stored
+    loaded = rk.load_config()
+    assert any(rk.names_match(name, ["ollama.service"]) for name in loaded["protected"])
+    assert any(rk.names_match(name, ["pipewire.service"]) for name in loaded["protected"])
+    assert not any(rk.names_match(name, ["spotify"]) for name in loaded["protected"])
+
+    kept = json.dumps({"protected": ["spotify"]}) + "\n"
+    cfg_path.write_text(kept, encoding="utf-8")
+    monkeypatch.setattr(sys, "argv", ["ram-keeper", "--protected-remove", "Session-2.scope"])
+    assert rk.main() == 2
+    assert cfg_path.read_text(encoding="utf-8") == kept
+
+
+def test_compositor_spellings_cannot_be_released(monkeypatch, tmp_path):
+    import ram_keeper as rk
+    cfg_path = tmp_path / "config.json"
+    monkeypatch.setenv("RAM_KEEPER_CONFIG", str(cfg_path))
+    original = '{"protected": ["spotify"]}\n'
+    for name in ("app-Hyprland-1234.scope", "wayland-wm@Hyprland.service"):
+        cfg_path.write_text(original, encoding="utf-8")
+        monkeypatch.setattr(sys, "argv", ["ram-keeper", "--protected-remove", name])
+        assert rk.main() == 2
+        assert cfg_path.read_text(encoding="utf-8") == original
+
+
+def test_removing_a_default_stays_removed(monkeypatch, tmp_path):
+    import ram_keeper as rk
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text("{}\n", encoding="utf-8")
+    monkeypatch.setenv("RAM_KEEPER_CONFIG", str(cfg_path))
+    monkeypatch.setattr(sys, "argv", ["ram-keeper", "--protected-remove", "ollama"])
+    assert rk.main() == 0
+    loaded = rk.load_config()
+    assert not any(rk.names_match(name, ["ollama"]) for name in loaded["protected"])
+    assert any(rk.names_match(name, ["pipewire"]) for name in loaded["protected"])
+    monkeypatch.setattr(sys, "argv", ["ram-keeper", "--protected-remove", "quickshell"])
+    assert rk.main() == 2
+
+
+def test_scan_marks_never_reclaim_as_protected(tmp_path):
+    import ram_keeper as rk
+    leaf = tmp_path / "localsearch-3.service"
+    leaf.mkdir()
+    (leaf / "memory.current").write_text("200000000")
+    (leaf / "memory.stat").write_text("anon 1\nfile 1\ninactive_file 1\n")
+    (leaf / "pids.current").write_text("1")
+    found = rk.scan(tmp_path, set(), 1, {"localsearch-3.service"})
+    assert found and found[0].protected is True
+
+
+def test_sleep_returns_when_the_config_changes(monkeypatch, tmp_path):
+    import os
+    import ram_keeper as rk
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text("{}\n", encoding="utf-8")
+    monkeypatch.setenv("RAM_KEEPER_CONFIG", str(cfg_path))
+    slept = []
+
+    def fake_sleep(seconds):
+        slept.append(seconds)
+        cfg_path.write_text('{"unprotect": ["ollama"]}\n', encoding="utf-8")
+        os.utime(cfg_path, None)
+
+    monkeypatch.setattr(rk.time, "sleep", fake_sleep)
+    steward = rk.Steward(config=rk.load_config())
+    steward._sleep(30)
+    assert slept and sum(slept) < 30

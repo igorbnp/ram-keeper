@@ -49,8 +49,13 @@ def make_group(name, current, anon=0, reclaimable=0, protected=False,
     }
 
 
+def _zram_room():
+    return {"devices": [{"name": "/dev/zram0", "ram_backed": True,
+                         "size": 8192 * MB, "used": 0}]}
+
+
 def make_snapshot(groups, state="critical", free_percent=5.0, total=8192 * MB,
-                  available=400 * MB, forecast=None):
+                  available=400 * MB, forecast=None, zram=None):
     return {
         "state": state,
         "memory_reading_valid": True,
@@ -60,6 +65,7 @@ def make_snapshot(groups, state="critical", free_percent=5.0, total=8192 * MB,
         "mem_used": total - available,
         "groups": groups,
         "forecast": forecast,
+        "zram": _zram_room() if zram is None else zram,
     }
 
 
@@ -68,10 +74,12 @@ class Recorder:
 
     def __init__(self):
         self.asks = []          # (group name, bytes asked)
+        self.cache_only = []
         self.budget_left = []
 
-    def __call__(self, group, amount):
+    def __call__(self, group, amount, cache_only=False):
         self.asks.append((group.name, amount))
+        self.cache_only.append(bool(cache_only))
         return rk.Action(label=group.label, requested=amount,
                          freed=amount, swapped_out=0, outcome="ok")
 
@@ -186,6 +194,177 @@ def test_vanished_cgroup_reports_zero_freed(tmp_path):
         f"a vanished cgroup was reported as {action.outcome!r}")
 
 
+def test_cache_sweep_ignores_unreachable_anon_and_runs_without_cache_first():
+    group = make_group("app-noswap.scope", current=4100 * MB, anon=4000 * MB,
+                       reclaimable=100 * MB, swapable=False)
+    steward = steward_with(cache_first=False, max_reclaim_per_pass=4096 * MB,
+                           max_victim_fraction=100, anon_reclaim_cooldown=0)
+    recorder = Recorder()
+    steward.reclaim_from = recorder
+    snap = make_snapshot([group], state="critical", free_percent=5.0)
+    steward.relieve(snap, force=True, cache_only=True)
+    assert recorder.asks, "Drop cache did nothing when cache_first is off"
+    assert recorder.cache_only == [True]
+    assert recorder.asks[0][1] == 64 * MB
+
+
+def test_trending_inside_the_margin_does_not_ask_for_the_floor():
+    steward = steward_with(max_reclaim_per_pass=4096 * MB)
+    recorder = Recorder()
+    steward.reclaim_from = recorder
+    total = 8192 * MB
+    floor = int(total * 18 / 100)
+    group = make_group("app-near.scope", current=800 * MB, anon=700 * MB,
+                       reclaimable=100 * MB)
+    close = make_snapshot(
+        [group], state="trending", free_percent=18.9, total=total,
+        available=floor + 76 * MB,
+        forecast={"urgency": "imminent", "horizon_seconds": 40})
+    result = steward.relieve(close)
+    assert recorder.asks == []
+    assert result["reason"] == "trending within floor margin"
+    assert result["acted"] is False
+
+    recorder.asks.clear()
+    wide = make_snapshot(
+        [group], state="trending", free_percent=22.0, total=total,
+        available=floor + 300 * MB,
+        forecast={"urgency": "imminent", "horizon_seconds": 40})
+    steward.relieve(wide)
+    asked = sum(amount for _, amount in recorder.asks)
+    assert asked > 0
+    assert asked < 512 * MB
+
+
+def test_stalling_drops_cache_and_leaves_anonymous_memory():
+    steward = steward_with(anon_reclaim_cooldown=0, max_reclaim_per_pass=4096 * MB,
+                           max_victim_fraction=60)
+    recorder = Recorder()
+    steward.reclaim_from = recorder
+    group = make_group("app-stall.scope", current=800 * MB, anon=700 * MB,
+                       reclaimable=100 * MB)
+    result = steward.relieve(make_snapshot([group], state="stalling", free_percent=20.0))
+    assert recorder.asks
+    assert recorder.cache_only == [True]
+    assert result["actions"]
+
+
+def test_stall_with_an_imminent_forecast_and_a_small_gap_drops_cache(monkeypatch):
+    """A stall promoted to trending must still try cache when the gap is small."""
+    steward = steward_with()
+    total = 8192 * MB
+    available = int(total * 18.9 / 100)
+    monkeypatch.setattr(rk, "meminfo", lambda: {
+        "MemTotal": total, "MemAvailable": available, "Cached": 400 * MB})
+    monkeypatch.setattr(rk, "psi", lambda resource="memory": {
+        "available": True, "some_avg60": 8.0})
+    monkeypatch.setattr(rk, "zram_stats", lambda: {"devices": []})
+    monkeypatch.setattr(rk, "user_root", lambda: Path("/no-such-cgroup"))
+    group = rk.Cgroup(
+        path=Path("/no-such-cgroup/app-stall.scope"),
+        name="app-stall.scope", kind="scope", label="stall",
+        current=800 * MB, anon=700 * MB, reclaimable=100 * MB, file=100 * MB,
+        reclaimable_file=100 * MB)
+    monkeypatch.setattr(rk, "scan", lambda *args, **kwargs: [group])
+
+    class _Imminent:
+        urgency = "imminent"
+
+        def as_dict(self):
+            return {"urgency": "imminent", "horizon_seconds": 40}
+
+    monkeypatch.setattr(steward.tracker, "forecast", lambda target: _Imminent())
+    recorder = Recorder()
+    steward.reclaim_from = recorder
+    snap = steward.snapshot()
+    assert snap["state"] == "trending"
+    result = steward.relieve(snap)
+    assert recorder.asks, "a stall with a small remainder made no attempt"
+    assert recorder.cache_only == [True]
+    assert result["acted"] is True
+
+
+def test_stalling_with_imminent_forecast_becomes_trending(monkeypatch):
+    steward = steward_with()
+    total = 8000 * MB
+    monkeypatch.setattr(rk, "meminfo", lambda: {
+        "MemTotal": total, "MemAvailable": 2000 * MB, "Cached": 100 * MB})
+    monkeypatch.setattr(rk, "psi", lambda resource="memory": {
+        "available": True, "some_avg60": 8.0})
+    monkeypatch.setattr(rk, "zram_stats", lambda: {"devices": []})
+    monkeypatch.setattr(rk, "user_root", lambda: Path("/no-such-cgroup"))
+    monkeypatch.setattr(rk, "scan", lambda *args, **kwargs: [])
+
+    class _Imminent:
+        urgency = "imminent"
+
+        def as_dict(self):
+            return {"urgency": "imminent", "horizon_seconds": 30}
+
+    monkeypatch.setattr(steward.tracker, "forecast", lambda target: _Imminent())
+    assert steward.snapshot()["state"] == "trending"
+
+
+def test_gone_or_denied_does_not_spend_the_budget():
+    class _Reply:
+        def __init__(self):
+            self.names = []
+
+        def __call__(self, group, amount, cache_only=False):
+            self.names.append(group.name)
+            outcome = "gone" if "gone" in group.name else "denied" if "denied" in group.name else "ok"
+            freed = 0 if outcome in ("gone", "denied") else amount
+            return rk.Action(label=group.label, requested=amount, freed=freed,
+                             swapped_out=0, outcome=outcome)
+
+    steward = steward_with(max_reclaim_per_pass=200 * MB, max_victim_fraction=100,
+                           anon_reclaim_cooldown=0, cache_first=False)
+    reply = _Reply()
+    steward.reclaim_from = reply
+    groups = [
+        make_group("app-gone.scope", current=800 * MB, anon=800 * MB, reclaimable=0),
+        make_group("app-denied.scope", current=500 * MB, anon=500 * MB, reclaimable=0),
+        make_group("app-live.scope", current=400 * MB, anon=400 * MB, reclaimable=0),
+    ]
+    steward.relieve(make_snapshot(groups))
+    assert reply.names == ["app-gone.scope", "app-denied.scope", "app-live.scope"]
+
+
+def test_cache_write_uses_swappiness_zero_and_falls_back(tmp_path, monkeypatch):
+    import errno
+    steward = steward_with()
+    path, group = _fake_cgroup(tmp_path, current=100 * MB, with_reclaim_file=True)
+    writes = []
+    real_open = open
+
+    def fake_open(file, mode="r", *args, **kwargs):
+        if Path(file) == path / "memory.reclaim" and "w" in mode:
+            class _Handle:
+                def write(self, data):
+                    writes.append(data)
+                    if "swappiness=0" in data:
+                        raise OSError(errno.EINVAL, "old kernel")
+                    return len(data)
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *exc):
+                    return False
+            return _Handle()
+        return real_open(file, mode, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.open", fake_open)
+    action = steward.reclaim_from(group, 32 * MB, cache_only=True)
+    assert writes == [f"{32 * MB} swappiness=0", str(32 * MB)]
+    assert action.outcome == "ok"
+
+    writes.clear()
+    action = steward.reclaim_from(group, 32 * MB, cache_only=False)
+    assert writes == [str(32 * MB)]
+    assert action.outcome == "ok"
+
+
 def test_unreadable_after_value_is_not_treated_as_zero(tmp_path, monkeypatch):
     """A real 0 after a reclaim is meaningful; an unreadable file is not."""
     steward = steward_with()
@@ -258,9 +437,238 @@ def test_config_names_match_real_cgroups(cgroup, wanted):
 @pytest.mark.parametrize("cgroup,wanted", [
     ("app-firefox-1.scope", "spotify"),
     ("syncthing.service", "syncthing-server"),
+    ("syncthing-server.service", "syncthing"),
+    ("pipewire-pulse.service", "pipewire.service"),
+    ("hermes-gateway.service", "hermes"),
+    ("siamese.service", "sia"),
+    ("asia.service", "sia"),
 ])
 def test_config_names_do_not_over_match(cgroup, wanted):
     assert not rk.names_match(cgroup, {wanted})
+
+
+@pytest.mark.parametrize("cgroup,wanted", [
+    ("pipewire.service", "pipewire.service"),
+    ("syncthing.service", "syncthing.service"),
+    ("ollama.service", "ollama.service"),
+    ("hermes.service", "hermes"),
+    ("app-hermes-1043.scope", "hermes"),
+    ("hermes-gateway.service", "hermes-gateway"),
+    ("sia.service", "sia"),
+    ("app-sia-1043.scope", "sia"),
+])
+def test_documented_units_match_the_real_cgroup(cgroup, wanted):
+    assert rk.names_match(cgroup, {wanted})
+
+
+def test_defaults_protect_what_the_docs_name():
+    protected = set(rk.DEFAULT_CONFIG["protected"])
+    for name in ("pipewire.service", "syncthing.service", "ollama.service",
+                 "hermes", "hermes-gateway", "sia"):
+        assert name in protected
+    for cgroup in ("pipewire.service", "syncthing.service", "ollama.service",
+                   "hermes.service", "hermes-gateway.service", "sia.service"):
+        assert rk.names_match(cgroup, protected)
+    for stranger in ("pipewire-pulse.service", "syncthing-server.service",
+                     "siamese.service"):
+        assert not rk.names_match(stranger, protected)
+
+
+class _Clock:
+    def __init__(self):
+        self.now = 0.0
+
+    def __call__(self):
+        return self.now
+
+
+def test_anon_cooldown_holds_while_an_untouchable_culprit_keeps_pressure():
+    """Several passes, free memory stays critical, the hog cannot be touched."""
+    clock = _Clock()
+    steward = steward_with(anon_reclaim_cooldown=90, max_reclaim_per_pass=4096 * MB,
+                           max_victim_fraction=60)
+    steward._clock = clock
+    recorder = Recorder()
+    steward.reclaim_from = recorder
+    hog = make_group("untouchable.scope", current=6800 * MB, anon=6800 * MB,
+                     reclaimable=0, protected=True)
+    browser = make_group("app-browser.scope", current=800 * MB, anon=700 * MB,
+                         reclaimable=0)
+    snap = make_snapshot([hog, browser], state="critical", free_percent=5.0)
+
+    def asked(name):
+        return sum(amount for victim, amount in recorder.asks if victim == name)
+
+    steward.relieve(snap)
+    assert asked("untouchable.scope") == 0
+    assert asked("app-browser.scope") > 0
+    first = asked("app-browser.scope")
+
+    clock.now = 5
+    steward.relieve(snap)
+    assert asked("app-browser.scope") == first, (
+        "a second pass inside the cooldown drained the same app again")
+
+    clock.now = 10
+    steward.relieve(snap)
+    assert asked("app-browser.scope") == first
+
+    clock.now = 90
+    steward.relieve(snap)
+    assert asked("app-browser.scope") > first, (
+        "the pause never expired")
+
+    after_wait = asked("app-browser.scope")
+    clock.now = 95
+    steward.relieve(snap, force=True)
+    assert asked("app-browser.scope") > after_wait, (
+        "the manual button was blocked by the pause")
+
+
+def test_critical_shortens_the_per_victim_pause_to_fifteen_seconds():
+    clock = _Clock()
+    steward = steward_with(anon_reclaim_cooldown=90, max_reclaim_per_pass=200 * MB,
+                           max_victim_fraction=25, cache_first=False)
+    steward._clock = clock
+    recorder = Recorder()
+    steward.reclaim_from = recorder
+    first = make_group("app-first.scope", current=900 * MB, anon=900 * MB, reclaimable=0)
+    second = make_group("app-second.scope", current=800 * MB, anon=800 * MB, reclaimable=0)
+    snap = make_snapshot([first, second], state="critical", free_percent=5.0)
+
+    def asked(name):
+        return [amount for victim, amount in recorder.asks if victim == name]
+
+    steward.relieve(snap)
+    assert asked("app-first.scope") == [200 * MB]
+    assert asked("app-first.scope")[0] <= steward.max_victim_slice(900 * MB)
+    assert asked("app-second.scope") == []
+
+    clock.now = 5
+    steward.relieve(snap)
+    assert asked("app-first.scope") == [200 * MB]
+    assert asked("app-second.scope") == [200 * MB]
+    assert asked("app-second.scope")[0] <= steward.max_victim_slice(800 * MB)
+
+    clock.now = 14
+    steward.relieve(snap)
+    assert len(asked("app-first.scope")) == 1
+
+    clock.now = 15
+    steward.relieve(snap)
+    assert len(asked("app-first.scope")) == 2
+    assert asked("app-first.scope")[-1] <= steward.max_victim_slice(900 * MB)
+
+    quiet_clock = _Clock()
+    quiet = steward_with(anon_reclaim_cooldown=90, max_reclaim_per_pass=200 * MB,
+                         max_victim_fraction=25, cache_first=False)
+    quiet._clock = quiet_clock
+    quiet_rec = Recorder()
+    quiet.reclaim_from = quiet_rec
+    quiet.relieve(make_snapshot([first], state="tight", free_percent=12.0))
+    quiet_clock.now = 15
+    quiet.relieve(make_snapshot([first], state="tight", free_percent=12.0))
+    assert [name for name, _ in quiet_rec.asks].count("app-first.scope") == 1
+
+
+def test_anon_pass_requires_free_zram():
+    steward = steward_with(max_reclaim_per_pass=4096 * MB, max_victim_fraction=60,
+                           anon_reclaim_cooldown=0)
+    recorder = Recorder()
+    steward.reclaim_from = recorder
+    group = make_group("app-disk.scope", current=800 * MB, anon=700 * MB,
+                       reclaimable=100 * MB)
+    full = {"devices": [{"name": "/dev/zram0", "ram_backed": True,
+                         "size": 200 * MB, "used": 200 * MB}]}
+    disk = {"devices": [{"name": "/swap/swapfile", "ram_backed": False,
+                         "size": 8192 * MB, "used": 0}]}
+    steward.relieve(make_snapshot([group], zram=full))
+    assert [amount for _, amount in recorder.asks] == [100 * MB], recorder.asks
+    recorder.asks.clear()
+    steward.relieve(make_snapshot([group], zram=disk))
+    assert [amount for _, amount in recorder.asks] == [100 * MB], recorder.asks
+    recorder.asks.clear()
+    steward.relieve(make_snapshot([group], zram={"devices": []}))
+    assert [amount for _, amount in recorder.asks] == [100 * MB]
+    recorder.asks.clear()
+    steward.relieve(make_snapshot([group]))
+    assert [name for name, _ in recorder.asks] == ["app-disk.scope", "app-disk.scope"]
+    assert recorder.asks[0][1] == 100 * MB
+    assert recorder.asks[1][1] >= 16 * MB
+
+
+def test_critical_without_a_reachable_victim_names_the_protected_apps(monkeypatch):
+    steward = steward_with()
+    total = 8192 * MB
+    monkeypatch.setattr(rk, "meminfo", lambda: {
+        "MemTotal": total, "MemAvailable": int(total * 0.05), "Cached": 100 * MB})
+    monkeypatch.setattr(rk, "psi", lambda resource="memory": {
+        "available": True, "some_avg60": 0.0})
+    monkeypatch.setattr(rk, "zram_stats", lambda: {"devices": []})
+    monkeypatch.setattr(rk, "user_root", lambda: Path("/no-such-cgroup"))
+    holders = [
+        rk.Cgroup(path=Path("/no/ollama.service"), name="ollama.service",
+                  kind="service", label="ollama", current=6 * 1024 * MB,
+                  anon=6 * 1024 * MB, protected=True),
+        rk.Cgroup(path=Path("/no/hermes.service"), name="hermes.service",
+                  kind="service", label="hermes", current=1024 * MB,
+                  anon=1024 * MB, protected=True),
+        rk.Cgroup(path=Path("/no/app-small.scope"), name="app-small.scope",
+                  kind="scope", label="small", current=20 * MB, anon=20 * MB,
+                  protected=False),
+    ]
+    monkeypatch.setattr(rk, "scan", lambda *args, **kwargs: holders)
+    snap = steward.snapshot()
+    assert snap["state"] == "critical"
+    assert snap["held_by"] == ["ollama", "hermes"]
+
+    browser = rk.Cgroup(path=Path("/no/app-browser.scope"), name="app-browser.scope",
+                        kind="scope", label="browser", current=900 * MB,
+                        anon=900 * MB, protected=False)
+    monkeypatch.setattr(rk, "scan", lambda *args, **kwargs: holders + [browser])
+    assert steward.snapshot()["held_by"] == []
+
+
+def test_critical_without_zram_room_does_not_push_to_disk_swap():
+    shapes = [
+        {"devices": [{"name": "/dev/zram0", "ram_backed": True,
+                      "size": 200 * MB, "used": 200 * MB}]},
+        {"devices": [{"name": "/swap/swapfile", "ram_backed": False,
+                      "size": 8192 * MB, "used": 0}]},
+        {"devices": []},
+    ]
+    for zram in shapes:
+        steward = steward_with(max_reclaim_per_pass=4096 * MB, max_victim_fraction=60,
+                               anon_reclaim_cooldown=0)
+        recorder = Recorder()
+        steward.reclaim_from = recorder
+        group = make_group("app-disk.scope", current=800 * MB, anon=700 * MB,
+                           reclaimable=100 * MB)
+        result = steward.relieve(make_snapshot([group], state="critical",
+                                               free_percent=5.0, zram=zram))
+        assert recorder.cache_only == [True], recorder.asks
+        assert result["skipped_anon"] == "no-zram-room"
+        assert "disk swap" in result["reason"]
+        logged = steward.log_path.read_text(encoding="utf-8")
+        assert "no-zram-room" in logged
+
+    steward = steward_with(max_reclaim_per_pass=4096 * MB, max_victim_fraction=60,
+                           anon_reclaim_cooldown=0)
+    recorder = Recorder()
+    steward.reclaim_from = recorder
+    bare = make_group("app-anon.scope", current=800 * MB, anon=800 * MB, reclaimable=0)
+    result = steward.relieve(make_snapshot(
+        [bare], state="critical", free_percent=5.0, zram={"devices": []}))
+    assert recorder.asks == []
+    assert result["acted"] is False
+    assert result["skipped_anon"] == "no-zram-room"
+    published = {}
+    steward.publish = lambda snap: published.update(snap)
+    steward.snapshot = lambda: make_snapshot(
+        [bare], state="critical", free_percent=5.0, zram={"devices": []})
+    steward.supervise_once()
+    assert published["relief"]["acted"] is False
+    assert published["relief"]["skipped_anon"] == "no-zram-room"
 
 
 def test_scan_honours_protection_by_short_name(tmp_path):
@@ -334,7 +742,7 @@ def test_never_reclaim_is_excluded_from_the_published_victim_total(tmp_path, mon
                   label="ls", current=500 * MB, anon=0, reclaimable=300 * MB),
     ]
     monkeypatch.setattr(rk, "user_root", lambda: tmp_path)
-    monkeypatch.setattr(rk, "scan", lambda root, protected, min_bytes: groups)
+    monkeypatch.setattr(rk, "scan", lambda root, protected, min_bytes, never=None: groups)
     monkeypatch.setattr(rk, "meminfo", lambda: {"MemTotal": 8192 * MB,
                                                 "MemAvailable": 4096 * MB,
                                                 "Cached": 100 * MB})

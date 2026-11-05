@@ -168,6 +168,16 @@ if kill -0 "$P" 2>/dev/null; then ok "the notifier survived the corrupt file"; e
 unset RAM_KEEPER_DAEMON_POLL RAM_KEEPER_PRESSURE_POLL
 
 echo
+echo "== 4b. a free percentage that is not a number is not a prompt =="
+new_case injected-free
+printf '{"state":"critical","free_percent":"${HOME}"}\n' >"$CASE/.local/state/ram-keeper/state.json"
+export RAM_KEEPER_DAEMON_POLL=1 RAM_KEEPER_PRESSURE_POLL=1
+P="$(launch)"
+sleep 3
+check "a non-numeric free percentage produced no toast" "$(toast_count)" "0"
+unset RAM_KEEPER_DAEMON_POLL RAM_KEEPER_PRESSURE_POLL
+
+echo
 echo "== 5. the daemon stopping is announced =="
 new_case daemon-down
 export RAM_KEEPER_DAEMON_POLL=1 RAM_KEEPER_PRESSURE_POLL=2
@@ -184,6 +194,60 @@ sleep 3
 count="$(grep -c 'RAM protection stopped' "$STUB/toasts")"
 [[ "$count" == "1" ]] && ok "announced the transition once, not repeatedly" \
                       || bad "nagged $count times for one failure"
+unset RAM_KEEPER_DAEMON_POLL RAM_KEEPER_PRESSURE_POLL
+
+echo
+echo "== 6b. a pause the user asked for is not an alarm =="
+new_case user-pause
+export RAM_KEEPER_DAEMON_POLL=1 RAM_KEEPER_PRESSURE_POLL=2
+P="$(launch)"
+sleep 2
+touch "$CASE/.local/state/ram-keeper/paused-by-user"
+echo inactive >"$STUB/systemctl_state"
+sleep 3
+check "a user pause produced no toast" "$(toast_count)" "0"
+unset RAM_KEEPER_DAEMON_POLL RAM_KEEPER_PRESSURE_POLL
+
+echo
+echo "== 4c. critical without an action does not claim it is reclaiming =="
+new_case no-reclaim
+printf '%s\n' '{"state":"critical","free_percent":5.0,"relief":{"acted":false,"skipped_anon":"no-zram-room"}}' \
+  >"$CASE/.local/state/ram-keeper/state.json"
+export RAM_KEEPER_DAEMON_POLL=1 RAM_KEEPER_PRESSURE_POLL=1
+P="$(launch)"
+sleep 3
+if grep -q 'reclaiming now' "$STUB/toasts"; then
+  bad "the toast said reclaiming now when nothing was reclaimed"
+else
+  ok "the toast did not claim a reclaim"
+fi
+if grep -q 'disk swap' "$STUB/toasts"; then
+  ok "the toast says app memory stayed off disk swap"
+else
+  bad "the toast hid the reason"
+fi
+kill -TERM -"$P" 2>/dev/null || true
+unset RAM_KEEPER_DAEMON_POLL RAM_KEEPER_PRESSURE_POLL
+
+echo
+echo "== 4d. critical with only protected apps names them =="
+new_case held
+printf '%s\n' '{"state":"critical","free_percent":5.0,"held_by":["ollama","hermes"],"relief":{"acted":false}}' \
+  >"$CASE/.local/state/ram-keeper/state.json"
+export RAM_KEEPER_DAEMON_POLL=1 RAM_KEEPER_PRESSURE_POLL=1
+P="$(launch)"
+sleep 3
+if grep -q 'ollama' "$STUB/toasts" && grep -q 'hermes' "$STUB/toasts"; then
+  ok "the toast names the protected apps holding memory"
+else
+  bad "the toast did not name the protected apps"
+fi
+if grep -q 'reclaiming now' "$STUB/toasts"; then
+  bad "the toast claimed a reclaim when no victim was reachable"
+else
+  ok "the toast did not claim a reclaim"
+fi
+kill -TERM -"$P" 2>/dev/null || true
 unset RAM_KEEPER_DAEMON_POLL RAM_KEEPER_PRESSURE_POLL
 
 echo

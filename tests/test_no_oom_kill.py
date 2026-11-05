@@ -9,8 +9,13 @@ This reproduces the request-size failure deterministically and checks the per-vi
 The live stress section allocates 4.8 GB and sleeps for three minutes; it is opt-in
 via RAM_KEEPER_DANGEROUS_TESTS=1 and is never part of the default suite.
 """
-import json, os, re, subprocess, sys, time
+import json, os, re, subprocess, sys, tempfile, time
 from pathlib import Path
+
+# Private config: this file used to overwrite the real one and restore it.
+_CFG_DIR = tempfile.mkdtemp(prefix="rk-config-")
+os.environ["RAM_KEEPER_CONFIG"] = str(Path(_CFG_DIR) / "config.json")
+os.environ.setdefault("RAM_KEEPER_STATE_DIR", tempfile.mkdtemp(prefix="rk-state-"))
 
 PLUGIN = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PLUGIN / "helper"))
@@ -53,6 +58,8 @@ def build_snapshot(victim_anon_mb, victim_file_mb, state, free_pct):
         "state": state, "free_percent": free_pct,
         "mem_available": int(total * free_pct / 100), "mem_total": total,
         "cached": 0, "forecast": {"urgency": "none"},
+        "zram": {"devices": [{"name": "/dev/zram0", "ram_backed": True,
+                              "size": 8 * 1024 * MB, "used": 0}]},
         "groups": [{
             "name": "victim.scope", "label": "victim", "kind": "scope",
             "current": (victim_anon_mb + victim_file_mb) * MB,
@@ -104,19 +111,12 @@ check("total stays inside the available memory",
       sum(reqs) <= 2000 * MB, f"{sum(reqs)//MB}MB of 2000MB available")
 
 print("\n== 4. the cap is configurable and clamped ==")
-cfgfile = Path.home() / ".config/ram-keeper/config.json"
-backup = cfgfile.read_text() if cfgfile.exists() else None
-try:
-    for value, expect in [(5, 5), (60, 60), (1, 5), (999, 60)]:
-        cfgfile.parent.mkdir(parents=True, exist_ok=True)
-        cfgfile.write_text(json.dumps({"max_victim_fraction": value}))
-        got = rk.Steward().config["max_victim_fraction"]
-        check(f"max_victim_fraction={value} -> {got}", got == expect, f"got {got}")
-finally:
-    if backup is not None:
-        cfgfile.write_text(backup)
-    elif cfgfile.exists():
-        cfgfile.unlink()
+cfgfile = Path(os.environ["RAM_KEEPER_CONFIG"])
+cfgfile.parent.mkdir(parents=True, exist_ok=True)
+for value, expect in [(5, 5), (60, 60), (1, 5), (999, 60)]:
+    cfgfile.write_text(json.dumps({"max_victim_fraction": value}))
+    got = rk.Steward().config["max_victim_fraction"]
+    check(f"max_victim_fraction={value} -> {got}", got == expect, f"got {got}")
 
 if os.environ.get("RAM_KEEPER_DANGEROUS_TESTS") == "1":
     print("\n== 5. live: sustained load must not kill anything ==")

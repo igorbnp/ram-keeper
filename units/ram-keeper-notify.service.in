@@ -26,6 +26,7 @@ ProtectHome=read-only
 # treats a non-existent path in ReadWritePaths as a fatal sandbox error.
 ReadWritePaths=-%h/.local/state/ram-keeper
 PrivateTmp=yes
+IPAddressDeny=any
 RestrictSUIDSGID=yes
 LockPersonality=yes
 

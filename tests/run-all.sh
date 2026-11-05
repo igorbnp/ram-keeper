@@ -13,6 +13,10 @@
 set -uo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
+# Never let a child inherit the owner's config. Each script also sets this,
+# and doing it here covers a script that forgets.
+export RAM_KEEPER_CONFIG="${RAM_KEEPER_CONFIG:-$(mktemp "${TMPDIR:-/tmp}/rk-config.XXXXXX")}"
+export RAM_KEEPER_STATE_DIR="${RAM_KEEPER_STATE_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/rk-state.XXXXXX")}"
 fails=0
 test_out="$(mktemp "${TMPDIR:-/tmp}/ram-keeper-test.XXXXXX")"
 trap 'rm -f "$test_out"' EXIT
