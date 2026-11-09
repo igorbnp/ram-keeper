@@ -446,6 +446,8 @@ DEFAULT_CONFIG = {
         "wayland-wm@hyprland.desktop",
         "quickshell",
         "pipewire.service",
+        "pipewire-pulse.service",
+        "wireplumber.service",
         "syncthing.service",
         "ollama.service",
         "hermes",

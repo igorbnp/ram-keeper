@@ -99,9 +99,8 @@ Panel {
     anchors.fill: parent
     bar: root.bar
     slotSize: root.barWidth
-    text: root.showPercent && !root.verticalBar
-      ? root.percentText + " " + root.glyph
-      : root.glyph
+    text: root.glyph
+    labelText: (root.showPercent && !root.verticalBar) ? root.percentText : ""
     tooltipText: root.loaded
       ? (Model.isUnknown(root.state)
           ? "Memory reading unavailable"
@@ -133,12 +132,17 @@ Panel {
       onCloseRequested: root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
 
-      Column {
-        id: column
-        anchors.left: parent.left
-        anchors.right: parent.right
-        anchors.top: parent.top
-        spacing: Style.space(12)
+      Flickable {
+        anchors.fill: parent
+        contentHeight: column.implicitHeight
+        boundsBehavior: Flickable.StopAtBounds
+        flickableDirection: Flickable.VerticalFlick
+        clip: true
+
+        Column {
+          id: column
+          width: parent.width
+          spacing: Style.space(12)
 
         // ---------------------------------------------------------- hero
         PanelHero {
@@ -571,3 +575,5 @@ Panel {
     }
   }
 }
+}
+

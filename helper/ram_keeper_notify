@@ -262,15 +262,12 @@ watch_pressure() {
     rest="${rest#*$'\t'}"
     skipped="${rest%%$'\t'*}"
     held="${rest#*$'\t'}"
-    # No further field: the strip leaves the previous value in place.
     if [[ "$held" == "$skipped" ]]; then
       held=""
     fi
     if [[ "$skipped" == "$acted" ]]; then
       skipped=""
     fi
-    # A snapshot with only state and free leaves acted equal to free. Treat
-    # that as "the pass did not say it acted".
     if [[ "$acted" == "$free" ]]; then
       acted=""
       skipped=""

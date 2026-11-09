@@ -463,13 +463,14 @@ def test_documented_units_match_the_real_cgroup(cgroup, wanted):
 
 def test_defaults_protect_what_the_docs_name():
     protected = set(rk.DEFAULT_CONFIG["protected"])
-    for name in ("pipewire.service", "syncthing.service", "ollama.service",
-                 "hermes", "hermes-gateway", "sia"):
+    for name in ("pipewire.service", "pipewire-pulse.service", "wireplumber.service",
+                 "syncthing.service", "ollama.service", "hermes", "hermes-gateway", "sia"):
         assert name in protected
-    for cgroup in ("pipewire.service", "syncthing.service", "ollama.service",
-                   "hermes.service", "hermes-gateway.service", "sia.service"):
+    for cgroup in ("pipewire.service", "pipewire-pulse.service", "wireplumber.service",
+                   "syncthing.service", "ollama.service", "hermes.service",
+                   "hermes-gateway.service", "sia.service"):
         assert rk.names_match(cgroup, protected)
-    for stranger in ("pipewire-pulse.service", "syncthing-server.service",
+    for stranger in ("pipewire-extra.service", "syncthing-server.service",
                      "siamese.service"):
         assert not rk.names_match(stranger, protected)
 

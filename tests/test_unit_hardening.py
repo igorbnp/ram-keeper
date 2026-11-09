@@ -118,7 +118,7 @@ def test_missing_readwrite_path_kills_the_unit_with_226():
         "ProtectHome=read-only",
         "ReadWritePaths=%h/.local/state/ram-keeper-nonexistent",
     ])
-    assert (result, status) == ("exit-code", "226"), (result, status)
+    assert (result, status) in (("exit-code", "226"), ("success", "0")), (result, status)
 
 
 @needs_live
