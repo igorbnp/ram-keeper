@@ -10,6 +10,7 @@ production daemon uses its config plus the built-in inviolable cgroups.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -62,12 +63,12 @@ def read_process_info(pid: int) -> ProcessInfo | None:
     """Read basic info about a process. Returns None if it vanished."""
     try:
         cmdline_path = Path(f"/proc/{pid}/cmdline")
-        cmdline = cmdline_path.read_text().replace("\x00", " ").strip()
+        cmdline = cmdline_path.read_text(errors="replace").replace("\x00", " ").strip()
 
         # Read cgroup
         cgroup = ""
         try:
-            cgroup_text = Path(f"/proc/{pid}/cgroup").read_text()
+            cgroup_text = Path(f"/proc/{pid}/cgroup").read_text(errors="replace")
             for line in cgroup_text.splitlines():
                 if line.startswith("0::"):
                     cgroup = line.split(":", 2)[2]
@@ -76,7 +77,7 @@ def read_process_info(pid: int) -> ProcessInfo | None:
             pass
 
         # Derive name from cmdline
-        name = cmdline.split()[0] if cmdline else Path(f"/proc/{pid}/comm").read_text().strip()
+        name = cmdline.split()[0] if cmdline else Path(f"/proc/{pid}/comm").read_text(errors="replace").strip()
         name = Path(name).name  # strip path
 
         return ProcessInfo(pid=pid, name=name, cmdline=cmdline, cgroup=cgroup)
@@ -139,7 +140,7 @@ def lookup_desktop_file(name: str) -> str:
 def _parse_desktop_name(path: Path) -> str:
     """Extract the Name= field from a .desktop file."""
     try:
-        for line in path.read_text().splitlines():
+        for line in path.read_text(errors="replace").splitlines():
             if line.startswith("Name="):
                 return line.split("=", 1)[1].strip()
     except OSError:
@@ -153,7 +154,7 @@ def lookup_unit_description(name: str) -> str:
         name = f"{name}.service"
     try:
         result = subprocess.run(
-            ["systemctl", "show", name, "--property=Description", "--no-pager"],
+            ["systemctl", "--user", "show", "--", name],
             capture_output=True, text=True, timeout=5,
         )
         if result.returncode != 0:
@@ -227,8 +228,10 @@ def _is_critical_process(process: ProcessInfo) -> tuple[bool, str]:
     if process.name.lower() in {n.lower() for n in critical_names}:
         return True, "critical system component"
 
-    # Check cgroup for session scope
-    if "session" in process.cgroup and "scope" in process.cgroup:
+    # A real session scope is session-<digits>.scope. A name that merely
+    # contains both words (app-minha-session.scope) is an ordinary app.
+    parts = [p for p in process.cgroup.split("/") if p]
+    if any(re.fullmatch(r"session-\d+\.scope", part) for part in parts):
         return True, "session scope"
 
     return False, ""
@@ -256,7 +259,7 @@ def evaluate_new_processes(
         proc.protection_reason = reason
         result.append(proc)
 
-    return result
+    return result[: config.max_processes]
 
 
 # ---------------------------------------------------------------------------

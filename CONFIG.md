@@ -29,6 +29,7 @@ the rest keep their defaults. Delete the file to return to defaults.
 |---|---|---|
 | `interval_idle` | `20.0` | Seconds between passes when healthy. |
 | `interval_pressure` | `5.0` | Seconds between passes under pressure. |
+| `anon_reclaim_cooldown` | `90.0` | Minimum seconds before the same cgroup can lose anonymous memory again. The manual button ignores this pause. Clamped to 0–600. `0` disables it. |
 | `reclaim_sleep` | `0.4` | Seconds to wait after asking a cgroup to give memory back, before measuring what actually came back. Cache reclaim is synchronous; anon→zram can take a moment to be accounted. Clamped to 0–5. |
 
 Reading cgroups is cheap (a few dozen small files), so `interval_idle` can go
@@ -72,9 +73,12 @@ services that keep your session alive:
 ```
   wayland-wm@hyprland.desktop   the compositor; a dead WM is a dead desktop
   quickshell                    the shell that draws the panel
-  pipewire.service              audio
-  syncthing.service             file sync
+  pipewire.service              audio (not pipewire-pulse, and not a name that only shares the prefix)
+  syncthing.service             file sync (not syncthing-server)
   ollama.service                local model server
+  hermes                        the Hermes gateway process
+  hermes-gateway                the gateway when it is its own unit
+  sia                           SIA
   ram-keeper                    the daemon itself
   ```
 
@@ -106,8 +110,16 @@ cannot be removed by any config file.
 To protect something else, add it by the name you see in the panel:
 
 ```bash
-python3 ~/.config/omarchy/plugins/ram-keeper/helper/ram_keeper.py \
+python3 ~/.config/omarchy/plugins/io.github.igorbnp.ram-keeper/helper/ram_keeper.py \
   --protected-add your-app
+```
+
+To stop protecting one of the defaults (not the compositor, the shell, or the
+daemon), use the Release control in the panel, or:
+
+```bash
+python3 ~/.config/omarchy/plugins/io.github.igorbnp.ram-keeper/helper/ram_keeper.py \
+  --protected-remove ollama
 ```
 
 To find a cgroup name:
@@ -152,13 +164,14 @@ should let apps keep much more resident.
 **Less RAM (4 GB)** — raise `target_free_percent` to `25`, drop
 `interval_pressure` to `3`. Reclaim earlier and more eagerly.
 
-**A local LLM server you want resident** (llama-server, ollama): add its unit
-to `never_reclaim`. A model that has been swapped out has to be read back from
+**A local LLM server you want resident** (llama-server): add its unit
+to `never_reclaim`. `ollama.service` is already in the default protected list.
+A model that has been swapped out has to be read back from
 zram before it can answer, and that is the one workload where paying RAM is
 worth it:
 
 ```bash
-python3 ~/.config/omarchy/plugins/ram-keeper/helper/ram_keeper.py \
+python3 ~/.config/omarchy/plugins/io.github.igorbnp.ram-keeper/helper/ram_keeper.py \
   --protected-add llama-server.service
 ```
 
@@ -176,7 +189,7 @@ journalctl --user -u ram-keeper -n 40
 **Nothing is ever reclaimed** — check the state and free memory:
 
 ```bash
-python3 ~/.config/omarchy/plugins/ram-keeper/helper/ram_keeper.py --once | \
+python3 ~/.config/omarchy/plugins/io.github.igorbnp.ram-keeper/helper/ram_keeper.py --once | \
   python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["state"], d["free_percent"], "reclaimable:", d["reclaimable_total"]//1048576, "MB")'
 ```
 

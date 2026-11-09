@@ -1,5 +1,8 @@
 name: Security
 
+permissions:
+  contents: read
+
 on:
   push:
     branches: [main, master]
@@ -31,13 +34,21 @@ jobs:
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
       - name: Run Bandit (Python security linter)
+        # O JSON é artefato, não portão. `--exit-zero` diz isso na cara do
+        # bandit; o `|| true` que estava aqui escondia a intenção. Quem julga
+        # continua sendo a segunda linha, em severidade média ou maior.
         run: |
-          bandit -r helper/ -f json -o bandit-report.json || true
+        # O JSON é artefato, não portão. `--exit-zero` diz isso na cara do
+        # bandit; o `|| true` que estava aqui escondia a intenção. Quem julga
+        # continua sendo a segunda linha, em severidade média ou maior.
+        run: |
+          bandit -r helper/ -f json -o bandit-report.json --exit-zero
+          bandit -r helper/ -ll
           bandit -r helper/ -ll
 
       - name: Run Safety (dependency vulnerability check)
         run: |
-          safety check --full-report || true
+          safety check --full-report
 
       - name: Upload Bandit report
         if: always()

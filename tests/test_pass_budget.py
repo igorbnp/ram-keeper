@@ -22,6 +22,7 @@ from pathlib import Path
 # Steward objects, and a pass that "frees" memory would append a fabricated
 # reclaim event to the production log.
 os.environ.setdefault("RAM_KEEPER_STATE_DIR", tempfile.mkdtemp(prefix="rk-test-state-"))
+os.environ.setdefault("RAM_KEEPER_CONFIG", str(Path(tempfile.mkdtemp(prefix="rk-config-")) / "config.json"))
 
 PLUGIN = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PLUGIN / "helper"))
@@ -54,14 +55,16 @@ def snapshot(groups, state="critical", free_percent=4.0, total=8192 * MB,
     return {"state": state, "memory_reading_valid": True,
             "free_percent": free_percent, "mem_total": total,
             "mem_available": available, "mem_used": total - available,
-            "groups": groups, "forecast": forecast}
+            "groups": groups, "forecast": forecast,
+            "zram": {"devices": [{"name": "/dev/zram0", "ram_backed": True,
+                                  "size": 8192 * MB, "used": 0}]}}
 
 
 class Recorder:
     def __init__(self):
         self.asks = []
 
-    def __call__(self, victim, amount):
+    def __call__(self, victim, amount, cache_only=False):
         self.asks.append((victim.name, amount))
         return rk.Action(label=victim.label, requested=amount, freed=amount,
                          swapped_out=0, outcome="ok")

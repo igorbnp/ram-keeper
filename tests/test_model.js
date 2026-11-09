@@ -77,6 +77,8 @@ console.log("\n== memory segments ==");
 const segs = M.memorySegments(snap);
 check("has segments", segs.length > 0);
 check("apps present", segs.some(s => s.key === "apps"));
+check("apps use the apps colour", segs.find(s => s.key === "apps").tone === "apps",
+      segs.find(s => s.key === "apps").tone);
 check("free present", segs.some(s => s.key === "free"));
 check("cache present when cache is non-zero",
       !snap["cached"] || segs.some(s => s.key === "cache"));
@@ -86,6 +88,9 @@ check("segments sum to MemTotal",
   Math.abs(totalSeg - snap.mem_total) < 4 * 1048576,
   `${totalSeg} vs ${snap.mem_total}`);
 const pcts = M.memoryPercentages(snap);
+check("percentage bar uses the apps colour",
+      pcts.find(s => s.key === "apps").tone === "apps",
+      pcts.find(s => s.key === "apps").tone);
 const sumPct = pcts.reduce((a, s) => a + s.fraction, 0);
 check("percentages sum to ~1", Math.abs(sumPct - 1) < 0.02, String(sumPct));
 check("empty snapshot is safe", M.memorySegments({}).length === 0);
@@ -122,6 +127,41 @@ const compositorVictims = snap.groups.filter(g => !g.protected && (
 check("protected excludes the compositor from victims",
   compositorVictims.length === 0,
   compositorVictims.map(g => g.name).join(", "));
+
+const actionRows = M.protectedGroups({
+  groups: [
+    { name: "session-2.scope", label: "session", protected: true, inviolable: true, current: 400 * 1024 * 1024 },
+    { name: "ollama.service", label: "ollama", protected: true, inviolable: false, current: 800 * 1024 * 1024 }
+  ]
+});
+check("an inviolable row has no button",
+  actionRows.find(r => r.key === "session-2.scope").action === "");
+check("a protected row can be released",
+  actionRows.find(r => r.key === "ollama.service").action === "release");
+const freeRows = M.reclaimableGroups({
+  groups: [
+    { name: "app-Firefox-1.scope", label: "Firefox", protected: false, inviolable: false,
+      current: 900 * 1024 * 1024, anon: 800 * 1024 * 1024, reclaimable: 100 * 1024 * 1024 }
+  ]
+});
+check("a reclaimable row can be protected", freeRows[0] && freeRows[0].action === "protect");
+const blocked = {
+  state: "critical",
+  relief: { acted: false, skipped_anon: "no-zram-room" }
+};
+check("a blocked swap is not called reclaiming",
+  M.watchLine(blocked, true).indexOf("disk swap") >= 0
+  && M.watchLine(blocked, true).indexOf("reclaiming now") < 0);
+check("a manual result does not call a blocked swap comfortable",
+  M.summaryLine({ acted: false, skipped_anon: "no-zram-room" }).indexOf("disk swap") >= 0);
+const heldLine = M.watchLine({
+  state: "critical",
+  held_by: ["ollama", "hermes"],
+  groups: []
+}, true);
+check("critical without a victim names the protected apps",
+  heldLine.indexOf("ollama") >= 0 && heldLine.indexOf("hermes") >= 0
+  && heldLine.indexOf("nothing needed") < 0);
 const quickshellVictim = snap.groups.filter(g => !g.protected && /quickshell/i.test(g.name));
 check("protected excludes quickshell from victims", quickshellVictim.length === 0,
   quickshellVictim.map(g => g.name).join(", "));
@@ -202,6 +242,8 @@ check("action result reports freed and swapped",
     === "freed 1.00 GB · moved 512 MB to zram",
   M.summaryLine({ acted: true, freed: 1073741824, swapped_out: 536870912 }));
 check("null result is safe", M.summaryLine(null) === "");
+check("empty action output is not a comfortable result", M.parseResult("") === null);
+check("blank action output is not a comfortable result", M.parseResult("   ") === null);
 
 
 console.log("\n== candidates are ordered by what we would actually recover ==");
@@ -256,6 +298,7 @@ try {
     M.protectedGroups(s, 4); M.swapRows(s); M.psiRow(s && s.psi);
     M.psiLabel(M.psiRow(s && s.psi)); M.forecastRow(s && s.forecast);
     M.forecastForSnapshot(s); M.freePercentLabel(s); M.freeFraction(s);
+    M.watchLine(s, rand() > 0.5);
     M.usedFraction(s); M.stateLabel(s && s.state); M.stateGlyph(s && s.state);
     M.parseJsonLine(JSON.stringify(s || {})); M.formatBytes(s && s.mem_total);
 

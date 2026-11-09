@@ -31,6 +31,17 @@ collect_ignore = [
 
 
 @pytest.fixture(autouse=True)
+def isolated_config(tmp_path, monkeypatch):
+    """No test may read or write the real config file.
+
+    The path is a fresh file under tmp_path. Tests that need a specific
+    document write that file, or point RAM_KEEPER_CONFIG somewhere else.
+    """
+    cfg = tmp_path / "ram-keeper" / "config.json"
+    monkeypatch.setenv("RAM_KEEPER_CONFIG", str(cfg))
+
+
+@pytest.fixture(autouse=True)
 def isolated_state_dir(tmp_path, monkeypatch):
     """Every test writes state and logs into its own directory.
 

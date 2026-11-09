@@ -131,10 +131,11 @@ def test_valid_config_produces_no_warnings(cfg):
 # ---------------------------------------------------------------------------
 
 def run_add(tmp_path, name, home):
+    cfg = Path(home) / ".config" / "ram-keeper" / "config.json"
     return subprocess.run(
         [sys.executable, HELPER, "--protected-add", name],
         capture_output=True, text=True, timeout=30,
-        env={**os.environ, "HOME": str(home)},
+        env={**os.environ, "HOME": str(home), "RAM_KEEPER_CONFIG": str(cfg)},
     )
 
 

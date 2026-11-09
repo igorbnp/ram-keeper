@@ -18,6 +18,8 @@ check("isUnknown('unknown')", M.isUnknown("unknown") === true);
 check("isUnknown('ok') is false", M.isUnknown("ok") === false);
 check("unknown counts as a warning", M.isWarning("unknown") === true);
 check("unknown glyph differs from ok", M.stateGlyph("unknown") !== M.stateGlyph("ok"));
+check("unknown glyph differs from critical",
+      M.stateGlyph("unknown") !== M.stateGlyph("critical"));
 
 // With an unknown snapshot the numbers are zero, so every section must be empty
 // rather than showing a misleading empty bar.

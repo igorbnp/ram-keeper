@@ -6,11 +6,13 @@ on:
       - "v*.*.*"
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   release:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
     steps:
       - uses: actions/checkout@v4
@@ -21,6 +23,9 @@ jobs:
           ver=$(python3 -c "import json;print(json.load(open('manifest.json'))['version'])")
           echo "tag=$tag manifest=$ver"
           [ "$tag" = "$ver" ] || { echo "::error::tag $tag does not match manifest version $ver"; exit 1; }
+
+      - name: Run the test suite
+        run: bash tests/ci-suite.sh
 
       - name: Build the source archives
         run: |

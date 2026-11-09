@@ -57,7 +57,7 @@ function memorySegments(snapshot) {
   var parts = memoryParts(snapshot);
   if (!parts) return [];
   return [
-    { key: "apps", label: "Apps", bytes: parts.apps, tone: "primary" },
+    { key: "apps", label: "Apps", bytes: parts.apps, tone: "apps" },
     { key: "cache", label: "Cache", bytes: parts.cache, tone: "cache" },
     { key: "free", label: "Free", bytes: parts.free, tone: "free" }
   ].filter(function (s) { return s.bytes > 0; });
@@ -67,7 +67,7 @@ function memoryPercentages(snapshot) {
   var parts = memoryParts(snapshot);
   if (!parts) return [];
   return [
-    { key: "apps", label: "Apps", fraction: parts.apps / parts.total, tone: "primary" },
+    { key: "apps", label: "Apps", fraction: parts.apps / parts.total, tone: "apps" },
     { key: "cache", label: "Cache", fraction: parts.cache / parts.total, tone: "cache" },
     { key: "free", label: "Free", fraction: parts.free / parts.total, tone: "free" }
   ].filter(function (s) { return s.fraction > 0.001; });
@@ -101,7 +101,7 @@ function stateGlyph(state) {
     case "tight": return "󰗚";      // gauge
     case "stalling": return "󰅜";   // history / clock
     case "trending": return "󰔡";   // trending down
-    case "unknown": return "󰅚";   // question — deliberately not the calm glyph
+    case "unknown": return "󰋗";   // question, not the critical slash
     default: return "󰍛";           // memory
   }
 }
@@ -181,6 +181,12 @@ function horizonLabel(seconds) {
 // Only things that can actually give something back: unprotected, above the
 // noise floor, and not already empty. Sorted by what we'd recover, so the
 // panel leads with the process that matters.
+function rowAction(group) {
+  if (!group || group.inviolable === true) return "";
+  if (group.protected === true) return "release";
+  return "protect";
+}
+
 function reclaimableGroups(snapshot, limit) {
   if (!snapshot || !snapshot.groups) return [];
   var rows = snapshot.groups
@@ -201,6 +207,8 @@ function reclaimableGroups(snapshot, limit) {
         swapable: g.swapable !== false,
         give: give,
         protected: g.protected === true,
+        inviolable: g.inviolable === true,
+        action: rowAction(g),
         kind: g.kind || ""
       };
     });
@@ -225,6 +233,8 @@ function protectedGroups(snapshot, limit) {
         cache: g.reclaimable || 0,
         swap: g.swap || 0,
         protected: true,
+        inviolable: g.inviolable === true,
+        action: rowAction(g),
         kind: g.kind || ""
       };
     });
@@ -301,9 +311,11 @@ function parseSnapshot(raw) {
 }
 
 function parseResult(raw) {
+  var text = String(raw == null ? "" : raw).trim();
+  if (!text) return null;
   var data = null;
   try {
-    data = JSON.parse(raw || "{}");
+    data = JSON.parse(text);
   } catch (e) {
     return null;
   }
@@ -319,12 +331,30 @@ function parseJsonLine(line) {
 
 function summaryLine(result) {
   if (!result) return "";
+  if (result.skipped_anon === "no-zram-room" && !result.acted) {
+    return "App memory was not moved to disk swap";
+  }
   if (!result.acted) return "Nothing to do — memory is comfortable";
   var parts = [];
   if (result.freed > 0) parts.push("freed " + formatBytes(result.freed));
   if (result.swapped_out > 0) parts.push("moved " + formatBytes(result.swapped_out) + " to zram");
+  if (result.skipped_anon === "no-zram-room") parts.push("app memory was not moved to disk swap");
   if (parts.length === 0) parts.push("no change");
   return parts.join(" · ");
+}
+
+function watchLine(snapshot, daemonUp) {
+  if (!daemonUp) return "Automatic protection is paused";
+  var held = snapshot && Array.isArray(snapshot.held_by) ? snapshot.held_by : [];
+  if (held.length) {
+    return "Memory is critically low. Protected apps are holding it: " + held.join(", ");
+  }
+  var relief = snapshot && snapshot.relief;
+  if (relief && relief.skipped_anon === "no-zram-room") {
+    if (relief.acted) return "Dropped cache. App memory was not moved to disk swap.";
+    return "Memory is tight. App memory was not moved to disk swap.";
+  }
+  return "Watching automatically · nothing needed from you";
 }
 
 // ---------------------------------------------------------------------------
@@ -372,6 +402,7 @@ if (typeof module !== "undefined" && module.exports) {
     parseResult: parseResult,
     parseJsonLine: parseJsonLine,
     summaryLine: summaryLine,
+    watchLine: watchLine,
     freePercentLabel: freePercentLabel,
     freeFraction: freeFraction,
     usedFraction: usedFraction

@@ -21,11 +21,11 @@ the user systemd unit. See CONFIG.md for the policy and thresholds.
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import math
 import os
 import re
-import socket
 import subprocess
 import sys
 import time
@@ -70,12 +70,11 @@ def user_root() -> Path:
     hierarchy layout, or a future Omarchy migration changes the path shape.
     """
     uid = os.getuid()
-    slices = sorted(CGROOT.glob(f"user.slice/user-{uid}.slice"))
-    if slices:
-        return slices[0]
-    # Fall back to the first user slice present (containers, unusual setups).
-    for candidate in sorted(CGROOT.glob("user.slice/user-*.slice")):
-        return candidate
+    own = CGROOT / "user.slice" / f"user-{uid}.slice"
+    if own.is_dir():
+        return own
+    # Another user's slice is not this session. Scanning it would reclaim
+    # memory that belongs to someone else.
     return CGROOT / "user.slice"
 
 
@@ -94,6 +93,7 @@ class Cgroup:
     swap: int = 0
     reclaimable: int = 0      # file pages we could drop for free
     protected: bool = False   # exempt by configuration or by role
+    inviolable: bool = False  # no panel button may take this protection off
     swapable: bool = True     # False when MemorySwapMax=0 (anon can never be reclaimed)
     pids: int = 0
 
@@ -207,7 +207,8 @@ def human_label(name: str) -> str:
     return label or name
 
 
-def scan(root: Path, protected: set[str], min_bytes: int) -> list[Cgroup]:
+def scan(root: Path, protected: set[str], min_bytes: int,
+         never: set[str] | None = None) -> list[Cgroup]:
     """Enumerate reclaimable leaf cgroups under the user's own hierarchy."""
     found: list[Cgroup] = []
     if not root.is_dir():
@@ -271,8 +272,10 @@ def scan(root: Path, protected: set[str], min_bytes: int) -> list[Cgroup]:
         else:
             kind = "service"
 
+        inviolable = is_inviolable(name)
         is_protected = (names_match(name, protected)
-                        or is_inviolable(name))
+                        or names_match(name, never or set())
+                        or inviolable)
         found.append(Cgroup(
             path=cgroup_dir,
             name=name,
@@ -285,6 +288,7 @@ def scan(root: Path, protected: set[str], min_bytes: int) -> list[Cgroup]:
             swap=swap,
             reclaimable=reclaimable,
             protected=is_protected,
+            inviolable=inviolable,
             swapable=swapable,
             pids=pids,
         ))
@@ -298,11 +302,15 @@ def scan(root: Path, protected: set[str], min_bytes: int) -> list[Cgroup]:
 def meminfo() -> dict:
     values: dict[str, int] = {}
     try:
-        for line in Path("/proc/meminfo").read_text().splitlines():
+        lines = Path("/proc/meminfo").read_text().splitlines()
+    except OSError:
+        return values
+    for line in lines:
+        try:
             key, rest = line.split(":", 1)
             values[key] = int(rest.split()[0]) * 1024
-    except (OSError, ValueError, IndexError):
-        pass
+        except (ValueError, IndexError):
+            continue
     return values
 
 
@@ -354,27 +362,50 @@ def zram_stats() -> dict:
     """
     devices = []
     try:
-        out = subprocess.run(["swapon", "--show=NAME,TYPE,SIZE,USED,PRIO",
-                              "--noheadings", "--bytes"],
-                             capture_output=True, text=True, timeout=5).stdout
-        for line in out.strip().splitlines():
+        # /proc/swaps reports Size and Used in KiB. No swapon process.
+        lines = Path("/proc/swaps").read_text().splitlines()
+        for line in lines[1:]:
             parts = line.split()
-            if len(parts) >= 4:
-                name = parts[0]
-                devices.append({
-                    "name": name,
-                    "type": parts[1],
-                    "size": int(parts[2]) if parts[2].isdigit() else 0,
-                    "used": int(parts[3]) if parts[3].isdigit() else 0,
-                    "ram_backed": "zram" in name.lower(),
-                })
-    except (OSError, subprocess.SubprocessError, ValueError):
+            if len(parts) < 4:
+                continue
+            name = parts[0]
+            devices.append({
+                "name": name,
+                "type": parts[1],
+                "size": int(parts[2]) * 1024,
+                "used": int(parts[3]) * 1024,
+                "ram_backed": "zram" in name.lower(),
+            })
+    except (OSError, ValueError, IndexError):
         pass
     return {"devices": devices,
             "used": sum(d["used"] for d in devices),
             "size": sum(d["size"] for d in devices),
             "disk_used": sum(d["used"] for d in devices if not d["ram_backed"]),
             "ram_used": sum(d["used"] for d in devices if d["ram_backed"])}
+
+
+def zram_has_room(zram: dict | None, margin: int = 64 * 1024 * 1024) -> bool:
+    """True when some RAM-backed swap device can still take anonymous pages.
+
+    Disk swap does not count. A full zram, or no zram at all, must not push
+    app memory onto the slow swapfile.
+    """
+    if not isinstance(zram, dict):
+        return False
+    devices = zram.get("devices") or []
+    if not isinstance(devices, list):
+        return False
+    for dev in devices:
+        if not isinstance(dev, dict) or not dev.get("ram_backed"):
+            continue
+        try:
+            free = int(dev.get("size") or 0) - int(dev.get("used") or 0)
+        except (TypeError, ValueError):
+            continue
+        if free > margin:
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -396,6 +427,10 @@ DEFAULT_CONFIG = {
     "interval_idle": 20.0,
     # Seconds between passes while under pressure.
     "interval_pressure": 5.0,
+    # Minimum seconds between anonymous reclaims of the SAME cgroup. Without
+    # this, an untouchable hog keeps free memory under the floor and every
+    # 5 s pass takes another 25% of the same browser until it is empty.
+    "anon_reclaim_cooldown": 90.0,
     # Hard ceiling on how much a single pass may reclaim, so one spike can't
     # turn into a system-wide swap storm.
     "max_reclaim_per_pass": 2 * 1024 * 1024 * 1024,
@@ -410,6 +445,14 @@ DEFAULT_CONFIG = {
     "protected": [
         "wayland-wm@hyprland.desktop",
         "quickshell",
+        "pipewire.service",
+        "pipewire-pulse.service",
+        "wireplumber.service",
+        "syncthing.service",
+        "ollama.service",
+        "hermes",
+        "hermes-gateway",
+        "sia",
         "ram-keeper",
     ],
     # Seconds to let a cgroup settle after a reclaim request before measuring
@@ -425,6 +468,11 @@ DEFAULT_CONFIG = {
     "never_reclaim": [
         "localsearch-3.service",
     ],
+    # Names the user took off the default lists. A non-empty protected list is
+    # merged back with the defaults, so removing "ollama" from that list would
+    # not stick. This list is subtracted after the merge. Inviolable names are
+    # refused.
+    "unprotect": [],
 }
 
 # The compositor and the shell can never be handed to a reclaim sweep, whatever
@@ -438,6 +486,7 @@ INVIOABLE_PROTECTED = frozenset({
     "session",                        # any session-* scope
     "quickshell",                     # the shell that draws this panel
     "ram-keeper",                     # ourselves
+    "ram-keeper-notify",              # the notifier; a different unit from the daemon
     # systemd --user's own manager. It is a leaf cgroup holding the thing that
     # would have to act on a problem, so making it a victim is self-defeating:
     # reclaiming from it stalls every unit the user has.
@@ -445,23 +494,47 @@ INVIOABLE_PROTECTED = frozenset({
 })
 
 
+# uwsm may publish the compositor as app-Hyprland-<pid>.scope or as
+# wayland-wm@Hyprland.service, with any capitalisation. The instance has to
+# be Hyprland itself: hyprland-gtk-launch and wayland-wm@sway stay ordinary.
+_COMPOSITOR_UNIT = re.compile(
+    r"^wayland-wm@hyprland(?:\.desktop)?(?:\.(?:service|scope|slice|socket))?$",
+    re.IGNORECASE,
+)
+
+
 def is_inviolable(name: str) -> bool:
-    """True for cgroups no config file may ever hand to a reclaim sweep."""
-    if name in INVIOABLE_PROTECTED:
+    """True for cgroups no config file may ever hand to a reclaim sweep.
+
+    `names_match` understands `app-quickshell-<pid>.scope`. A suffix strip
+    alone leaves that name unprotected. `session-N.scope` is numbered per
+    login, so the session prefix stays as its own check and is not a
+    substring search (an app named `minha-session` is not the session).
+    The compositor is recognised by the alias `hyprland` and by the
+    wayland-wm@ template, so a capitalised or unsuffixed unit is still
+    shielded, and a longer name that merely contains those letters is not.
+    """
+    if not isinstance(name, str) or not name:
+        return False
+    if names_match(name, INVIOABLE_PROTECTED) or names_match(name, ("hyprland",)):
         return True
-    # Strip every systemd unit suffix, not just two: session.slice has to
-    # reduce to "session", which .removesuffix(".scope") alone does not do.
-    base = name
-    for suffix in (".service", ".scope", ".slice"):
-        base = base.removesuffix(suffix)
-    if base in INVIOABLE_PROTECTED:
+    if _COMPOSITOR_UNIT.match(name.strip()):
         return True
-    # session.slice, and the compositor's own session-N.scope which is numbered
-    # per login, so the exact name cannot be hard-coded.
+    base = _strip_unit_suffix(name.strip()).casefold()
     return base == "session" or base.startswith("session-")
 
 
 def config_path() -> Path:
+    """Where the user's config lives.
+
+    `RAM_KEEPER_CONFIG` points at another file so a test can load and write a
+    throwaway config. Without it, the suite used to overwrite the real
+    `~/.config/ram-keeper/config.json` and, if the daemon reloaded in that
+    window, act on the hostile values.
+    """
+    override = os.environ.get("RAM_KEEPER_CONFIG")
+    if override:
+        return Path(override)
     return Path.home() / ".config" / "ram-keeper" / "config.json"
 
 
@@ -492,6 +565,7 @@ CONFIG_BOUNDS = {
     "min_target_bytes": (4 * 1024 * 1024, 4 * 1024 * 1024 * 1024),
     "interval_idle": (1.0, 3600.0),
     "interval_pressure": (0.5, 600.0),
+    "anon_reclaim_cooldown": (0.0, 600.0),
     "max_reclaim_per_pass": (16 * 1024 * 1024, 32 * 1024 * 1024 * 1024),
     "max_victim_fraction": (5, 60),
     "reclaim_sleep": (0.0, 5.0),
@@ -590,7 +664,7 @@ def load_config() -> dict:
                 if key not in DEFAULT_CONFIG:
                     _CONFIG_WARNINGS.append(f"unknown setting {key!r} ignored")
                     continue
-                if key in ("protected", "never_reclaim"):
+                if key in ("protected", "never_reclaim", "unprotect"):
                     cfg[key] = _coerce_strlist(key, value, DEFAULT_CONFIG[key])
                     # Merge, never replace. If a user adds their own app to
                     # `protected`, replacing the default list would silently
@@ -599,7 +673,7 @@ def load_config() -> dict:
                     # compositor. Adding to the defaults is also what the user
                     # meant. An explicit empty list is still honoured, since
                     # that is an unambiguous statement.
-                    if value:
+                    if value and key != "unprotect":
                         merged = list(DEFAULT_CONFIG[key])
                         for item in cfg[key]:
                             if item not in merged:
@@ -627,6 +701,19 @@ def load_config() -> dict:
             "interval_pressure must be below interval_idle; "
             f"pressure interval set to {max(0.5, cfg['interval_idle'] / 2)}s")
         cfg["interval_pressure"] = max(0.5, cfg["interval_idle"] / 2)
+
+    blocked = []
+    for name in cfg.get("unprotect") or []:
+        if is_inviolable(name):
+            _CONFIG_WARNINGS.append(f"{name} stays protected")
+            continue
+        blocked.append(name)
+    cfg["unprotect"] = blocked
+    if blocked:
+        cfg["protected"] = [item for item in cfg["protected"]
+                            if not names_match(item, blocked)]
+        cfg["never_reclaim"] = [item for item in cfg["never_reclaim"]
+                                if not names_match(item, blocked)]
 
     for warning in _CONFIG_WARNINGS:
         print(f"ram-keeper config: {warning}", file=sys.stderr)
@@ -764,16 +851,18 @@ class TrendTracker:
         """
         if len(window) < 4:
             return ""
-        first, last = window[0], window[-1]
-        span = last[0] - first[0]
-        if span <= 1.0:
-            return ""
+        last = window[-1]
         best_name, best_rate = "", 0.0
         for name, value in last[2].items():
-            start = first[2].get(name)
-            if start is None:
-                continue           # process appeared mid-window: not a trend
-            rate = (value - start) / span
+            # Present in the last few samples, measured from when it appeared.
+            # Requiring it in the first sample hid a leak that started later.
+            if any(name not in sample[2] for sample in window[-3:]):
+                continue
+            first = next(sample for sample in window if name in sample[2])
+            span = last[0] - first[0]
+            if span < 15.0:
+                continue
+            rate = (value - first[2][name]) / span
             if rate > best_rate:
                 best_name, best_rate = name, rate
         # Only name a culprit when the growth is real, not noise.
@@ -802,6 +891,21 @@ class Action:
         return self.outcome in ("ok", "eagain")
 
 
+def manifest_path() -> Path:
+    """The manifest shipped next to this plugin, on disk."""
+    return Path(__file__).resolve().parent.parent / "manifest.json"
+
+
+def plugin_version() -> str:
+    """The version the installed manifest claims, or nothing if it is unreadable."""
+    try:
+        data = json.loads(manifest_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    version = data.get("version") if isinstance(data, dict) else ""
+    return version if isinstance(version, str) else ""
+
+
 @dataclass
 class Steward:
     config: dict = field(default_factory=load_config)
@@ -815,6 +919,13 @@ class Steward:
     last_forecast: Forecast = field(default_factory=Forecast)
     # Rotate the reclaim log at 4 MB; two generations are kept.
     max_log_bytes: int = 4 * 1024 * 1024
+    # Injectable so a test can walk several passes without waiting.
+    _clock: object = field(default=time.monotonic, repr=False, compare=False)
+    _anon_ready_at: dict = field(default_factory=dict, repr=False, compare=False)
+    # Captured once. A later edit of manifest.json must not make this process
+    # claim it is already the new build: the panel compares this string with
+    # the file it reads itself, and restarts the unit when they differ.
+    started_version: str = field(default_factory=plugin_version, repr=False, compare=False)
 
     # -- logging ---------------------------------------------------------
     def log(self, event: dict) -> None:
@@ -882,7 +993,7 @@ class Steward:
 
         protected = set(self.config["protected"])
         never = set(self.config["never_reclaim"])
-        groups = scan(user_root(), protected, int(self.config["min_target_bytes"]))
+        groups = scan(user_root(), protected, int(self.config["min_target_bytes"]), never)
 
         victims = [g for g in groups if not g.protected and not names_match(g.name, never)]
         victims.sort(key=lambda g: g.reclaimable, reverse=True)
@@ -916,8 +1027,32 @@ class Steward:
         # An imminent crossing is pressure the floor does not show yet. Treat
         # it as its own state so the daemon acts before the number moves rather
         # than after — which is the entire reason for having a forecast.
-        if state == "ok" and self.last_forecast.urgency == "imminent":
+        # Remember a stall that this promotion hides. The small-gap trending
+        # path would otherwise return without touching the cache the stall
+        # was supposed to drop.
+        psi_stalling = state == "stalling"
+        if state in ("ok", "stalling") and self.last_forecast.urgency == "imminent":
             state = "trending"
+
+        # A critical machine whose only large cgroups are protected has
+        # nothing the pass can ask. Name those apps so the panel does not
+        # say that nothing is needed.
+        reachable_floor = 64 * 1024 * 1024
+        reachable = [
+            g for g in groups
+            if not g.protected and (g.reclaimable + g.anon) > reachable_floor
+        ]
+        held_by: list[str] = []
+        if state == "critical" and not reachable:
+            seen: list[str] = []
+            big = [g for g in groups
+                   if g.protected and g.current >= int(self.config["min_target_bytes"])]
+            big.sort(key=lambda g: g.current, reverse=True)
+            for holder in big:
+                label = (holder.label or holder.name or "").strip()
+                if label and label not in seen:
+                    seen.append(label)
+            held_by = seen[:8]
 
         # MemAvailable already excludes reclaimable cache, so the honest split of
         # "used" is: real anon+kernel, cache, then free-and-available. `Cached`
@@ -957,10 +1092,13 @@ class Steward:
             "groups": [asdict(g) | {"path": str(g.path)} for g in groups],
             "reclaimable_total": sum(g.reclaimable for g in victims),
             "checked_at": time.time(),
+            "version": self.started_version,
+            "psi_stalling": psi_stalling,
+            "held_by": held_by,
         }
 
     # -- reclamation -----------------------------------------------------
-    def reclaim_from(self, group: Cgroup, amount: int) -> Action:
+    def reclaim_from(self, group: Cgroup, amount: int, cache_only: bool = False) -> Action:
         """Ask one cgroup to give back `amount`. Cache comes off first.
 
         Accounting rule: every number reported here must be something the
@@ -975,18 +1113,29 @@ class Steward:
         before = _read_int(group.path / "memory.current", -1)
         before_swap = cgroup_swap(group.path)
         outcome = "unknown"
-        try:
-            with open(group.reclaim_file, "w", encoding="utf-8") as handle:
-                handle.write(str(amount))
-            outcome = "ok"
-        except FileNotFoundError:
-            outcome = "gone"
-        except PermissionError:
-            outcome = "denied"
-        except OSError as e:
-            # EAGAIN means "could not free that much right now" — the kernel
-            # still reclaimed everything it could. Not a failure.
-            outcome = "eagain" if e.errno == 11 else f"error:{e.errno}"
+        # A cache pass must not swap anonymous pages. `swappiness=0` asks the
+        # kernel for that. Older kernels reject the token with EINVAL; then
+        # the plain byte count is the only write they accept.
+        payloads = [f"{int(amount)} swappiness=0", str(int(amount))] if cache_only else [str(int(amount))]
+        for index, payload in enumerate(payloads):
+            try:
+                with open(group.reclaim_file, "w", encoding="utf-8") as handle:
+                    handle.write(payload)
+                outcome = "ok"
+                break
+            except FileNotFoundError:
+                outcome = "gone"
+                break
+            except PermissionError:
+                outcome = "denied"
+                break
+            except OSError as e:
+                if cache_only and index == 0 and e.errno == errno.EINVAL:
+                    continue
+                # EAGAIN means "could not free that much right now" — the kernel
+                # still reclaimed everything it could. Not a failure.
+                outcome = "eagain" if e.errno == 11 else f"error:{e.errno}"
+                break
 
         self._settle()
         after = _read_int(group.path / "memory.current", -1)
@@ -1098,9 +1247,14 @@ class Steward:
             return {"acted": False,
                     "reason": "memory reading unavailable; refusing to reclaim",
                     "actions": []}
-        if state in ("ok", "stalling") and not force:
+        if state == "ok" and not force:
             return {"acted": False, "reason": f"no pressure (state={state}, free={free_percent}%)",
                     "actions": []}
+        # PSI says the machine is waiting, but the floor is not crossed and the
+        # forecast is not imminent. Drop cache only: swapping anon here is what
+        # turns a stall into the thrash the stall was warning about.
+        if state == "stalling" and not force:
+            cache_only = True
 
         # How much do we actually need? Under real pressure the deficit is the
         # honest number: ask for the shortfall plus headroom, not a fixed
@@ -1123,6 +1277,7 @@ class Steward:
         # Without this, a forecast on a machine with 3.6 GB free fell through to
         # the 64 MB floor and reclaimed from a healthy system — the forecast
         # would have been the cause of the pressure it exists to prevent.
+        trending_sized = False
         if (state == "trending"
                 and forecast.get("urgency") in ("soon", "imminent")
                 and forecast.get("horizon_seconds")
@@ -1139,6 +1294,16 @@ class Steward:
             headroom = self.max_victim_slice()
             slice_of_gap = gap // 3 if horizon < 600 else min(gap // 3, headroom // 2)
             needed = max(min(slice_of_gap, headroom), 64 * 1024 * 1024)
+            trending_sized = True
+
+        # Inside the margin the 512 MB floor would ask for MORE, not less.
+        # A forecast that close to the floor waits; it does not lunge.
+        if state == "trending" and not force and not trending_sized:
+            if snap.get("psi_stalling"):
+                cache_only = True
+            else:
+                return {"acted": False, "reason": "trending within floor margin",
+                        "actions": []}
 
         if force:
             needed = int(self.config["max_reclaim_per_pass"])
@@ -1160,12 +1325,14 @@ class Steward:
         # service that is itself protected.
         _never = set(self.config["never_reclaim"])
         _floor = int(self.config["min_target_bytes"])
-        available = sum((g.get("reclaimable") or 0) + (g.get("anon") or 0)
-                        for g in snap_groups
-                        if not g.get("protected")
-                        and not names_match(g.get("name") or "", _never)
-                        and not is_inviolable(g.get("name") or "")
-                        and (g.get("current") or 0) > _floor)
+        available = sum(
+            (g.get("reclaimable") or 0)
+            + ((g.get("anon") or 0) if (not cache_only and g.get("swapable", True)) else 0)
+            for g in snap_groups
+            if not g.get("protected")
+            and not names_match(g.get("name") or "", _never)
+            and not is_inviolable(g.get("name") or "")
+            and (g.get("current") or 0) > _floor)
         # No floor when there is nothing reachable: a phantom budget reads as
         # work the pass could do, on a pass that can do nothing.
         if available > 0:
@@ -1210,7 +1377,7 @@ class Steward:
                       and g.current > self.config["min_target_bytes"]]
 
         # Pass 1: page cache, cheapest and invisible to the user.
-        if self.config["cache_first"]:
+        if self.config["cache_first"] or cache_only:
             for group in sorted(candidates, key=lambda g: g.reclaimable, reverse=True):
                 if budget <= 0:
                     break
@@ -1219,17 +1386,25 @@ class Steward:
                 ask = min(budget, group.reclaimable, remaining_slice(group))
                 if ask < 16 * 1024 * 1024:
                     continue
-                action = self.reclaim_from(group, ask)
+                action = self.reclaim_from(group, ask, cache_only=True)
                 actions.append(action)
-                budget -= ask      # kernel-visible bytes: the ceiling is what we ASK for
-                asked_bytes[group.name] = asked_bytes.get(group.name, 0) + ask
+                # A cgroup that vanished, or one we may not write, did not take
+                # any of the budget. Charging it anyway ends the pass on a miss.
+                if action.outcome not in ("gone", "denied"):
+                    budget -= ask
+                    asked_bytes[group.name] = asked_bytes.get(group.name, 0) + ask
 
         # Pass 2: anonymous memory to zram. Target the single biggest holder
         # rather than spreading thin slices across everything: one process
         # giving up 500MB in one go is far cheaper than ten processes each
         # faulting a little back in, and it keeps the reclaimed pages
         # together in zram where the compressor works on a contiguous run.
-        if budget > 0 and not cache_only:
+        skipped_anon = ""
+        if budget > 0 and not cache_only and not zram_has_room(snap.get("zram")):
+            # Disk swap is not a fallback. Cache was the action that was
+            # allowed; anonymous pages stay where they are, and the pass says so.
+            skipped_anon = "no-zram-room"
+        elif budget > 0 and not cache_only and zram_has_room(snap.get("zram")):
             for group in sorted(candidates, key=lambda g: g.anon, reverse=True):
                 if budget <= 0:
                     break
@@ -1242,10 +1417,27 @@ class Steward:
                 ask = min(budget, group.anon, remaining_slice(group))
                 if ask < 16 * 1024 * 1024:
                     continue
+                if not force:
+                    ready_at = self._anon_ready_at.get(group.name, 0.0)
+                    if self._clock() < ready_at:
+                        continue
                 action = self.reclaim_from(group, ask)
                 actions.append(action)
+                if action.outcome in ("gone", "denied"):
+                    continue
                 budget -= ask          # kernel-visible bytes: the ceiling is on what we ASK for
                 asked_bytes[group.name] = asked_bytes.get(group.name, 0) + ask
+                try:
+                    pause = float(self.config.get("anon_reclaim_cooldown", 90.0))
+                except (TypeError, ValueError):
+                    pause = 90.0
+                # Critical is the state that cannot wait a minute and a half
+                # for the same victim. The ceiling is per cgroup, and a
+                # shorter configured pause stays shorter.
+                if state == "critical" and math.isfinite(pause):
+                    pause = min(pause, 15.0)
+                if math.isfinite(pause) and pause > 0:
+                    self._anon_ready_at[group.name] = self._clock() + pause
 
         # Pass 3: cgroups with swap disabled are NOT reclaimed.
         # Asking them for anon is a guaranteed EAGAIN that wastes the pass's budget.
@@ -1257,9 +1449,13 @@ class Steward:
 
         real = [a for a in actions if a.freed > 0]
         self.actions_today += len(real)
+        reason = f"state={state}, free={free_percent}%, target={target_free}%"
+        if skipped_anon:
+            reason = "No ram-backed swap with room, so app memory was not moved to disk swap"
         summary = {
             "acted": bool(real),
-            "reason": f"state={state}, free={free_percent}%, target={target_free}%",
+            "reason": reason,
+            "skipped_anon": skipped_anon,
             "requested": needed,
             "freed": sum(a.freed for a in real),
             "swapped_out": sum(a.swapped_out for a in real),
@@ -1267,6 +1463,9 @@ class Steward:
         }
         if real:
             self.log({"event": "reclaim", **summary})
+        if skipped_anon:
+            self.log({"event": "anon-skipped", "skipped_anon": skipped_anon,
+                      "reason": reason, "state": state})
         return summary
 
     def sweep_cache(self) -> dict:
@@ -1276,6 +1475,28 @@ class Steward:
         is what the button in the panel promises.
         """
         return self.relieve(force=True, cache_only=True)
+
+    def supervise_once(self) -> dict:
+        """One measurement, one reclaim when there is pressure, then publish.
+
+        The panel and the notifier read the file this writes. Publishing
+        before the pass used to let them say a reclaim was under way on a
+        pass that had refused to move anything.
+        """
+        snap = self.snapshot()
+        if snap["state"] == "ok":
+            relief = {"acted": False, "reason": "no pressure", "skipped_anon": ""}
+        else:
+            relief = self.relieve(snap)
+            if relief.get("acted"):
+                snap = self.snapshot()
+        snap["relief"] = {
+            "acted": bool(relief.get("acted")),
+            "reason": str(relief.get("reason") or ""),
+            "skipped_anon": str(relief.get("skipped_anon") or ""),
+        }
+        self.publish(snap)
+        return snap
 
     # -- loop ------------------------------------------------------------
     def run_forever(self) -> None:
@@ -1289,34 +1510,33 @@ class Steward:
         """
         self.log({"event": "start", "pid": os.getpid(), "cgroup": self_cgroup()})
         consecutive_failures = 0
-        last_reload = 0.0
-        reload_interval = 300.0
+        seen_mtime = None
 
         while True:
             try:
-                # Pick up an edited config occasionally. Without this the only
-                # way a threshold change takes effect is a restart, and a user
-                # who tuned it would reasonably assume it was live.
-                now = time.monotonic()
-                if now - last_reload > reload_interval:
+                # A panel click writes the config and should be visible on the
+                # next pass, not five minutes later. The sleep also returns
+                # early when the file's mtime changes.
+                try:
+                    mtime = config_path().stat().st_mtime
+                except OSError:
+                    mtime = None
+                if mtime != seen_mtime:
                     self.config = load_config()
-                    last_reload = now
+                    seen_mtime = mtime
                     if _CONFIG_WARNINGS:
                         self.log({"event": "config-warning",
                                   "warnings": list(_CONFIG_WARNINGS)})
 
-                snap = self.snapshot()
-                self.publish(snap)
-                if snap["state"] != "ok":
-                    self.relieve(snap)
+                snap = self.supervise_once()
 
                 consecutive_failures = 0
                 # Only states that relieve() will actually act on. `stalling`
                 # is refused by relieve (the stall is not attributable to any
                 # one cgroup), so ticking at the 5s pressure rate for it just
-                # bought a full 51-cgroup walk and a `swapon` subprocess every
+                # bought a full 51-cgroup walk and a swap read every
                 # five seconds, forever, doing nothing.
-                pressure = snap["state"] in ("tight", "critical", "trending")
+                pressure = snap["state"] in ("tight", "critical", "trending", "stalling")
                 self._sleep(self.config["interval_pressure"] if pressure
                             else self.config["interval_idle"])
 
@@ -1353,7 +1573,21 @@ class Steward:
             value = 20.0
         if not (value == value) or value <= 0 or value == float("inf"):
             value = 20.0
-        time.sleep(min(value, 3600.0))
+        remaining = min(value, 3600.0)
+        try:
+            seen = config_path().stat().st_mtime
+        except OSError:
+            seen = None
+        while remaining > 0:
+            try:
+                current = config_path().stat().st_mtime
+            except OSError:
+                current = None
+            if seen is not None and current != seen:
+                return
+            step = min(1.0, remaining)
+            time.sleep(step)
+            remaining -= step
 
 
 # ---------------------------------------------------------------------------
@@ -1426,11 +1660,85 @@ def add_never_reclaim(name: str) -> list[str]:
         if name not in names:
             names.append(name)
         existing["never_reclaim"] = names
+        raw_unprotect = existing.get("unprotect")
+        if isinstance(raw_unprotect, str):
+            raw_unprotect = [raw_unprotect]
+        if not isinstance(raw_unprotect, list):
+            raw_unprotect = []
+        existing["unprotect"] = [
+            v.strip() for v in raw_unprotect
+            if isinstance(v, str) and v.strip() and not names_match(v, [name])
+        ]
 
         tmp = path.with_suffix(".tmp")
         tmp.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
         tmp.replace(path)
     return names
+
+
+def remove_protection(name: str) -> list[str]:
+    """Take one name off both lists, and keep a default from coming back.
+
+    The stored protected list is merged with the defaults whenever it is
+    non-empty, so deleting ollama from that list would not last. The name is
+    recorded in `unprotect`, which is subtracted after the merge. An inviolable
+    name is refused.
+    """
+    name = (name or "").strip()
+    if not name or any(ord(ch) < 32 or ord(ch) == 127 for ch in name):
+        raise ValueError("cgroup name must be one non-blank line")
+    if is_inviolable(name):
+        raise ValueError(f"{name} stays protected")
+
+    path = config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_suffix(".lock")
+    with open(lock_path, "a", encoding="utf-8") as lock_handle:
+        try:
+            import fcntl
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        except (ImportError, OSError):
+            pass
+
+        existing: dict = {}
+        try:
+            loaded = json.loads(path.read_bytes().decode("utf-8-sig"))
+            if isinstance(loaded, dict):
+                existing = loaded
+        except (OSError, ValueError, UnicodeDecodeError, RecursionError):
+            existing = {}
+
+        def _listed(key: str) -> list[str]:
+            current = existing.get(key)
+            if isinstance(current, str):
+                current = [current]
+            if not isinstance(current, list):
+                current = []
+            return [v.strip() for v in current if isinstance(v, str) and v.strip()]
+
+        def _drop_name(key: str) -> None:
+            # An empty list is how load_config hears "forget the defaults".
+            # Releasing the last name the user wrote must remove the key, so
+            # the patterns come back. The removal itself lives in `unprotect`.
+            if key not in existing:
+                return
+            kept = [v for v in _listed(key) if not names_match(v, [name])]
+            if kept:
+                existing[key] = kept
+            else:
+                existing.pop(key, None)
+
+        _drop_name("protected")
+        _drop_name("never_reclaim")
+        gone = _listed("unprotect")
+        if not any(names_match(v, [name]) for v in gone):
+            gone.append(name)
+        existing["unprotect"] = gone
+
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
+        tmp.replace(path)
+    return existing["unprotect"]
 
 
 def main() -> int:
@@ -1445,7 +1753,26 @@ def main() -> int:
                         help="drop reclaimable page cache now")
     parser.add_argument("--protected-add", metavar="CGROUP",
                         help="add a cgroup to the never-reclaim list")
+    parser.add_argument("--protected-remove", metavar="CGROUP",
+                        help="stop protecting a cgroup the defaults would keep")
     args = parser.parse_args()
+
+    if args.protected_add and args.protected_remove:
+        print("ram-keeper: pass only one of --protected-add and --protected-remove",
+              file=sys.stderr)
+        return 2
+
+    if args.protected_remove:
+        try:
+            lst = remove_protection(args.protected_remove)
+        except ValueError as exc:
+            print(f"ram-keeper: {exc}", file=sys.stderr)
+            return 2
+        except OSError as exc:
+            print(f"ram-keeper: could not write config: {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps({"unprotect": lst}))
+        return 0
 
     if args.protected_add:
         try:
@@ -1472,10 +1799,12 @@ def main() -> int:
 
     if args.relieve:
         print(json.dumps(steward.relieve(force=True), default=str))
+        steward.publish(steward.snapshot())
         return 0
 
     if args.sweep_cache:
         print(json.dumps(steward.sweep_cache(), default=str))
+        steward.publish(steward.snapshot())
         return 0
 
     if args.daemon:

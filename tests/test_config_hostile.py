@@ -2,10 +2,12 @@
 disable the daemon. Each must now degrade to a working configuration.
 """
 import json, subprocess, sys, tempfile, os
-
-
-import sys
 from pathlib import Path
+
+# A private config. This suite used to overwrite the real file and restore it.
+_CFG_DIR = tempfile.mkdtemp(prefix="rk-config-")
+os.environ["RAM_KEEPER_CONFIG"] = str(Path(_CFG_DIR) / "config.json")
+os.environ.setdefault("RAM_KEEPER_STATE_DIR", tempfile.mkdtemp(prefix="rk-state-"))
 
 # ---------------------------------------------------------------------------
 # This suite exercises the live machine: it runs the daemon, reads real
@@ -16,10 +18,9 @@ from pathlib import Path
 import os as _os
 import sys
 
-if not _os.path.exists("/sys/fs/cgroup/user.slice") or not _os.environ.get("CI"):
-    pass
-elif _os.environ.get("RAM_KEEPER_LIVE") != "1":
-    print("  --   live suite skipped (no RAM_KEEPER_LIVE on a CI runner)")
+if (not _os.path.exists("/sys/fs/cgroup/user.slice")
+        or (_os.environ.get("CI") and _os.environ.get("RAM_KEEPER_LIVE") != "1")):
+    print("  --   live suite skipped (no user cgroup, or CI without RAM_KEEPER_LIVE=1)")
     sys.exit(0)
 
 
@@ -29,34 +30,30 @@ PLUGIN = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PLUGIN / "helper"))
 
 HELPER = str(PLUGIN / "helper" / "ram_keeper.py")
-REAL = Path.home() / ".config/ram-keeper/config.json"
+CFG = Path(os.environ["RAM_KEEPER_CONFIG"])
+
 def run_with(cfg_text, label):
-    """Run --once with a specific config file, restore the real one after."""
-    backup = REAL.read_text() if REAL.exists() else None
-    try:
-        REAL.parent.mkdir(parents=True, exist_ok=True)
-        REAL.write_text(cfg_text)
-        p = subprocess.run(["/usr/bin/python3", HELPER, "--once"],
-                           capture_output=True, text=True, timeout=60)
-        ok_exit = p.returncode == 0
-        cfg = {}
-        if ok_exit:
-            cfg = json.loads(p.stdout)
-        print(f"  {'ok  ' if ok_exit else 'FAIL'} {label}")
-        if not ok_exit:
-            print(f"       exit={p.returncode} stderr={p.stderr.strip()[:200]}")
-        else:
-            warn = [l for l in p.stderr.splitlines() if "config:" in l]
-            if warn:
-                print(f"       warned: {warn[0].strip()[:110]}")
-            if cfg:
-                print(f"       target={cfg.get('state')} free={cfg.get('free_percent')}%")
-        return ok_exit, cfg, p.stderr
-    finally:
-        if backup is not None:
-            REAL.write_text(backup)
-        elif REAL.exists():
-            REAL.unlink()
+    """Run --once against the throwaway config named by RAM_KEEPER_CONFIG."""
+    CFG.parent.mkdir(parents=True, exist_ok=True)
+    CFG.write_text(cfg_text)
+    env = os.environ.copy()
+    env["RAM_KEEPER_CONFIG"] = str(CFG)
+    p = subprocess.run(["/usr/bin/python3", HELPER, "--once"],
+                       capture_output=True, text=True, timeout=60, env=env)
+    ok_exit = p.returncode == 0
+    cfg = {}
+    if ok_exit:
+        cfg = json.loads(p.stdout)
+    print(f"  {'ok  ' if ok_exit else 'FAIL'} {label}")
+    if not ok_exit:
+        print(f"       exit={p.returncode} stderr={p.stderr.strip()[:200]}")
+    else:
+        warn = [l for l in p.stderr.splitlines() if "config:" in l]
+        if warn:
+            print(f"       warned: {warn[0].strip()[:110]}")
+        if cfg:
+            print(f"       target={cfg.get('state')} free={cfg.get('free_percent')}%")
+    return ok_exit, cfg, p.stderr
 def main():
     cases = [
         ("valid override",            json.dumps({"target_free_percent": 22.0})),
@@ -104,35 +101,26 @@ def main():
     # read the repaired config directly from the module
     for mod in [m for m in list(sys.modules) if m == "ram_keeper"]:
         del sys.modules[mod]
-    REAL.parent.mkdir(parents=True, exist_ok=True)
-    backup = REAL.read_text() if REAL.exists() else None
-    try:
-        REAL.write_text(json.dumps({"target_free_percent": 5.0, "critical_free_percent": 40.0,
-                                    "interval_idle": 5.0, "interval_pressure": 60.0,
-                                    "max_reclaim_per_pass": 0,
-                                    "never_reclaim": "solo.scope",
-                                    "target_free_percent": 5.0}))
-        import importlib
-        rk = importlib.import_module("ram_keeper")
-        c = rk.load_config()
-        print(f"  critical={c['critical_free_percent']} target={c['target_free_percent']} "
-              f"-> critical < target: {c['critical_free_percent'] < c['target_free_percent']}")
-        print(f"  interval_idle={c['interval_idle']} pressure={c['interval_pressure']} "
-              f"-> pressure < idle: {c['interval_pressure'] < c['interval_idle']}")
-        print(f"  max_reclaim={c['max_reclaim_per_pass']} -> > 0: {c['max_reclaim_per_pass'] > 0}")
-        print(f"  never_reclaim={c['never_reclaim']} -> is a list of str: "
-              f"{isinstance(c['never_reclaim'], list) and all(isinstance(x, str) for x in c['never_reclaim'])}")
-        ok2 = (c["critical_free_percent"] < c["target_free_percent"]
-               and c["interval_pressure"] < c["interval_idle"]
-               and c["max_reclaim_per_pass"] > 0)
-        print(f"  ALL RELATIONSHIPS HOLD: {ok2}")
-        if not ok2:
-            failures += 1
-    finally:
-        if backup is not None:
-            REAL.write_text(backup)
-        elif REAL.exists():
-            REAL.unlink()
+    CFG.write_text(json.dumps({"target_free_percent": 5.0, "critical_free_percent": 40.0,
+                                "interval_idle": 5.0, "interval_pressure": 60.0,
+                                "max_reclaim_per_pass": 0,
+                                "never_reclaim": "solo.scope"}))
+    import importlib
+    rk = importlib.import_module("ram_keeper")
+    c = rk.load_config()
+    print(f"  critical={c['critical_free_percent']} target={c['target_free_percent']} "
+          f"-> critical < target: {c['critical_free_percent'] < c['target_free_percent']}")
+    print(f"  interval_idle={c['interval_idle']} pressure={c['interval_pressure']} "
+          f"-> pressure < idle: {c['interval_pressure'] < c['interval_idle']}")
+    print(f"  max_reclaim={c['max_reclaim_per_pass']} -> > 0: {c['max_reclaim_per_pass'] > 0}")
+    print(f"  never_reclaim={c['never_reclaim']} -> is a list of str: "
+          f"{isinstance(c['never_reclaim'], list) and all(isinstance(x, str) for x in c['never_reclaim'])}")
+    ok2 = (c["critical_free_percent"] < c["target_free_percent"]
+           and c["interval_pressure"] < c["interval_idle"]
+           and c["max_reclaim_per_pass"] > 0)
+    print(f"  ALL RELATIONSHIPS HOLD: {ok2}")
+    if not ok2:
+        failures += 1
     print("\nALL PASS" if failures == 0 else f"\n{failures} FAILURES")
     assert failures == 0, f"{failures} failures"
 

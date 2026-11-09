@@ -7,7 +7,12 @@ from pathlib import Path
 PLUGIN = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PLUGIN / "helper"))
 
-import json, sys, subprocess
+import json, os, subprocess, tempfile
+from pathlib import Path as _Path
+
+_CFG_DIR = tempfile.mkdtemp(prefix="rk-config-")
+os.environ["RAM_KEEPER_CONFIG"] = str(_Path(_CFG_DIR) / "config.json")
+os.environ.setdefault("RAM_KEEPER_STATE_DIR", tempfile.mkdtemp(prefix="rk-state-"))
 
 # ---------------------------------------------------------------------------
 # This suite exercises the live machine: it runs the daemon, reads real
@@ -17,26 +22,26 @@ import json, sys, subprocess
 # ---------------------------------------------------------------------------
 import os as _os
 import sys
-if not _os.path.exists("/sys/fs/cgroup/user.slice") or not _os.environ.get("CI"):
-    pass
-elif _os.environ.get("RAM_KEEPER_LIVE") != "1":
-    print("  --   live suite skipped (no RAM_KEEPER_LIVE on a CI runner)")
-    import sys
+if (not _os.path.exists("/sys/fs/cgroup/user.slice")
+        or (_os.environ.get("CI") and _os.environ.get("RAM_KEEPER_LIVE") != "1")):
+    print("  --   live suite skipped (no user cgroup, or CI without RAM_KEEPER_LIVE=1)")
     sys.exit(0)
 
 
 
 def main():
-    REAL = Path.home()/".config/ram-keeper/config.json"
-    backup = REAL.read_text() if REAL.exists() else None
+    cfg_path = _Path(os.environ["RAM_KEEPER_CONFIG"])
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
 
-    HELPER = str(PLUGIN / "helper" / "ram_keeper.py")
     def victims_with(cfg):
-        REAL.parent.mkdir(parents=True, exist_ok=True)
-        REAL.write_text(json.dumps(cfg))
-        out = subprocess.run(["/usr/bin/python3", HELPER, "--once"],
-                             capture_output=True, text=True, timeout=60)
-        d = json.loads(out.stdout)
+        cfg_path.write_text(json.dumps(cfg))
+        import importlib
+        if "ram_keeper" in sys.modules:
+            del sys.modules["ram_keeper"]
+        rk = importlib.import_module("ram_keeper")
+        # Measure now. A published state.json can be minutes old and would
+        # hide the config this test just wrote.
+        d = rk.Steward().snapshot()
         v = [g["name"] for g in d["groups"] if not g["protected"]]
         return d, v
     try:
@@ -73,6 +78,9 @@ def main():
                           ("session-2.scope", True),
                           ("quickshell", True),
                           ("ram-keeper.service", True),
+                          ("ram-keeper-notify.service", True),
+                          ("app-quickshell-1043.scope", True),
+                          ("app-minha-session.scope", False),
                           ("app-org.chromium.Chromium-123.scope", False),
                           ("syncthing.service", False),
                           ("session.slice", True),
@@ -82,10 +90,12 @@ def main():
             if not ok: failures += 1
             print(f"  {'ok  ' if ok else 'FAIL'} is_inviolable({n!r}) = {got} (expected {expect})")
         print("\nALL PASS" if failures == 0 else f"\n{failures} FAILURES")
-    finally:
-        if backup is not None: REAL.write_text(backup)
-        elif REAL.exists(): REAL.unlink()
+        return failures
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(1 if main() else 0)

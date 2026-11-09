@@ -99,9 +99,8 @@ Panel {
     anchors.fill: parent
     bar: root.bar
     slotSize: root.barWidth
-    text: root.showPercent && !root.verticalBar
-      ? root.percentText + " " + root.glyph
-      : root.glyph
+    text: root.glyph
+    labelText: (root.showPercent && !root.verticalBar) ? root.percentText : ""
     tooltipText: root.loaded
       ? (Model.isUnknown(root.state)
           ? "Memory reading unavailable"
@@ -133,12 +132,17 @@ Panel {
       onCloseRequested: root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
 
-      Column {
-        id: column
-        anchors.left: parent.left
-        anchors.right: parent.right
-        anchors.top: parent.top
-        spacing: Style.space(12)
+      Flickable {
+        anchors.fill: parent
+        contentHeight: column.implicitHeight
+        boundsBehavior: Flickable.StopAtBounds
+        flickableDirection: Flickable.VerticalFlick
+        clip: true
+
+        Column {
+          id: column
+          width: parent.width
+          spacing: Style.space(12)
 
         // ---------------------------------------------------------- hero
         PanelHero {
@@ -174,7 +178,7 @@ Panel {
               iconText: "󰐲"
               tooltipText: !root.actionsReady ? "Not connected"
                 : (root.daemonUp ? "Automatic protection is on" : "Automatic protection is off")
-              foreground: root.foreground
+              foreground: root.daemonUp ? root.foreground : root.urgentColor
               hoverColor: root.daemonUp ? root.foreground : root.urgentColor
               enabled: root.actionsReady
               onClicked: {
@@ -286,7 +290,7 @@ Panel {
 
           Button {
             width: (parent.width - Style.space(8)) / 2
-            text: root.busy ? "Working…" : "Free memory now"
+            text: root.keeper && root.keeper.activeAction === "relieve" ? "Working…" : "Free memory now"
             // `keeper` is null until the service loads. `!root.busy` alone is
             // then true, which INVERTS the guard and leaves an enabled button
             // whose handler throws on a null object.
@@ -298,7 +302,7 @@ Panel {
 
           Button {
             width: (parent.width - Style.space(8)) / 2
-            text: "Drop cache"
+            text: root.keeper && root.keeper.activeAction === "sweep" ? "Working…" : "Drop cache"
             enabled: root.actionsReady && !root.busy
             foreground: root.foreground
             accent: root.accentColor
@@ -450,6 +454,22 @@ Panel {
             }
 
             Text {
+              anchors.right: reclaimSize.left
+              anchors.rightMargin: Style.space(8)
+              anchors.verticalCenter: parent.verticalCenter
+              visible: modelData.action === "protect"
+              text: "Protect"
+              color: root.accentColor
+              font.family: Style.font.family
+              font.pixelSize: Style.font.bodySmall
+              MouseArea {
+                anchors.fill: parent
+                onClicked: if (root.keeper) root.keeper.protect(modelData.key)
+              }
+            }
+
+            Text {
+              id: reclaimSize
               anchors.right: parent.right
               anchors.verticalCenter: parent.verticalCenter
               text: Model.formatBytes(modelData.bytes)
@@ -498,6 +518,22 @@ Panel {
             }
 
             Text {
+              anchors.right: sizeText.left
+              anchors.rightMargin: Style.space(8)
+              anchors.verticalCenter: parent.verticalCenter
+              visible: modelData.action === "release"
+              text: "Release"
+              color: root.accentColor
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
+              MouseArea {
+                anchors.fill: parent
+                onClicked: if (root.keeper) root.keeper.unprotect(modelData.key)
+              }
+            }
+
+            Text {
+              id: sizeText
               anchors.right: parent.right
               anchors.verticalCenter: parent.verticalCenter
               text: Model.formatBytes(modelData.bytes)
@@ -518,9 +554,7 @@ Panel {
 
           Text {
             width: parent.width
-            text: root.daemonUp
-              ? "Watching automatically · nothing needed from you"
-              : "Automatic protection is paused"
+            text: Model.watchLine(root.snap, root.daemonUp)
             color: root.daemonUp ? Qt.darker(root.foreground, 1.5) : root.urgentColor
             font.family: Style.font.family
             font.pixelSize: Style.font.caption
@@ -541,3 +575,5 @@ Panel {
     }
   }
 }
+}
+

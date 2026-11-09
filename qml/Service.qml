@@ -18,8 +18,16 @@ import "Model.js" as Model
 Item {
   id: root
 
-  property var manifest: null
   property var shell: null
+
+  // The installed manifest, read by this panel. The shell does not have to
+  // inject one: a missing injection used to make the version check a no-op.
+  readonly property string manifestPath: {
+    var helper = decodeURIComponent(
+      String(Qt.resolvedUrl("../helper/ram_keeper.py")).replace(/^file:\/\//, ""))
+    return helper.replace("/helper/ram_keeper.py", "/manifest.json")
+  }
+  property string diskVersion: ""
 
   // Quattro sanitizes third-party manifests, so resolve the helper from this
   // component and decode the file URL before handing it to a process.
@@ -37,17 +45,23 @@ Item {
   // always with an empty trend history so the forecast showed nothing.
   readonly property string statePath:
     Quickshell.env("HOME") + "/.local/state/ram-keeper/state.json"
+  readonly property string pauseFlagPath:
+    Quickshell.env("HOME") + "/.local/state/ram-keeper/paused-by-user"
 
   property var snapshot: ({})
   property bool loaded: false
   property string lastError: ""
   property bool busy: false
+  property string activeAction: ""
   property string lastResult: ""
 
   // Whether the systemd unit is actually running. Read back from systemctl
   // rather than assumed from our own start/stop calls, so the panel tells the
   // truth even if the unit was stopped from outside the panel.
   property bool daemonUp: false
+  property bool pausedByUser: false
+  property bool pauseKnown: false
+  property bool versionRestarted: false
   // Wall-clock of the last snapshot the daemon published.
   property double lastHeartbeat: 0
   // Incremented by the poll timer and surfaced over IPC, so a stalled panel is
@@ -69,7 +83,6 @@ Item {
   function applySnapshot(raw) {
     var parsed = Model.parseSnapshot(raw)
     if (!parsed) return          // partial write or not published yet; keep last good
-    root.lastError = ""
     root.snapshot = parsed
     root.loaded = true
     // checked_at is the daemon's own clock at the moment it measured, so a
@@ -77,6 +90,41 @@ Item {
     if (parsed.checked_at) root.lastHeartbeat = parsed.checked_at
     root.noteHeartbeat()
     root.daemonActive()
+    root.considerVersionRestart()
+  }
+
+  // The daemon publishes the version it loaded at start. This file is the
+  // version on disk now. They differ after `omarchy plugin update` until the
+  // unit is restarted. One restart per shell start: the flag is not cleared.
+  function considerVersionRestart() {
+    var running = root.snapshot && root.snapshot.version ? String(root.snapshot.version) : ""
+    if (running && root.diskVersion && running !== root.diskVersion
+        && !root.pausedByUser && !root.versionRestarted) {
+      root.versionRestarted = true
+      root.lastError = "Restarting protection so it matches this version"
+      if (!versionRestart.running) {
+        versionRestart.command = ["systemctl", "--user", "restart", root.unitName]
+        versionRestart.running = true
+      }
+    }
+  }
+
+  function refreshManifest() {
+    if (!manifestReader || manifestReader.running) return
+    manifestReader.command = ["cat", root.manifestPath]
+    manifestReader.running = true
+  }
+
+  function applyManifest(raw) {
+    var parsed = null
+    try {
+      parsed = JSON.parse(String(raw || ""))
+    } catch (e) {
+      return
+    }
+    if (!parsed || !parsed.version) return
+    root.diskVersion = String(parsed.version)
+    root.considerVersionRestart()
   }
 
   // ---------------------------------------------------------------------
@@ -86,14 +134,32 @@ Item {
   function relieve() {
     if (root.busy) return
     root.busy = true
-    actionProc.command = ["/usr/bin/python3", root.helperPath, "--relieve"]
+    root.activeAction = "relieve"
+    actionProc.command = ["python3", root.helperPath, "--relieve"]
     actionProc.running = true
+  }
+
+  property string listVerb: "release"
+
+  function protect(name) {
+    if (!name || protectProc.running) return
+    root.listVerb = "protect"
+    protectProc.command = ["python3", root.helperPath, "--protected-add", name]
+    protectProc.running = true
+  }
+
+  function unprotect(name) {
+    if (!name || protectProc.running) return
+    root.listVerb = "release"
+    protectProc.command = ["python3", root.helperPath, "--protected-remove", name]
+    protectProc.running = true
   }
 
   function sweep() {
     if (root.busy) return
     root.busy = true
-    actionProc.command = ["/usr/bin/python3", root.helperPath, "--sweep-cache"]
+    root.activeAction = "sweep"
+    actionProc.command = ["python3", root.helperPath, "--sweep-cache"]
     actionProc.running = true
   }
 
@@ -138,6 +204,10 @@ Item {
   // reported "Automatic protection is paused" while the daemon was running.
   // A UI that lies about whether protection is on is worse than no indicator.
   function daemonActive() {
+    if (root.pausedByUser) {
+      root.daemonUp = false
+      return
+    }
     var now = Date.now() / 1000;
     root.daemonUp = (now - root.lastHeartbeat) < 180;
   }
@@ -152,16 +222,23 @@ Item {
   }
 
   function startDaemon() {
-    if (!daemonStart.running) {
-      daemonStart.command = ["systemctl", "--user", "start", root.unitName]
-      daemonStart.running = true
+    root.pausedByUser = false
+    root.daemonUp = false
+    if (!pauseClear.running) {
+      pauseClear.command = ["rm", "-f", root.pauseFlagPath]
+      pauseClear.running = true
     }
   }
 
   function stopDaemon() {
-    if (!daemonStop.running) {
-      daemonStop.command = ["systemctl", "--user", "stop", root.unitName]
-      daemonStop.running = true
+    root.pausedByUser = true
+    root.daemonUp = false
+    root.lastHeartbeat = 0
+    if (!pauseWrite.running) {
+      pauseWrite.command = ["python3", "-c",
+        "import pathlib,sys; pathlib.Path(sys.argv[1]).parent.mkdir(parents=True, exist_ok=True); pathlib.Path(sys.argv[1]).write_text('1\\n')",
+        root.pauseFlagPath]
+      pauseWrite.running = true
     }
   }
 
@@ -183,6 +260,14 @@ Item {
   // Reading the path directly always resolves the current inode. Five kilobytes
   // every five seconds is nothing.
   Process {
+    id: manifestReader
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.applyManifest(text)
+    }
+  }
+
+  Process {
     id: stateReader
     // Command assigned in refresh(), not here: a declaration-time command
     // binding made this Process static and, with it, every Timer in this Item —
@@ -193,6 +278,18 @@ Item {
     }
     onExited: function(code) {
       if (code !== 0 && root.loaded) root.daemonActive()
+    }
+  }
+
+  Process {
+    id: protectProc
+    onExited: function(exitCode) {
+      if (exitCode !== 0) {
+        root.lastError = root.listVerb === "protect"
+          ? "Could not protect that app"
+          : "Could not release that app"
+      }
+      root.refresh()
     }
   }
 
@@ -212,7 +309,47 @@ Item {
     }
     onExited: {
       root.busy = false
+      root.activeAction = ""
       actionDoneTimer.restart()
+    }
+  }
+
+  Process {
+    id: pauseWrite
+    onExited: function(exitCode) {
+      if (exitCode !== 0) root.lastError = "Could not remember that protection is paused"
+      if (!daemonStop.running) {
+        daemonStop.command = ["systemctl", "--user", "stop", root.unitName]
+        daemonStop.running = true
+      }
+    }
+  }
+
+  Process {
+    id: pauseClear
+    onExited: function(exitCode) {
+      if (exitCode !== 0) root.lastError = "Could not clear the pause"
+      if (!daemonStart.running) {
+        daemonStart.command = ["systemctl", "--user", "start", root.unitName]
+        daemonStart.running = true
+      }
+    }
+  }
+
+  Process {
+    id: pauseRead
+    onExited: function(code) {
+      root.pausedByUser = (code === 0)
+      root.pauseKnown = true
+      root.daemonActive()
+      if (!root.pausedByUser) startDaemonTimer.restart()
+    }
+  }
+
+  Process {
+    id: versionRestart
+    onExited: function(exitCode) {
+      if (exitCode !== 0) root.lastError = "Could not restart protection for this version"
     }
   }
 
@@ -244,7 +381,10 @@ Item {
     id: actionDoneTimer
     interval: 9000
     repeat: false
-    onTriggered: root.lastResult = ""
+    onTriggered: {
+      root.lastResult = ""
+      root.lastError = ""
+    }
   }
 
   Timer {
@@ -270,6 +410,7 @@ Item {
       root.pollTicks += 1;
       root.daemonActive();
       root.refresh();
+      root.refreshManifest();
     }
   }
 
@@ -278,15 +419,19 @@ Item {
     // Bring the daemon up on first load so the protection exists before the
     // user ever needs it. If the unit is missing, say so once instead of
     // failing silently on every check.
-    startDaemonTimer.restart()
+    pauseRead.command = ["test", "-f", root.pauseFlagPath]
+    pauseRead.running = true
     root.refresh()
+    root.refreshManifest()
   }
 
   Timer {
     id: startDaemonTimer
     interval: 600
     repeat: false
-    onTriggered: root.startDaemon()
+    onTriggered: {
+      if (root.pauseKnown && !root.pausedByUser) root.startDaemon()
+    }
   }
 
   // ---------------------------------------------------------------------

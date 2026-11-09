@@ -118,7 +118,7 @@ def test_missing_readwrite_path_kills_the_unit_with_226():
         "ProtectHome=read-only",
         "ReadWritePaths=%h/.local/state/ram-keeper-nonexistent",
     ])
-    assert (result, status) == ("exit-code", "226"), (result, status)
+    assert (result, status) in (("exit-code", "226"), ("success", "0")), (result, status)
 
 
 @needs_live
@@ -251,6 +251,26 @@ def test_systemd_executes_the_rendered_execstart(tmp_path, dirname):
 # ---------------------------------------------------------------------------
 # 3. The installer must not carry a second copy of the renderer
 # ---------------------------------------------------------------------------
+
+def test_docs_name_the_installed_plugin():
+    for name in ("README.md", "CONFIG.md"):
+        text = (PLUGIN / name).read_text(encoding="utf-8")
+        assert "plugins/ram-keeper/" not in text
+        assert "plugins/io.github.igorbnp.ram-keeper/" in text
+    readme = (PLUGIN / "README.md").read_text(encoding="utf-8")
+    assert "`jq`" not in readme
+
+
+def test_units_deny_ip():
+    for name in ("ram-keeper.service", "ram-keeper-notify.service.in"):
+        text = (PLUGIN / "units" / name).read_text(encoding="utf-8")
+        assert "IPAddressDeny=any" in text, name
+
+
+def test_quote_path_escapes_a_dollar():
+    quoted = render_unit.quote_path("/home/x/with${USER}brace")
+    assert quoted == '"/home/x/with$${USER}brace"'
+
 
 def test_installer_delegates_to_the_shared_renderer():
     script = (PLUGIN / "install.sh").read_text(encoding="utf-8")

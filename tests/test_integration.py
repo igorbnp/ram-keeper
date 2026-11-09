@@ -133,11 +133,9 @@ class TestGuardianToRamKeeper:
 class TestScanWithGuardian:
     """Tests for ram_keeper scan combined with process_guardian detection."""
 
-    def test_scan_respects_guardian_protection(self, integrated_config, mock_system_state):
+    def test_scan_respects_guardian_protection(self, integrated_config, mock_system_state, tmp_path):
         """ram_keeper scan should respect protection from guardian."""
-        # Create a mock cgroup tree
-        tmp_path = Path("/tmp/test_cgroup")
-        tmp_path.mkdir(exist_ok=True)
+        # Create a mock cgroup tree in the test's own directory.
 
         # Create cgroups
         for pid, info in mock_system_state["processes"].items():

@@ -342,6 +342,11 @@ class TestIsCriticalProcess:
         result, _ = pg._is_critical_process(proc)
         assert result is True
 
+    def test_a_name_that_contains_session_is_not_the_session(self):
+        proc = pg.ProcessInfo(pid=1, name="app", cgroup="/user.slice/app-minha-session.scope")
+        result, _ = pg._is_critical_process(proc)
+        assert result is False
+
     def test_regular_app_is_not_critical(self):
         """Regular apps should not be critical."""
         proc = pg.ProcessInfo(pid=1, name="firefox", cgroup="/user.slice/app-firefox.scope")
@@ -430,3 +435,15 @@ class TestGetProtectedCgroupNames:
         """Should return empty set for empty list."""
         result = pg.get_protected_cgroup_names([])
         assert result == set()
+
+
+def test_evaluate_stops_at_max_processes(monkeypatch):
+    procs = [
+        pg.ProcessInfo(pid=i, name=f"app{i}", cgroup=f"/user.slice/app-{i}.scope")
+        for i in range(3)
+    ]
+    monkeypatch.setattr(pg, "detect_new_processes", lambda *a, **k: procs)
+    monkeypatch.setattr(pg, "get_process_description", lambda proc: "")
+    cfg = pg.GuardianConfig(max_processes=1)
+    got = pg.evaluate_new_processes(set(), cfg)
+    assert len(got) == 1
