@@ -8,7 +8,10 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # ubuntu-latest passou a apontar para 26.04 em 19/10/2026, e o toolcache
+    # dessa imagem não traz Python 3.9 — a matriz inteira caía antes do
+    # primeiro passo. Fixar em 24.04 mantém as cinco versões rodando.
+    runs-on: ubuntu-24.04
     strategy:
       matrix:
         python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
