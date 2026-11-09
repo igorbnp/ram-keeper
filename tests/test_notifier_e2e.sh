@@ -134,6 +134,11 @@ else
   bad "a dead OOM watcher was never restarted (journalctl ran $calls time)"
 fi
 check "the same kill produced exactly one toast" "$(toast_count)" "1"
+if grep -q 'hog' "$STUB/toasts"; then
+  ok "the toast names the killed process"
+else
+  bad "the toast omitted the killed process name"
+fi
 unset RAM_KEEPER_DAEMON_POLL RAM_KEEPER_PRESSURE_POLL
 
 echo

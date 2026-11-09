@@ -268,5 +268,24 @@ if "root.daemonUp ? root.foreground : root.urgentColor" not in panel:
 else:
     print("  ok   the off button uses the warning colour at rest")
 
+# BarIconButton contract: glyph in text, label in labelText.
+# Putting percentText in text squeezes the whole string into a 16px square.
+if "BarIconButton {" not in panel:
+    fails += 1
+    print("  FAIL Panel.qml is missing BarIconButton")
+else:
+    bar_btn = panel.split("BarIconButton {", 1)[1].split("KeyboardPanel {", 1)[0]
+    if "labelText:" not in bar_btn or "percentText" in bar_btn.split("text:", 1)[1].split("\n", 1)[0]:
+        fails += 1
+        print("  FAIL BarIconButton does not separate icon text and labelText")
+    else:
+        print("  ok   BarIconButton separates icon text and percentage labelText")
+
+if "Flickable {" not in panel or "boundsBehavior: Flickable.StopAtBounds" not in panel or "clip: true" not in panel:
+    fails += 1
+    print("  FAIL Panel content lacks a bounded Flickable scroll container")
+else:
+    print("  ok   Panel content uses a bounded Flickable scroll container")
+
 print("\n" + ("QML structure ok" if fails == 0 else "%d file(s) suspect" % fails))
 assert fails == 0, f"Test failed: {fails} failures"

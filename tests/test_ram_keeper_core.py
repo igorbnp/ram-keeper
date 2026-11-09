@@ -1172,3 +1172,21 @@ class TestPublishedSnapshot:
                    return_value=tmp_path / ".local/state/ram-keeper"):
             result = rk.published_snapshot()
             assert result is None
+
+
+class TestSuperviseOnce:
+    def test_acted_relief_refreshes_published_snapshot(self, tmp_path):
+        """When relief acts, supervise_once must publish fresh post-reclaim metrics."""
+        steward = rk.Steward()
+        steward.state_path = tmp_path / "state.json"
+        first_snap = {"state": "critical", "free_percent": 8.0, "mem_available": 100}
+        second_snap = {"state": "ok", "free_percent": 25.0, "mem_available": 500}
+
+        calls = [first_snap, second_snap]
+        with patch.object(steward, "snapshot", side_effect=lambda: calls.pop(0) if calls else second_snap), \
+             patch.object(steward, "relieve", return_value={"acted": True, "reason": "reclaimed"}):
+            published = steward.supervise_once()
+            assert published["state"] == "ok"
+            assert published["free_percent"] == 25.0
+            assert published["relief"]["acted"] is True
+

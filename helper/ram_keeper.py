@@ -1488,6 +1488,8 @@ class Steward:
             relief = {"acted": False, "reason": "no pressure", "skipped_anon": ""}
         else:
             relief = self.relieve(snap)
+            if relief.get("acted"):
+                snap = self.snapshot()
         snap["relief"] = {
             "acted": bool(relief.get("acted")),
             "reason": str(relief.get("reason") or ""),

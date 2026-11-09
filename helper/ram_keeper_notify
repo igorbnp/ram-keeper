@@ -203,10 +203,31 @@ watch_oom_kills() {
         key="oom-$(printf '%s' "$line" | md5sum | cut -c1-8)"
         should_announce "$key" || continue
         log_event "oom-kill"
+
+        local victim=""
+        if [[ "$line" =~ Killed\ process\ [0-9]+\ \(([^\)]+)\) ]]; then
+          victim="${BASH_REMATCH[1]}"
+        elif [[ "$line" =~ Marked\ (.+)\ for\ killing ]]; then
+          victim="$(basename "${BASH_REMATCH[1]}")"
+          victim="${victim%.scope}"
+          victim="${victim%.service}"
+        fi
+
+        local title body prompt_text
+        if [[ -n "$victim" ]]; then
+          title="Process closed: $victim ran out of memory"
+          body="The system stopped $victim to protect your desktop. Click to diagnose."
+          prompt_text="The system OOM killer stopped the process '$victim' for using too much memory. Use the ram-memory-diagnosis skill to work out what happened and what to change."
+        else
+          title="A process was killed for using too much memory"
+          body="RAM Keeper should have prevented this. Click to find out what happened."
+          prompt_text="systemd-oomd just killed a process on this machine for using too much memory. Use the ram-memory-diagnosis skill to work out what happened and what to change."
+        fi
+
         send critical "$ALERT_GLYPH" \
-          "A process was killed for using too much memory" \
-          "RAM Keeper should have prevented this. Click to find out what happened." \
-          "$(agent_action "systemd-oomd just killed a process on this machine for using too much memory. Use the ram-memory-diagnosis skill to work out what happened and what to change.")"
+          "$title" \
+          "$body" \
+          "$(agent_action "$prompt_text")"
       done
 }
 
