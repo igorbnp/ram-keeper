@@ -1,0 +1,7 @@
+{
+  "ensaio": "clone-juncao",
+  "afeta": "sem-grafo",
+  "motivo": "Repositorio entrou no Forgejo em 2026-11-10: suite em tests/ e pytest/shell para Linux (nao roda por unittest discover no PC1); sem grafo de consumidores",
+  "dono": "orquestrador",
+  "prazo": "2027-01-31"
+}
