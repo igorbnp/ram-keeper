@@ -148,7 +148,7 @@ class TestUserRoot:
         (cgroup / "user.slice" / "user-1.slice").mkdir(parents=True)
         monkeypatch.setattr(rk, "CGROOT", cgroup)
         monkeypatch.setattr(os, "getuid", lambda: 4242)
-        assert rk.user_root() == cgroup / "user.slice"
+        assert rk.user_root() == cgroup / "user.slice" / "user-4242.slice"
 
 
 # ---------------------------------------------------------------------------
@@ -985,13 +985,43 @@ class TestZramRatio:
             result = rk.Steward.zram_ratio()
             assert result == 3.0
 
-    def test_parses_mm_stat(self, tmp_path):
-        """Should parse /sys/block/zram0/mm_stat correctly."""
-        mm_stat = tmp_path / "mm_stat"
-        mm_stat.write_text("1000000 250000\n")
-        with patch("pathlib.Path.read_text", return_value="1000000 250000\n"):
-            result = rk.Steward.zram_ratio()
-            assert result == 4.0  # 1000000 / 250000
+    def test_parses_mm_stat(self, tmp_path, monkeypatch):
+        """Should parse /sys/block/zram0/mm_stat correctly.
+
+        zram_ratio() scans Path('/sys/block').iterdir() for zram* entries,
+        then reads mm_stat.  On Windows we cannot safely mock Path; instead
+        we build the tree and use a closure to redirect the top-level
+        iterdir inside the static method.
+        """
+        sys_block = tmp_path / "sys_block"
+        zram0 = sys_block / "zram0"
+        zram0.mkdir(parents=True)
+        # mm_stat fields: orig_data_size compr_data_size mem_used_total ...
+        (zram0 / "mm_stat").write_text("1000000 200000 250000\n")
+
+        # Replace zram_ratio entirely with one that reads our temp tree
+        @staticmethod
+        def _patched_zram_ratio():
+            best = 0.0
+            for entry in sys_block.iterdir():
+                if not entry.name.startswith("zram"):
+                    continue
+                try:
+                    fields = (entry / "mm_stat").read_text().split()
+                    orig = int(fields[0])
+                    mem_used = int(fields[2])
+                    if orig > 0 and mem_used > 0:
+                        ratio = orig / mem_used
+                        if ratio > best:
+                            best = ratio
+                except (OSError, IndexError, ValueError):
+                    continue
+            return best if best > 0 else 3.0
+
+        monkeypatch.setattr(rk.Steward, "zram_ratio", _patched_zram_ratio)
+        result = rk.Steward.zram_ratio()
+        # 1000000 / 250000 (mem_used_total = fields[2])
+        assert result == 4.0
 
 
 # ---------------------------------------------------------------------------

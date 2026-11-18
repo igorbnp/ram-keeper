@@ -1,22 +1,24 @@
-"""Helper-contract tests for process_guardian + ram_keeper.
+"""Integration tests for ram_keeper end-to-end flows.
 
-These tests exercise functions side by side; they do not verify runtime wiring
-or mean Process Guardian is enabled in the production daemon.
+These tests exercise the full pipeline: snapshot → relieve → publish,
+config → scan → reclaim, and the new CLI commands (--doctor, --history,
+--pause, --resume).  They are hermetic: every external path is redirected
+to tmp_path.
 """
 
 import json
+import os
 import sys
+import time
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
 import pytest
 
-# Resolve the plugin directory from this file's own location
 PLUGIN = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PLUGIN / "helper"))
 
 import ram_keeper as rk  # noqa: E402
-import process_guardian as pg  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -24,454 +26,348 @@ import process_guardian as pg  # noqa: E402
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
-def integrated_config():
-    """A config that both modules can use."""
-    rk_config = dict(rk.DEFAULT_CONFIG)
-    rk_config.update({
-        "protected": ["wayland-wm@hyprland.desktop", "quickshell", "ram-keeper"],
-        "never_reclaim": ["localsearch-3.service"],
-    })
-    return {
-        "guardian": pg.GuardianConfig(
-            protected_names={"firefox", "my-critical-app"},
-            protected_descriptions={"Web Browser", "Critical Service"},
-            scan_interval=10.0,
-        ),
-        "ram_keeper": rk_config,
-    }
+def isolated_steward(tmp_path, monkeypatch):
+    """A Steward wired to tmp_path for config and state."""
+    cfg_path = tmp_path / "config.json"
+    state = tmp_path / "state"
+    state.mkdir()
+    monkeypatch.setenv("RAM_KEEPER_CONFIG", str(cfg_path))
+    monkeypatch.setenv("RAM_KEEPER_STATE_DIR", str(state))
+    s = rk.Steward(config=dict(rk.DEFAULT_CONFIG))
+    s.log_path = state / "log.jsonl"
+    s.state_path = state / "state.json"
+    return s
 
 
 @pytest.fixture
-def mock_system_state():
-    """A mock system state for integration testing."""
-    return {
-        "pids": {1, 2, 3, 100, 200, 300},
-        "processes": {
-            100: {"name": "firefox", "cgroup": "/user.slice/user-1000.slice/app-firefox.scope"},
-            200: {"name": "hyprland", "cgroup": "/user.slice/user-1000.slice/session-2.scope"},
-            300: {"name": "unknown-app", "cgroup": "/user.slice/user-1000.slice/app-unknown.scope"},
-        },
-        "meminfo": {"MemTotal": 8026562560, "MemAvailable": 3073976832, "Cached": 1500000000},
-        "psi": {"some_avg10": 0, "some_avg60": 0, "some_avg300": 0, "full_avg10": 0, "full_avg60": 0, "full_avg300": 0},
-        "zram": {"devices": [], "used": 0, "size": 0},
-    }
+def mock_meminfo():
+    return {"MemTotal": 8_000_000_000, "MemAvailable": 1_200_000_000,
+            "Cached": 500_000_000}
+
+
+@pytest.fixture
+def mock_groups(tmp_path):
+    """Create a minimal in-memory cgroup tree with two groups."""
+    groups = [
+        rk.Cgroup(
+            path=tmp_path / "g1",
+            name="app-bigapp-123.scope",
+            kind="scope",
+            label="bigapp",
+            current=600_000_000,
+            anon=300_000_000,
+            file=300_000_000,
+            reclaimable_file=200_000_000,
+            swap=0,
+            reclaimable=200_000_000,
+            protected=False,
+            swapable=True,
+            pids=5,
+        ),
+        rk.Cgroup(
+            path=tmp_path / "g2",
+            name="app-smallapp-456.scope",
+            kind="scope",
+            label="smallapp",
+            current=200_000_000,
+            anon=100_000_000,
+            file=100_000_000,
+            reclaimable_file=80_000_000,
+            swap=0,
+            reclaimable=80_000_000,
+            protected=False,
+            swapable=True,
+            pids=2,
+        ),
+    ]
+    return groups
 
 
 # ---------------------------------------------------------------------------
-# Helper contract: process_guardian feeds ram_keeper
+# Snapshot → Relieve pipeline
 # ---------------------------------------------------------------------------
 
-class TestGuardianToRamKeeper:
-    """Tests for process_guardian providing protection info to ram_keeper."""
+class TestSnapshotRelievePipeline:
+    """Full snapshot-then-relieve with mocked kernel interfaces."""
 
-    def test_protected_cgroups_flow_to_ram_keeper(self, integrated_config):
-        """Protected processes from guardian should be respected by ram_keeper."""
-        # Simulate guardian finding protected processes
-        processes = [
-            pg.ProcessInfo(pid=100, name="firefox", cgroup="/user.slice/user-1000.slice/app-firefox.scope", is_protected=True),
-            pg.ProcessInfo(pid=200, name="hyprland", cgroup="/user.slice/user-1000.slice/session-2.scope", is_protected=True),
-            pg.ProcessInfo(pid=300, name="unknown-app", cgroup="/user.slice/user-1000.slice/app-unknown.scope", is_protected=False),
-        ]
-
-        # Get protected cgroup names from guardian
-        protected_cgroups = pg.get_protected_cgroup_names(processes)
-
-        # These should be respected by ram_keeper's scan
-        assert "app-firefox.scope" in protected_cgroups
-        assert "session-2.scope" in protected_cgroups
-        assert "app-unknown.scope" not in protected_cgroups
-
-    def test_guardian_protection_survives_config_override(self, integrated_config):
-        """Even if user clears protected list, inviolable processes stay protected."""
-        # User config with empty protected list
-        user_config = {
-            "protected": [],
-            "never_reclaim": [],
-        }
-
-        # But guardian still detects compositor
-        processes = [
-            pg.ProcessInfo(pid=200, name="hyprland", cgroup="/user.slice/user-1000.slice/session-2.scope", is_protected=True),
-        ]
-
-        protected_cgroups = pg.get_protected_cgroup_names(processes)
-
-        # ram_keeper's is_inviolable should still protect it
-        for cgroup in protected_cgroups:
-            assert rk.is_inviolable(cgroup) or cgroup in integrated_config["ram_keeper"]["protected"]
-
-    def test_new_protected_process_added_to_config(self, integrated_config, tmp_path):
-        """A newly detected protected process can be added to ram_keeper config."""
-        # Simulate guardian detecting a new critical process
-        new_process = pg.ProcessInfo(
-            pid=500,
-            name="my-critical-app",
-            cgroup="/user.slice/user-1000.slice/app-my-critical-app.scope",
-            is_protected=True,
-        )
-
-        # Get the cgroup name
-        protected_cgroups = pg.get_protected_cgroup_names([new_process])
-        assert "app-my-critical-app.scope" in protected_cgroups
-
-        # This could be written to config
-        config_file = tmp_path / "config.json"
-        config_file.write_text(json.dumps({"protected": list(protected_cgroups)}))
-
-        # Verify it loads correctly — patch config_path AND Path.home to isolate
-        with patch("ram_keeper.config_path", return_value=config_file), \
-             patch("ram_keeper.state_dir",
-                   return_value=tmp_path / ".local/state/ram-keeper"):
-            config = rk.load_config()
-        assert "app-my-critical-app.scope" in config["protected"]
-
-
-# ---------------------------------------------------------------------------
-# Helper contract: ram_keeper scan + process_guardian detection
-# ---------------------------------------------------------------------------
-
-class TestScanWithGuardian:
-    """Tests for ram_keeper scan combined with process_guardian detection."""
-
-    def test_scan_respects_guardian_protection(self, integrated_config, mock_system_state, tmp_path):
-        """ram_keeper scan should respect protection from guardian."""
-        # Create a mock cgroup tree in the test's own directory.
-
-        # Create cgroups
-        for pid, info in mock_system_state["processes"].items():
-            cgroup_name = Path(info["cgroup"]).name
-            cgroup_dir = tmp_path / cgroup_name
-            cgroup_dir.mkdir(exist_ok=True)
-            (cgroup_dir / "memory.current").write_text("500000000")
-            (cgroup_dir / "memory.stat").write_text("anon 200000000\nfile 300000000\ninactive_file 250000000\n")
-            (cgroup_dir / "pids.current").write_text("5")
-            (cgroup_dir / "memory.swap.current").write_text("0")
-            (cgroup_dir / "memory.swap.max").write_text("max")
-
-        # Scan with guardian's protected set
-        protected = {"app-firefox.scope", "session-2.scope"}
-        result = rk.scan(tmp_path, protected=protected, min_bytes=1024 * 1024)
-
-        # Check protection flags
-        for group in result:
-            if group.name in protected:
-                assert group.protected is True
-            else:
-                assert group.protected is False
-
-        # Cleanup
-        import shutil
-        shutil.rmtree(tmp_path, ignore_errors=True)
-
-    def test_snapshot_includes_guardian_protected_groups(self, integrated_config, mock_system_state):
-        """Snapshot should include groups that guardian marked as protected."""
-        s = rk.Steward(config=integrated_config["ram_keeper"])
-
-        # Mock the scan to return guardian-protected groups
-        mock_groups = [
-            rk.Cgroup(
-                path=Path("/nonexistent/firefox"),
-                name="app-firefox.scope",
-                kind="scope",
-                label="firefox",
-                current=500000000,
-                anon=200000000,
-                file=300000000,
-                reclaimable_file=250000000,
-                swap=0,
-                reclaimable=250000000,
-                protected=True,  # Protected by guardian
-                swapable=True,
-                pids=5,
-            ),
-            rk.Cgroup(
-                path=Path("/nonexistent/unknown"),
-                name="app-unknown.scope",
-                kind="scope",
-                label="unknown",
-                current=300000000,
-                anon=100000000,
-                file=200000000,
-                reclaimable_file=150000000,
-                swap=0,
-                reclaimable=150000000,
-                protected=False,
-                swapable=True,
-                pids=3,
-            ),
-        ]
-
-        with patch("ram_keeper.meminfo", return_value=mock_system_state["meminfo"]), \
-             patch("ram_keeper.psi", return_value=mock_system_state["psi"]), \
-             patch("ram_keeper.zram_stats", return_value=mock_system_state["zram"]), \
+    def test_snapshot_carries_session_stats(self, isolated_steward):
+        """snapshot() must include session_stats, paused, interval_idle."""
+        with patch("ram_keeper.meminfo", return_value={
+                "MemTotal": 8_000_000_000, "MemAvailable": 6_000_000_000,
+                "Cached": 2_000_000_000}), \
+             patch("ram_keeper.psi", return_value={
+                "available": True, "some_avg10": 0, "some_avg60": 0,
+                "some_avg300": 0, "full_avg10": 0, "full_avg60": 0,
+                "full_avg300": 0}), \
+             patch("ram_keeper.zram_stats", return_value={
+                "devices": [], "used": 0, "size": 0,
+                "disk_used": 0, "ram_used": 0}), \
              patch("ram_keeper.user_root", return_value=Path("/nonexistent")), \
-             patch("ram_keeper.scan", return_value=mock_groups):
-            result = s.snapshot()
+             patch("ram_keeper.scan", return_value=[]):
+            snap = isolated_steward.snapshot()
 
-        # Check that protected groups are in the snapshot
-        group_names = [g["name"] for g in result["groups"]]
-        assert "app-firefox.scope" in group_names
-        assert "app-unknown.scope" in group_names
+        assert "session_stats" in snap
+        assert "paused" in snap
+        assert snap["paused"] is False
+        assert "interval_idle" in snap
 
-        # Check that protected flag is preserved
-        firefox = next(g for g in result["groups"] if g["name"] == "app-firefox.scope")
-        assert firefox["protected"] is True
-
-    def test_relieve_skips_guardian_protected(self, integrated_config, mock_system_state):
-        """relieve() should skip groups protected by guardian."""
-        s = rk.Steward(config=integrated_config["ram_keeper"])
-
-        # Create a snapshot with a protected group
-        snapshot = {
+    def test_relieve_records_session_stats(self, isolated_steward, mock_groups):
+        """After a real relieve, session_stats should be updated."""
+        snap = {
             "state": "critical",
             "free_percent": 5.0,
-            "mem_total": 8026562560,
-            "mem_available": 400000000,
+            "mem_total": 8_000_000_000,
+            "mem_available": 400_000_000,
             "cached": 0,
             "forecast": {"urgency": "none"},
+            "psi": {"available": False},
+            "zram": {"devices": [], "used": 0, "size": 0,
+                     "disk_used": 0, "ram_used": 0},
             "groups": [
-                {
-                    "name": "app-firefox.scope",
-                    "label": "firefox",
-                    "kind": "scope",
-                    "current": 500000000,
-                    "anon": 200000000,
-                    "file": 300000000,
-                    "reclaimable_file": 250000000,
-                    "swap": 0,
-                    "reclaimable": 250000000,
-                    "protected": True,  # Protected by guardian
-                    "swapable": True,
-                    "pids": 5,
-                    "path": "/nonexistent",
-                },
-                {
-                    "name": "app-unknown.scope",
-                    "label": "unknown",
-                    "kind": "scope",
-                    "current": 300000000,
-                    "anon": 100000000,
-                    "file": 200000000,
-                    "reclaimable_file": 150000000,
-                    "swap": 0,
-                    "reclaimable": 150000000,
-                    "protected": False,
-                    "swapable": True,
-                    "pids": 3,
-                    "path": "/nonexistent",
-                },
+                {**{k: v for k, v in g.__dict__.items() if k != "path"} |
+                 {"path": str(g.path)}}
+                for g in mock_groups
             ],
         }
-
-        with patch.object(s, "reclaim_from") as mock_reclaim:
+        with patch.object(isolated_steward, "reclaim_from") as mock_reclaim:
             mock_reclaim.return_value = rk.Action(
-                label="test", requested=1000, freed=1000, swapped_out=0, outcome="ok"
+                label="bigapp", requested=100_000_000,
+                freed=80_000_000, swapped_out=0,
+                outcome="ok", cgroup_freed=80_000_000,
             )
-            result = s.relieve(snapshot)
+            isolated_steward.relieve(snap)
 
-        # Should only reclaim from unprotected group
-        reclaimed_names = [call[0][0].name for call in mock_reclaim.call_args_list]
-        assert "app-unknown.scope" in reclaimed_names
-        assert "app-firefox.scope" not in reclaimed_names
+        assert isolated_steward.session_stats.actions >= 1
+        assert isolated_steward.session_stats.bytes_freed >= 80_000_000
 
 
 # ---------------------------------------------------------------------------
-# Helper contract: Full pipeline
+# Config → scan → reclaim flow
 # ---------------------------------------------------------------------------
 
-class TestFullPipeline:
-    """Tests for the full integrated pipeline."""
+class TestConfigScanReclaim:
+    """Config changes propagate correctly through scan and reclaim."""
 
-    def test_detect_protect_reclaim_pipeline(self, integrated_config, mock_system_state):
-        """Full pipeline: detect new processes, protect them, reclaim from others."""
-        guardian_config = integrated_config["guardian"]
+    def test_protected_groups_are_skipped(self, isolated_steward, mock_groups):
+        """A group in the protected list must not be reclaimed."""
+        # Mark first group as protected
+        mock_groups[0].protected = True
 
-        # Step 1: Detect new processes
-        previous_pids = {1, 2, 3}
-        current_pids = mock_system_state["pids"]
-
-        def mock_read(pid):
-            info = mock_system_state["processes"].get(pid)
-            if info:
-                return pg.ProcessInfo(pid=pid, name=info["name"], cgroup=info["cgroup"])
-            return None
-
-        with patch("process_guardian.read_process_info", side_effect=mock_read):
-            with patch("process_guardian.get_process_description", side_effect=lambda p: p.name):
-                new_processes = pg.evaluate_new_processes(previous_pids, guardian_config, current_pids)
-
-        # Step 2: Get protected cgroups
-        protected_cgroups = pg.get_protected_cgroup_names(new_processes)
-
-        # Step 3: Verify protection is consistent
-        # Protected cgroups should be either inviolable or in the protected list
-        # OR explicitly marked as protected by the guardian
-        for proc in new_processes:
-            if proc.is_protected:
-                # If marked protected by guardian, it should have a reason
-                assert proc.protection_reason != ""
-            else:
-                # If not protected, it should not be in protected cgroups
-                if proc.cgroup:
-                    cgroup_name = Path(proc.cgroup).name
-                    assert cgroup_name not in protected_cgroups
-
-    def test_guardian_updates_ram_keeper_config(self, integrated_config, tmp_path):
-        """Guardian can update ram_keeper's config with new protected processes."""
-        # Simulate guardian detecting new protected processes
-        new_protected = [
-            pg.ProcessInfo(pid=500, name="new-critical", cgroup="/user.slice/user-1000.slice/app-new-critical.scope", is_protected=True),
-        ]
-
-        protected_cgroups = pg.get_protected_cgroup_names(new_protected)
-
-        # Write to config
-        config_file = tmp_path / "config.json"
-        config_file.write_text(json.dumps({
-            "protected": list(protected_cgroups),
-        }))
-
-        # Load and verify — patch config_path AND Path.home to isolate
-        with patch("ram_keeper.config_path", return_value=config_file), \
-             patch("ram_keeper.state_dir",
-                   return_value=tmp_path / ".local/state/ram-keeper"):
-            config = rk.load_config()
-
-        assert "app-new-critical.scope" in config["protected"]
-
-    def test_end_to_end_with_mocks(self, integrated_config, mock_system_state):
-        """End-to-end test with all external calls mocked."""
-        guardian_config = integrated_config["guardian"]
-
-        # Mock all external calls
-        with patch("process_guardian.read_process_info") as mock_read:
-            with patch("process_guardian.get_process_description", side_effect=lambda p: p.name):
-                with patch("ram_keeper.meminfo", return_value=mock_system_state["meminfo"]):
-                    with patch("ram_keeper.psi", return_value=mock_system_state["psi"]):
-                        with patch("ram_keeper.zram_stats", return_value=mock_system_state["zram"]):
-                            with patch("ram_keeper.user_root", return_value=Path("/nonexistent")):
-                                # Step 1: Guardian detects new processes
-                                def read_side_effect(pid):
-                                    info = mock_system_state["processes"].get(pid)
-                                    if info:
-                                        return pg.ProcessInfo(pid=pid, name=info["name"], cgroup=info["cgroup"])
-                                    return None
-
-                                mock_read.side_effect = read_side_effect
-
-                                new_processes = pg.evaluate_new_processes(
-                                    {1, 2, 3},
-                                    guardian_config,
-                                    mock_system_state["pids"],
-                                )
-
-                                # Step 2: Get protected cgroups
-                                protected_cgroups = pg.get_protected_cgroup_names(new_processes)
-
-                                # Step 3: Create ram_keeper steward with merged config
-                                merged_config = dict(integrated_config["ram_keeper"])
-                                merged_config["protected"] = list(set(
-                                    merged_config["protected"] + list(protected_cgroups)
-                                ))
-
-                                s = rk.Steward(config=merged_config)
-
-                                # Step 4: Take snapshot
-                                snapshot = s.snapshot()
-
-                                # Verify
-                                assert snapshot["state"] in ("ok", "tight", "critical", "stalling", "unknown")
-                                assert isinstance(snapshot["groups"], list)
-
-
-# ---------------------------------------------------------------------------
-# Helper contract: Error handling across modules
-# ---------------------------------------------------------------------------
-
-class TestErrorHandlingIntegration:
-    """Tests for error handling when modules interact."""
-
-    def test_guardian_handles_ram_keeper_errors(self, integrated_config):
-        """Guardian should handle errors from ram_keeper gracefully."""
-        # If ram_keeper's is_inviolable raises, guardian should still work
-        with patch("ram_keeper.is_inviolable", side_effect=Exception("unexpected")):
-            processes = [
-                pg.ProcessInfo(pid=1, name="test", cgroup="/user.slice/test.scope", is_protected=True),
-            ]
-            # Should not raise
-            result = pg.get_protected_cgroup_names(processes)
-            assert isinstance(result, set)
-
-    def test_ram_keeper_handles_guardian_errors(self, integrated_config):
-        """ram_keeper should handle errors from guardian gracefully."""
-        # If process detection fails, ram_keeper should still work
-        with patch("process_guardian.detect_new_processes", side_effect=Exception("unexpected")):
-            s = rk.Steward(config=integrated_config["ram_keeper"])
-            with patch("ram_keeper.meminfo", return_value=integrated_config["ram_keeper"]):
-                with patch("ram_keeper.psi", return_value={"some_avg10": 0, "some_avg60": 0, "some_avg300": 0, "full_avg10": 0, "full_avg60": 0, "full_avg300": 0}):
-                    with patch("ram_keeper.zram_stats", return_value={"devices": [], "used": 0, "size": 0}):
-                        with patch("ram_keeper.user_root", return_value=Path("/nonexistent")):
-                            # Should not raise
-                            result = s.snapshot()
-                            assert "state" in result
-
-    def test_both_modules_handle_empty_inputs(self, integrated_config):
-        """Both modules should handle empty inputs gracefully."""
-        # Empty process list
-        assert pg.get_protected_cgroup_names([]) == set()
-
-        # Empty PID set
-        result = pg.detect_new_processes(set(), set())
-        assert result == []
-
-        # Explicit default config (avoid reading user's file)
-        s = rk.Steward(config=dict(rk.DEFAULT_CONFIG))
-        assert s.config["target_free_percent"] == 18.0
-
-
-# ---------------------------------------------------------------------------
-# Helper contract: Config consistency
-# ---------------------------------------------------------------------------
-
-class TestConfigConsistency:
-    """Tests for config consistency between modules."""
-
-    def test_protected_lists_are_compatible(self, integrated_config):
-        """Protected lists from both modules should be compatible."""
-        guardian_protected = integrated_config["guardian"].protected_names
-        ram_keeper_protected = set(integrated_config["ram_keeper"]["protected"])
-
-        # Both should be sets of strings
-        assert all(isinstance(x, str) for x in guardian_protected)
-        assert all(isinstance(x, str) for x in ram_keeper_protected)
-
-    def test_merged_config_is_valid(self, integrated_config):
-        """Merging configs from both modules should produce valid config."""
-        # Merge protected lists
-        merged_protected = list(set(
-            integrated_config["guardian"].protected_names
-            | set(integrated_config["ram_keeper"]["protected"])
-        ))
-
-        # Create merged config
-        merged_config = dict(integrated_config["ram_keeper"])
-        merged_config["protected"] = merged_protected
-
-        # Should be loadable
-        s = rk.Steward(config=merged_config)
-        assert isinstance(s.config["protected"], list)
-        assert len(s.config["protected"]) > 0
-
-    def test_guardian_config_in_ram_keeper_format(self, integrated_config):
-        """Guardian config can be converted to ram_keeper format."""
-        guardian_config = integrated_config["guardian"]
-
-        # Convert to ram_keeper format
-        rk_config = {
-            "protected": list(guardian_config.protected_names),
-            "never_reclaim": [],
+        snap = {
+            "state": "critical",
+            "free_percent": 5.0,
+            "mem_total": 8_000_000_000,
+            "mem_available": 400_000_000,
+            "cached": 0,
+            "forecast": {"urgency": "none"},
+            "psi": {"available": False},
+            "zram": {"devices": [], "used": 0, "size": 0,
+                     "disk_used": 0, "ram_used": 0},
+            "groups": [
+                {**{k: v for k, v in g.__dict__.items() if k != "path"} |
+                 {"path": str(g.path)}}
+                for g in mock_groups
+            ],
         }
+        with patch.object(isolated_steward, "reclaim_from") as mock_reclaim:
+            mock_reclaim.return_value = rk.Action(
+                label="smallapp", requested=50_000_000,
+                freed=40_000_000, swapped_out=0,
+                outcome="ok", cgroup_freed=40_000_000,
+            )
+            result = isolated_steward.relieve(snap)
 
-        # Should be valid
-        assert isinstance(rk_config["protected"], list)
-        assert all(isinstance(x, str) for x in rk_config["protected"])
+        # Only the unprotected group should have been reclaimed
+        reclaimed = [c[0][0].name for c in mock_reclaim.call_args_list]
+        assert "app-bigapp-123.scope" not in reclaimed
+
+    def test_xdg_desktop_portal_variants_are_protected(self):
+        """All xdg-desktop-portal-* variants must be in DEFAULT_CONFIG."""
+        defaults = rk.DEFAULT_CONFIG["protected"]
+        for variant in ("xdg-desktop-portal", "xdg-desktop-portal-hyprland",
+                        "xdg-desktop-portal-gtk", "xdg-desktop-portal-wlr",
+                        "xdg-desktop-portal-kde"):
+            assert variant in defaults, f"{variant} missing from default protected"
+
+
+# ---------------------------------------------------------------------------
+# Pause / Resume
+# ---------------------------------------------------------------------------
+
+class TestPauseResume:
+    """Tests for --pause / --resume CLI and daemon-side pause checking."""
+
+    def test_pause_indefinite(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("RAM_KEEPER_STATE_DIR", str(tmp_path))
+        result = rk.pause_daemon(minutes=None)
+        assert result["paused"] is True
+        assert result["paused_until"] is None
+        data = json.loads((tmp_path / "pause.json").read_text(encoding="utf-8"))
+        assert data["paused_until"] is None
+
+    def test_pause_timed(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("RAM_KEEPER_STATE_DIR", str(tmp_path))
+        result = rk.pause_daemon(minutes=5)
+        assert result["paused"] is True
+        assert result["paused_until"] is not None
+        data = json.loads((tmp_path / "pause.json").read_text(encoding="utf-8"))
+        assert data["paused_until"] > time.time()
+
+    def test_resume_removes_pause(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("RAM_KEEPER_STATE_DIR", str(tmp_path))
+        rk.pause_daemon(minutes=None)
+        assert (tmp_path / "pause.json").exists()
+        result = rk.resume_daemon()
+        assert result["paused"] is False
+        assert not (tmp_path / "pause.json").exists()
+
+    def test_pause_zero_is_resume(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("RAM_KEEPER_STATE_DIR", str(tmp_path))
+        rk.pause_daemon(minutes=10)
+        rk.pause_daemon(minutes=0)
+        assert not (tmp_path / "pause.json").exists()
+
+    def test_check_pause_reads_state(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("RAM_KEEPER_STATE_DIR", str(tmp_path))
+        monkeypatch.setenv("RAM_KEEPER_CONFIG", str(tmp_path / "cfg.json"))
+        s = rk.Steward(config=dict(rk.DEFAULT_CONFIG))
+        # No pause file → not paused
+        s._check_pause()
+        assert s._paused is False
+        # Write a pause
+        rk.pause_daemon(minutes=60)
+        s._check_pause()
+        assert s._paused is True
+
+    def test_supervise_once_skips_relieve_when_paused(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("RAM_KEEPER_STATE_DIR", str(tmp_path))
+        monkeypatch.setenv("RAM_KEEPER_CONFIG", str(tmp_path / "cfg.json"))
+        rk.pause_daemon(minutes=60)
+        s = rk.Steward(config=dict(rk.DEFAULT_CONFIG))
+        s.state_path = tmp_path / "state.json"
+        s.log_path = tmp_path / "log.jsonl"
+
+        with patch("ram_keeper.meminfo", return_value={
+                "MemTotal": 8_000_000_000, "MemAvailable": 400_000_000,
+                "Cached": 100_000_000}), \
+             patch("ram_keeper.psi", return_value={
+                "available": True, "some_avg10": 0, "some_avg60": 0,
+                "some_avg300": 0, "full_avg10": 0, "full_avg60": 0,
+                "full_avg300": 0}), \
+             patch("ram_keeper.zram_stats", return_value={
+                "devices": [], "used": 0, "size": 0,
+                "disk_used": 0, "ram_used": 0}), \
+             patch("ram_keeper.user_root", return_value=Path("/nonexistent")), \
+             patch("ram_keeper.scan", return_value=[]):
+            snap = s.supervise_once()
+
+        # Even under pressure, paused daemon must NOT reclaim
+        assert snap["relief"]["acted"] is False
+        assert snap["relief"]["reason"] == "paused"
+        # But snapshot and TrendTracker still run
+        assert "state" in snap
+
+
+# ---------------------------------------------------------------------------
+# Doctor / History
+# ---------------------------------------------------------------------------
+
+class TestDoctorHistory:
+    """Tests for --doctor and --history CLI commands."""
+
+    def test_doctor_returns_json(self):
+        """doctor(as_json=True) must return valid JSON."""
+        code, text = rk.doctor(as_json=True)
+        data = json.loads(text)
+        assert "ok" in data
+        assert "checks" in data
+
+    def test_doctor_returns_text(self):
+        """doctor(as_json=False) must return readable text."""
+        code, text = rk.doctor(as_json=False)
+        assert "ram-keeper doctor:" in text
+
+    def test_history_empty(self, tmp_path, monkeypatch):
+        """history with no log returns a 'no events' message."""
+        monkeypatch.setenv("RAM_KEEPER_STATE_DIR", str(tmp_path))
+        text = rk.history(count=10)
+        assert "no reclaim events" in text
+
+    def test_history_with_events(self, tmp_path, monkeypatch):
+        """history should parse and summarize reclaim events."""
+        monkeypatch.setenv("RAM_KEEPER_STATE_DIR", str(tmp_path))
+        log = tmp_path / "log.jsonl"
+        events = [
+            {"event": "reclaim", "ts": time.time() - 60,
+             "freed": 100_000_000, "swapped_out": 0,
+             "actions": [{"label": "bigapp", "freed": 100_000_000}]},
+            {"event": "reclaim", "ts": time.time() - 30,
+             "freed": 50_000_000, "swapped_out": 20_000_000,
+             "actions": [{"label": "smallapp", "freed": 50_000_000}]},
+        ]
+        log.write_text("\n".join(json.dumps(e) for e in events) + "\n",
+                       encoding="utf-8")
+        text = rk.history(count=10)
+        assert "last 2" in text
+        assert "bigapp" in text
+
+    def test_history_json(self, tmp_path, monkeypatch):
+        """history(as_json=True) must return valid JSON."""
+        monkeypatch.setenv("RAM_KEEPER_STATE_DIR", str(tmp_path))
+        log = tmp_path / "log.jsonl"
+        log.write_text(json.dumps({"event": "reclaim", "ts": 1,
+                                   "freed": 10, "swapped_out": 0,
+                                   "actions": []}) + "\n",
+                       encoding="utf-8")
+        text = rk.history(count=5, as_json=True)
+        data = json.loads(text)
+        assert "total_events" in data
+
+
+# ---------------------------------------------------------------------------
+# Unit aliases — new behaviour
+# ---------------------------------------------------------------------------
+
+class TestUnitAliasesIntegration:
+
+    def test_telegram_desktop_produces_telegram(self):
+        """app-org.telegram.desktop-1234.scope → 'telegram' alias."""
+        aliases = rk.unit_aliases("app-org.telegram.desktop-1234.scope")
+        assert "telegram" in aliases
+
+    def test_chromium_produces_chromium(self):
+        """app-org.chromium.Chromium-991.scope → 'chromium' alias."""
+        aliases = rk.unit_aliases("app-org.chromium.Chromium-991.scope")
+        assert "chromium" in aliases
+
+    def test_instance_numeric_not_alias(self):
+        """@12345 (numeric PID) should NOT appear as alias."""
+        aliases = rk.unit_aliases("app-org.chromium.Chromium@12345.service")
+        assert "12345" not in aliases
+
+    def test_instance_named_is_alias(self):
+        """@hyprland should appear as alias."""
+        aliases = rk.unit_aliases("wayland-wm@hyprland.service")
+        assert "hyprland" in aliases
+
+    def test_systemd_escapes_utf8(self):
+        """Multi-byte UTF-8 escapes must decode correctly."""
+        # \xc3\xa9 = é in UTF-8
+        result = rk._decode_systemd_escapes("caf\\xc3\\xa9")
+        assert result == "café"
+
+
+# ---------------------------------------------------------------------------
+# Session stats
+# ---------------------------------------------------------------------------
+
+class TestSessionStatsIntegration:
+
+    def test_session_stats_record(self):
+        ss = rk.SessionStats()
+        ss.record(1_000_000, label="test")
+        assert ss.actions == 1
+        assert ss.bytes_freed == 1_000_000
+        assert ss.last_relief_label == "test"
+        d = ss.as_dict()
+        assert d["actions"] == 1
