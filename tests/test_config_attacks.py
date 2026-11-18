@@ -19,7 +19,8 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-import pytest
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _pytest_shim import pytest, install_unittest_bridge  # noqa: E402
 
 PLUGIN = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PLUGIN / "helper"))
@@ -219,3 +220,6 @@ def test_coerce_number_survives_overflow(value):
     rk._CONFIG_WARNINGS.clear()
     out = rk._coerce_number("target_free_percent", value, 18.0)
     assert 5.0 <= out <= 60.0
+
+
+install_unittest_bridge(globals())

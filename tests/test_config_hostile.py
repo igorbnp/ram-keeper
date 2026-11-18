@@ -18,10 +18,10 @@ os.environ.setdefault("RAM_KEEPER_STATE_DIR", tempfile.mkdtemp(prefix="rk-state-
 import os as _os
 import sys
 
-if (not _os.path.exists("/sys/fs/cgroup/user.slice")
-        or (_os.environ.get("CI") and _os.environ.get("RAM_KEEPER_LIVE") != "1")):
-    print("  --   live suite skipped (no user cgroup, or CI without RAM_KEEPER_LIVE=1)")
-    sys.exit(0)
+_SKIP_LIVE = (
+    not _os.path.exists("/sys/fs/cgroup/user.slice")
+    or (_os.environ.get("CI") and _os.environ.get("RAM_KEEPER_LIVE") != "1")
+)
 
 
 # Resolve the plugin directory from this file's own location, so the suite runs
@@ -55,6 +55,9 @@ def run_with(cfg_text, label):
             print(f"       target={cfg.get('state')} free={cfg.get('free_percent')}%")
     return ok_exit, cfg, p.stderr
 def main():
+    if _SKIP_LIVE:
+        print("  --   live suite skipped (no user cgroup, or CI without RAM_KEEPER_LIVE=1)")
+        return
     cases = [
         ("valid override",            json.dumps({"target_free_percent": 22.0})),
         ("negative interval",          json.dumps({"interval_idle": -5.0})),

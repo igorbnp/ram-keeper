@@ -160,4 +160,4 @@ check("the user manager was never asked", rec.total("init.scope") == 0)
 check("an ordinary app was still reclaimed", rec.total("app-ok-1.scope") > 0)
 
 print(f"\n{'ALL PASS' if fails == 0 else f'{fails} FAILURES'}")
-sys.exit(1 if fails else 0)
+assert fails == 0, f"Test failed: {fails} failures"

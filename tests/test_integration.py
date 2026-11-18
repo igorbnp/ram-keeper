@@ -15,7 +15,8 @@ import time
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
-import pytest
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _pytest_shim import pytest, install_unittest_bridge  # noqa: E402
 
 PLUGIN = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PLUGIN / "helper"))
@@ -587,3 +588,6 @@ class TestCliPauseStateContract:
         data = json.loads(real_cfg.read_text(encoding="utf-8"))
         assert "firefox" in data["never_reclaim"]
         assert data["target_free_percent"] == 22.0
+
+
+install_unittest_bridge(globals())

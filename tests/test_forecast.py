@@ -159,37 +159,38 @@ check("slow decline is not imminent", f7.urgency != "imminent", f7.urgency)
 if os.environ.get("RAM_KEEPER_LIVE") != "1":
     print("\n== live probe skipped (set RAM_KEEPER_LIVE=1 on a desktop) ==")
     print("\nALL PASS" if fails == 0 else f"\n{fails} FAILURES")
-    sys.exit(0 if fails == 0 else 1)
-print("\n== 7. the live machine reports a forecast ==")
-out = subprocess.run(["/usr/bin/python3",
-                      str(PLUGIN / "helper" / "ram_keeper.py"),
-                      "--once"], capture_output=True, text=True, timeout=60)
-d = json.loads(out.stdout)
-fc = d.get("forecast")
-check("snapshot carries a forecast", fc is not None)
-if fc:
-    print(f"  {json.dumps(fc, indent=None)}")
-    check("forecast has urgency", "urgency" in fc)
-    check("urgency is a known value",
-          fc["urgency"] in ("none", "soon", "imminent", "eventual"), fc["urgency"])
-check("state is a known value",
-      d["state"] in ("ok", "tight", "critical", "stalling", "trending"), d["state"])
-print("\n== 8. swap split is honest ==")
-z = d["zram"]
-print(f"  ram_used={z.get('ram_used',0)//MB}MB disk_used={z.get('disk_used',0)//MB}MB")
-has_zram = any("zram" in dev["name"] for dev in z["devices"])
-if has_zram:
-    check("zram classified as RAM-backed",
-          any(dev.get("ram_backed") for dev in z["devices"] if "zram" in dev["name"]))
+    assert fails == 0, f"Test failed: {fails} failures"
 else:
-    print("  --   zram not present on this system, skipping zram assertion")
-has_swapfile = any("swapfile" in dev["name"] for dev in z["devices"])
-if has_swapfile:
-    check("swapfile classified as disk-backed",
-          any(not dev.get("ram_backed") for dev in z["devices"] if "swapfile" in dev["name"]))
-else:
-    print("  --   swapfile not present on this system, skipping swapfile assertion")
-check("ram_used + disk_used == used",
-      z.get("ram_used", 0) + z.get("disk_used", 0) == z["used"])
-print("\nALL PASS" if fails == 0 else f"\n{fails} FAILURES")
-assert fails == 0, f"Test failed: {fails} failures"
+    print("\n== 7. the live machine reports a forecast ==")
+    out = subprocess.run(["/usr/bin/python3",
+                          str(PLUGIN / "helper" / "ram_keeper.py"),
+                          "--once"], capture_output=True, text=True, timeout=60)
+    d = json.loads(out.stdout)
+    fc = d.get("forecast")
+    check("snapshot carries a forecast", fc is not None)
+    if fc:
+        print(f"  {json.dumps(fc, indent=None)}")
+        check("forecast has urgency", "urgency" in fc)
+        check("urgency is a known value",
+              fc["urgency"] in ("none", "soon", "imminent", "eventual"), fc["urgency"])
+    check("state is a known value",
+          d["state"] in ("ok", "tight", "critical", "stalling", "trending"), d["state"])
+    print("\n== 8. swap split is honest ==")
+    z = d["zram"]
+    print(f"  ram_used={z.get('ram_used',0)//MB}MB disk_used={z.get('disk_used',0)//MB}MB")
+    has_zram = any("zram" in dev["name"] for dev in z["devices"])
+    if has_zram:
+        check("zram classified as RAM-backed",
+              any(dev.get("ram_backed") for dev in z["devices"] if "zram" in dev["name"]))
+    else:
+        print("  --   zram not present on this system, skipping zram assertion")
+    has_swapfile = any("swapfile" in dev["name"] for dev in z["devices"])
+    if has_swapfile:
+        check("swapfile classified as disk-backed",
+              any(not dev.get("ram_backed") for dev in z["devices"] if "swapfile" in dev["name"]))
+    else:
+        print("  --   swapfile not present on this system, skipping swapfile assertion")
+    check("ram_used + disk_used == used",
+          z.get("ram_used", 0) + z.get("disk_used", 0) == z["used"])
+    print("\nALL PASS" if fails == 0 else f"\n{fails} FAILURES")
+    assert fails == 0, f"Test failed: {fails} failures"

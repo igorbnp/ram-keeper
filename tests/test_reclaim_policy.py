@@ -15,7 +15,8 @@ import json
 import sys
 from pathlib import Path
 
-import pytest
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _pytest_shim import pytest, install_unittest_bridge  # noqa: E402
 
 PLUGIN = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PLUGIN / "helper"))
@@ -813,3 +814,6 @@ def test_cache_only_reclaim_reports_the_full_amount(tmp_path, monkeypatch):
     action = steward.reclaim_from(group, 80 * MB)
     assert action.swapped_out == 0
     assert action.freed == 80 * MB, f"{action.freed // MB}MB"
+
+
+install_unittest_bridge(globals())

@@ -6,7 +6,8 @@ import time
 from pathlib import Path
 from unittest.mock import patch, MagicMock, mock_open
 
-import pytest
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _pytest_shim import pytest, install_unittest_bridge  # noqa: E402
 
 # Resolve the plugin directory from this file's own location
 PLUGIN = Path(__file__).resolve().parent.parent
@@ -1226,4 +1227,7 @@ class TestSuperviseOnce:
             assert published["state"] == "ok"
             assert published["free_percent"] == 25.0
             assert published["relief"]["acted"] is True
+
+
+install_unittest_bridge(globals())
 

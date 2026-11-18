@@ -11,7 +11,8 @@ import tempfile
 from pathlib import Path
 from unittest.mock import patch, mock_open, MagicMock
 
-import pytest
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _pytest_shim import pytest, install_unittest_bridge  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "helper"))
 
@@ -509,3 +510,6 @@ def test_sleep_returns_when_the_config_changes(monkeypatch, tmp_path):
     steward = rk.Steward(config=rk.load_config())
     steward._sleep(30)
     assert slept and sum(slept) < 30
+
+
+install_unittest_bridge(globals())

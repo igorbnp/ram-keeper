@@ -80,3 +80,9 @@ def test_override_is_active_for_this_process():
     """conftest points every pytest at a temp file before the test body."""
     assert os.environ.get("RAM_KEEPER_CONFIG")
     assert rk.config_path() != Path.home() / ".config" / "ram-keeper" / "config.json"
+
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _pytest_shim import install_unittest_bridge  # noqa: E402
+
+install_unittest_bridge(globals())
