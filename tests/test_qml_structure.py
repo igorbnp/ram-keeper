@@ -219,6 +219,28 @@ def _extract_pua_glyphs(src):
     return glyphs
 
 
+def _missing_pua_glyphs(glyphs, shell_cov, fallback_cov):
+    """Return `(missing_codepoints, scope)` for PUA glyphs against installed fonts.
+
+    Headless CI runners install DejaVu/Liberation (non-empty `fallback_cov` for
+    ASCII/Latin) without `JetBrainsMono Nerd Font` (`shell_cov is None`, zero
+    `>= 0xF0000` glyphs). Do not blame QML for a runner lacking Nerd Fonts,
+    while still rejecting uncovered BMP PUA (`0xE000..0xF8FF`, e.g. Material
+    Symbols web-font codepoints) and enforcing full coverage whenever `SHELL_FONT`
+    or another Supplementary-PUA icon font is installed.
+    """
+    if shell_cov is not None:
+        return sorted(cp for cp in glyphs if cp not in shell_cov), SHELL_FONT
+    if not fallback_cov:
+        return [], "any installed font"
+    has_supp_pua_font = any(cp >= 0xF0000 for cp in fallback_cov)
+    missing = sorted(
+        cp for cp in glyphs
+        if cp not in fallback_cov and (cp <= 0xF8FF or has_supp_pua_font)
+    )
+    return missing, "any installed font"
+
+
 # D-23 self-checks on the lexer and PUA extractor before scanning real files.
 _div_sample = strip_comments_and_literals("Item {\n  property real x: (a / 2) + ({k: 1}.k / 2)\n}\n")
 check("lexer preserves braces between division operators",
@@ -230,6 +252,10 @@ check("lexer strips braces inside single-quoted strings",
       repr(_sq_sample))
 check("PUA extractor catches Supplementary PUA-A (U+F0432)",
       0xF0432 in _extract_pua_glyphs('iconText: "\U000f0432"'))
+_ascii_only = set(range(0x20, 0x7F))
+check("PUA font check tolerates headless runner without Nerd Fonts while catching BMP PUA",
+      _missing_pua_glyphs({0xF0432, 0xE88A}, None, _ascii_only)[0] == [0xE88A]
+      and _missing_pua_glyphs({0xF0432}, {0xF0001}, _ascii_only)[0] == [0xF0432])
 
 scan_files = sorted(QML_DIR.glob("*.qml")) + sorted(QML_DIR.glob("*.js"))
 
@@ -283,16 +309,13 @@ for path in scan_files:
     # 4c. Private-use glyphs (BMP + Supplementary PUA) must exist in the icon font
     glyphs = _extract_pua_glyphs(src)
     if glyphs:
-        cov = _shell_font_coverage()
-        scope = SHELL_FONT
-        if cov is None:
-            cov, scope = _font_coverage(), "any installed font"
-        if cov:
-            missing = sorted(cp for cp in glyphs if cp not in cov)
-            for cp in missing:
-                problems.append(
-                    "U+%05X is private-use and absent from %s "
-                    "(renders as a tofu box)" % (cp, scope))
+        shell_cov = _shell_font_coverage()
+        fallback_cov = set() if shell_cov is not None else _font_coverage()
+        missing, scope = _missing_pua_glyphs(glyphs, shell_cov, fallback_cov)
+        for cp in missing:
+            problems.append(
+                "U+%05X is private-use and absent from %s "
+                "(renders as a tofu box)" % (cp, scope))
 
     if problems:
         fails += 1
