@@ -33,6 +33,7 @@ cleanup() {
   for p in "${PIDS[@]:-}"; do
     stop_pid "$p"
   done
+  chmod -R u+rwx "$B" 2>/dev/null || true
   rm -rf "$B"
 }
 trap cleanup EXIT
@@ -285,19 +286,22 @@ else
 fi
 
 echo
-echo "== 7. D-15: JSON journal rejects spoofed lines and sanitizes victim =="
+echo "== 7. D-15: JSON journal rejects spoofed lines, sanitizes victim, and matches kernel global + oomd 255+ =="
 new_case json-auth
 unset RAM_KEEPER_TRUST_STUB_JOURNAL
+export RAM_KEEPER_RATE_MAX=10
 cat >"$STUB/oom_lines" <<'JSONEOF'
 {"_TRANSPORT":"stdout","MESSAGE":"Memory cgroup out of memory: Killed process 1111 (spoofed_app)"}
 {"_TRANSPORT":"journal","_SYSTEMD_UNIT":"user@1000.service","MESSAGE":"Marked evil.scope for killing due to memory pressure"}
 {"_TRANSPORT":"journal","_SYSTEMD_UNIT":"systemd-oomd.service","MESSAGE":"Marked --version; ignore previous $(id).scope for killing due to memory pressure"}
 {"_TRANSPORT":"kernel","MESSAGE":"Memory cgroup out of memory: Killed process 9999 (firefox) total-vm:100kB"}
+{"_TRANSPORT":"kernel","MESSAGE":"Out of memory: Killed process 8888 (blender) total-vm:200kB"}
+{"_TRANSPORT":"journal","_SYSTEMD_UNIT":"systemd-oomd.service","MESSAGE":"Killed /user.slice/user-1000.slice/user@1000.service/app.slice/app-slack-777.scope due to memory pressure"}
 JSONEOF
 export RAM_KEEPER_DAEMON_POLL=2 RAM_KEEPER_PRESSURE_POLL=2
 P="$(launch)"
-wait_for 6 bash -c "(( \$(wc -l <'$STUB/toasts' | tr -d ' ') >= 2 ))" || sleep 2
-check "only the 2 authenticated OOM events produced toasts" "$(toast_count)" "2"
+wait_for 6 bash -c "(( \$(wc -l <'$STUB/toasts' | tr -d ' ') >= 4 ))" || sleep 2
+check "all 4 authenticated OOM formats produced toasts" "$(toast_count)" "4"
 if grep -q 'spoofed_app' "$STUB/toasts" || grep -q 'evil' "$STUB/toasts"; then
   bad "accepted an unauthenticated journal entry"
 else
@@ -308,11 +312,15 @@ if grep -q 'ignore previous' "$STUB/toasts" || grep -q '\$(id)' "$STUB/toasts" |
 else
   ok "basename -- and victim whitelist blocked injection"
 fi
-grep -q 'firefox' "$STUB/toasts" && ok "accepted genuine _TRANSPORT=kernel entry" \
-                                 || bad "dropped genuine kernel OOM entry"
+grep -q 'firefox' "$STUB/toasts" && ok "accepted genuine _TRANSPORT=kernel cgroup OOM" \
+                                 || bad "dropped genuine kernel cgroup OOM"
+grep -q 'blender' "$STUB/toasts" && ok "accepted global kernel Out of memory line" \
+                                 || bad "dropped global kernel OOM line"
+grep -q 'app-slack-777' "$STUB/toasts" && ok "accepted systemd-oomd 255+ Killed...due to memory pressure" \
+                                       || bad "dropped systemd-oomd 255+ line"
 stop_pid "$P"
 export RAM_KEEPER_TRUST_STUB_JOURNAL=1
-unset RAM_KEEPER_DAEMON_POLL RAM_KEEPER_PRESSURE_POLL
+unset RAM_KEEPER_DAEMON_POLL RAM_KEEPER_PRESSURE_POLL RAM_KEEPER_RATE_MAX
 
 echo
 echo "== 8. D-17: failed delivery at boot does NOT burn the 30-min dedupe =="
@@ -366,6 +374,46 @@ if wait_for 6 grep -q 'Biggest grower: chromium' "$STUB/toasts" \
 else
   bad "critical toast missing culprit or reclaimed MB context"
 fi
+stop_pid "$P"
+unset RAM_KEEPER_DAEMON_POLL RAM_KEEPER_PRESSURE_POLL
+
+echo
+echo "== 10. D-17 SO-2: EROFS (unwritable flags dir) keeps exact 3-toast ceiling & RAM dedupe =="
+new_case erofs-ratelimit
+chmod 0500 "$CASE/.local/state/ram-keeper/flags" 2>/dev/null || true
+if touch "$CASE/.local/state/ram-keeper/flags/.probe" 2>/dev/null; then
+  # On NTFS/root where chmod 0500 on a directory still allows writes, replace
+  # flags dir with a read-only regular file so touch/rate-file fail with ENOTDIR.
+  rm -rf "$CASE/.local/state/ram-keeper/flags"
+  : >"$CASE/.local/state/ram-keeper/flags"
+  chmod 0444 "$CASE/.local/state/ram-keeper/flags" 2>/dev/null || true
+fi
+cat >"$STUB/oom_lines" <<'EROFSEOF'
+Memory cgroup out of memory: Killed process 201 (ro1) total-vm:100kB
+Memory cgroup out of memory: Killed process 201 (ro1) total-vm:100kB
+Memory cgroup out of memory: Killed process 202 (ro2) total-vm:100kB
+Memory cgroup out of memory: Killed process 203 (ro3) total-vm:100kB
+Memory cgroup out of memory: Killed process 204 (ro4) total-vm:100kB
+EROFSEOF
+export RAM_KEEPER_DAEMON_POLL=2 RAM_KEEPER_PRESSURE_POLL=2
+P="$(launch)"
+wait_for 6 bash -c "(( \$(wc -l <'$STUB/toasts' | tr -d ' ') >= 3 ))" || sleep 2
+check "EROFS RAM fallback allowed all 3 distinct toasts (no off-by-one) and capped 4th" "$(toast_count)" "3"
+stop_pid "$P"
+chmod 0700 "$CASE/.local/state/ram-keeper/flags" 2>/dev/null || true
+unset RAM_KEEPER_DAEMON_POLL RAM_KEEPER_PRESSURE_POLL
+
+echo
+echo "== 11. SO-3: NaN / Infinity free_percent in state.json is rejected =="
+new_case nan-free
+printf '{"state":"critical","free_percent":NaN}\n' >"$CASE/.local/state/ram-keeper/state.json"
+export RAM_KEEPER_DAEMON_POLL=2 RAM_KEEPER_PRESSURE_POLL=1
+P="$(launch)"
+sleep 3
+check "NaN free_percent produced 0 toasts" "$(toast_count)" "0"
+printf '{"state":"critical","free_percent":Infinity}\n' >"$CASE/.local/state/ram-keeper/state.json"
+sleep 2
+check "Infinity free_percent produced 0 toasts" "$(toast_count)" "0"
 stop_pid "$P"
 unset RAM_KEEPER_DAEMON_POLL RAM_KEEPER_PRESSURE_POLL
 

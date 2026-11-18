@@ -31,14 +31,17 @@ fails=0
 test_out="$(mktemp "${TMPDIR:-/tmp}/ram-keeper-test.XXXXXX")"
 trap 'rm -f "$test_out" ${_own_cfg:+"$_own_cfg"}; [[ -n "$_own_state" ]] && rm -rf "$_own_state"' EXIT
 
-PY="${RAM_KEEPER_PYTHON:-}"
-if [[ -z "$PY" ]]; then
-  if [[ -x /usr/bin/python3 ]]; then
-    PY=/usr/bin/python3
-  else
-    PY="$(command -v python3 2>/dev/null || echo python3)"
+PY=""
+for _cand in "${RAM_KEEPER_PYTHON:-}" /usr/bin/python3 \
+             "$(command -v python3 2>/dev/null || true)" \
+             "$(command -v python 2>/dev/null || true)"; do
+  if [[ -n "$_cand" && -x "$_cand" ]] \
+     && "$_cand" -c "import sys" >/dev/null 2>&1; then
+    PY="$_cand"
+    break
   fi
-fi
+done
+[[ -n "$PY" ]] || PY=python3
 
 run() {
   local label="$1"; shift

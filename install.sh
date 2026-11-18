@@ -10,7 +10,7 @@ PLUGIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 UNIT_SRC="$PLUGIN_DIR/units/ram-keeper.service"
 NOTIFY_SRC="$PLUGIN_DIR/helper/ram_keeper_notify"
 UNIT_DST="$HOME/.config/systemd/user/ram-keeper.service"
-STATE_DIR="$HOME/.local/state/ram-keeper"
+STATE_DIR="${RAM_KEEPER_STATE_DIR:-$HOME/.local/state/ram-keeper}"
 
 say() { printf '\033[1;36m▸\033[0m %s\n' "$1"; }
 ok()  { printf '\033[1;32m✓\033[0m %s\n' "$1"; }
@@ -34,11 +34,13 @@ if [[ "${1:-}" == "--check" ]]; then
 
   say "running post-install health check (read-only)"
 
-  # 1. Find a python >= 3.9 interpreter.
+  # 1. Find a working python >= 3.9 interpreter (honouring RAM_KEEPER_PYTHON).
   CHECK_PY=""
-  for c in /usr/bin/python3 "$(command -v python3 2>/dev/null || true)"; do
+  for c in "${RAM_KEEPER_PYTHON:-}" /usr/bin/python3 \
+           "$(command -v python3 2>/dev/null || true)" \
+           "$(command -v python 2>/dev/null || true)"; do
     if [[ -n "$c" && -x "$c" ]] \
-       && "$c" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)' 2>/dev/null; then
+       && "$c" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)' >/dev/null 2>&1; then
       CHECK_PY="$c"
       break
     fi
@@ -130,8 +132,16 @@ if [[ "${1:-}" == "--check" ]]; then
   fi
 
   HERMES_ROOT="${HERMES_HOME:-$HOME/.hermes}"
-  if [[ -f "$HERMES_ROOT/skills/ram-memory-diagnosis/SKILL.md" ]]; then
-    check_ok "Hermes diagnosis skill present"
+  found_skill=""
+  for sk in "$HERMES_ROOT/skills/ram-memory-diagnosis/SKILL.md" \
+            "$HERMES_ROOT/profiles/"*/skills/ram-memory-diagnosis/SKILL.md; do
+    if [[ -f "$sk" ]]; then
+      found_skill="$sk"
+      break
+    fi
+  done
+  if [[ -n "$found_skill" ]]; then
+    check_ok "Hermes diagnosis skill present ($found_skill)"
   else
     say "Hermes skill optional: $HERMES_ROOT/skills/ram-memory-diagnosis/SKILL.md not installed"
   fi
@@ -170,9 +180,11 @@ stat -fc %T /sys/fs/cgroup 2>/dev/null | grep -q cgroup2fs \
   || die "cgroup v2 is required (found: $(stat -fc %T /sys/fs/cgroup 2>/dev/null))"
 
 PYTHON=""
-for candidate in /usr/bin/python3 "$(command -v python3 2>/dev/null || true)"; do
+for candidate in "${RAM_KEEPER_PYTHON:-}" /usr/bin/python3 \
+                 "$(command -v python3 2>/dev/null || true)" \
+                 "$(command -v python 2>/dev/null || true)"; do
   if [[ -n "$candidate" && -x "$candidate" ]]; then
-    if "$candidate" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)' 2>/dev/null; then
+    if "$candidate" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)' >/dev/null 2>&1; then
       PYTHON="$candidate"
       break
     fi

@@ -77,12 +77,25 @@ else
   echo "SKIP: full install skipped (no cgroup2fs); exercising --check"
 fi
 
-# Verify `--check` runs without mutating files and detects service health.
-"$PLUGIN/install.sh" --check >"$TMP/check.log" 2>&1 || true
+# Verify `--check` honours RAM_KEEPER_STATE_DIR and Hermes profile skills.
+mkdir -p "$TMP/custom-state/flags" "$TMP/hermes/profiles/dev/skills/ram-memory-diagnosis"
+touch "$TMP/hermes/profiles/dev/skills/ram-memory-diagnosis/SKILL.md"
+RAM_KEEPER_STATE_DIR="$TMP/custom-state" HERMES_HOME="$TMP/hermes" \
+  "$PLUGIN/install.sh" --check >"$TMP/check.log" 2>&1 || true
 if ! grep -q 'ram-keeper.service is running' "$TMP/check.log"; then
   cat "$TMP/check.log"
   echo "FAIL: install.sh --check did not report running service"
   exit 1
 fi
-echo "PASS: install.sh --check verified service state"
+if ! grep -q "state directory writable: $TMP/custom-state/flags" "$TMP/check.log"; then
+  cat "$TMP/check.log"
+  echo "FAIL: install.sh --check ignored RAM_KEEPER_STATE_DIR"
+  exit 1
+fi
+if ! grep -q "Hermes diagnosis skill present" "$TMP/check.log"; then
+  cat "$TMP/check.log"
+  echo "FAIL: install.sh --check missed Hermes profile skill"
+  exit 1
+fi
+echo "PASS: install.sh --check verified service state, RAM_KEEPER_STATE_DIR and Hermes skill"
 exit 0

@@ -6,6 +6,7 @@ sandbox rules live in systemd, not in us. On a machine with no user manager
 unrelated to the code.
 """
 
+import importlib.util
 import json
 import os
 import re
@@ -13,12 +14,16 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 
 try:
     import pytest
+    _USING_PYTEST_SHIM = False
 except ImportError:  # pragma: no cover - fallback when pytest is absent
+    _USING_PYTEST_SHIM = True
+
     class _RaisesCtx:
         def __init__(self, exc_type):
             self.exc_type = exc_type
@@ -434,10 +439,15 @@ def test_notifier_hardening_invariants():
     notifier = (PLUGIN / "helper" / "ram_keeper_notify").read_text(encoding="utf-8")
     assert "journalctl -f -n 0 -o json" in notifier
     assert "_TRANSPORT" in notifier and "systemd-oomd.service" in notifier
+    assert "out of memory: killed process" in notifier
+    assert "due to memory pressure" in notifier
     assert 'basename -- ' in notifier
     assert "sanitize_victim" in notifier
     assert "can_announce" in notifier and "mark_announced" in notifier
     assert "MEM_DEDUPE" in notifier
+    assert '("${live[@]:-}")' not in notifier
+    assert "math.isfinite(free)" in notifier
+    assert "S_ISREG" in notifier
     assert "rate_limit_check_and_record" in notifier
     assert "flock -n 9" in notifier
     assert "cleanup_notifier" in notifier
@@ -458,6 +468,10 @@ def test_ci_portability_and_process_guardian_retirement():
     assert "test_config_isolation.py" in run_all
     assert "printf '{}\\n'" in run_all
 
+    installer = (PLUGIN / "install.sh").read_text(encoding="utf-8")
+    assert 'STATE_DIR="${RAM_KEEPER_STATE_DIR:-$HOME/.local/state/ram-keeper}"' in installer
+    assert "profiles/" in installer
+
     for rel in ("tests/ci-suite.sh", "tests/run-all.sh", "README.md", "UPDATE_RECOMMENDATIONS.md"):
         content = (PLUGIN / rel).read_text(encoding="utf-8")
         assert "process_guardian" not in content, rel
@@ -469,30 +483,74 @@ def test_ci_portability_and_process_guardian_retirement():
     assert "psi_full_abort_percent" in cfg_doc
 
 
-class _UnittestBridge(unittest.TestCase):
-    """Allows `python -m unittest tests/test_unit_hardening.py` when pytest is absent."""
+def test_real_pytest_does_not_collect_unittest_bridge():
+    """Regression SO-1: when real pytest is imported, no TestCase runs parametrized/live funcs."""
+    fake_pytest = types.ModuleType("pytest")
 
-    def test_non_live_suite(self):
-        g = globals()
-        for name, obj in list(g.items()):
-            if not name.startswith("test_") or not callable(obj):
-                continue
-            if getattr(obj, "_skip_cond", False):
-                continue
-            param = getattr(obj, "_parametrize", None)
-            if param:
-                _arg, vals = param
-                for v in vals:
-                    with self.subTest(test=name, value=v):
-                        if "tmp_path" in obj.__code__.co_varnames:
-                            with tempfile.TemporaryDirectory() as td:
-                                obj(Path(td), v)
-                        else:
-                            obj(v)
-            else:
-                with self.subTest(test=name):
-                    obj()
+    class _RealMark:
+        @staticmethod
+        def skipif(cond, reason=""):
+            def deco(fn):
+                fn.pytestmark = [("skipif", cond, reason)]
+                return fn
+            return deco
+
+        @staticmethod
+        def parametrize(argname, values):
+            def deco(fn):
+                fn.pytestmark = [("parametrize", argname, values)]
+                return fn
+            return deco
+
+    fake_pytest.mark = _RealMark()
+    fake_pytest.raises = unittest.TestCase().assertRaises
+
+    prev = sys.modules.get("pytest")
+    sys.modules["pytest"] = fake_pytest
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "_probe_unit_hardening_real_pytest", Path(__file__).resolve()
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        assert mod._USING_PYTEST_SHIM is False
+        suite = unittest.defaultTestLoader.loadTestsFromModule(mod)
+        assert suite.countTestCases() == 0
+    finally:
+        if prev is None:
+            sys.modules.pop("pytest", None)
+        else:
+            sys.modules["pytest"] = prev
+
+
+if _USING_PYTEST_SHIM:
+    class _UnittestBridge(unittest.TestCase):
+        """Allows `python -m unittest` when pytest is absent, invisible to real pytest."""
+
+        def test_non_live_suite(self):
+            g = globals()
+            for name, obj in list(g.items()):
+                if not name.startswith("test_") or not callable(obj):
+                    continue
+                if getattr(obj, "_skip_cond", False):
+                    continue
+                param = getattr(obj, "_parametrize", None)
+                if param:
+                    _arg, vals = param
+                    for v in vals:
+                        with self.subTest(test=name, value=v):
+                            if "tmp_path" in obj.__code__.co_varnames:
+                                with tempfile.TemporaryDirectory() as td:
+                                    obj(Path(td), v)
+                            else:
+                                obj(v)
+                else:
+                    with self.subTest(test=name):
+                        obj()
 
 
 if __name__ == "__main__":
-    unittest.main(verbosity=2)
+    if _USING_PYTEST_SHIM:
+        unittest.main(verbosity=2)
+    else:
+        raise SystemExit(pytest.main([__file__, "-v"]))
