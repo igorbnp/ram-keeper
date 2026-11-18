@@ -403,9 +403,12 @@ def test_workflows_have_no_duplicate_yaml_keys():
 
 
 def test_release_and_manifest_version_contract():
-    """D-18: manifest is 1.2.0 and release.yml detects prerelease tags dynamically."""
+    """D-18: manifest uses valid SemVer >= 1.2.1 and release.yml detects prerelease tags dynamically."""
     manifest = json.loads((PLUGIN / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest["version"] == "1.2.0"
+    ver = str(manifest.get("version") or "")
+    m = re.match(r"^(\d+)\.(\d+)\.(\d+)(?:-[0-9A-Za-z.-]+)?$", ver)
+    assert m is not None, f"invalid SemVer in manifest.json: {ver!r}"
+    assert (int(m.group(1)), int(m.group(2)), int(m.group(3))) >= (1, 2, 1)
 
     rel = (PLUGIN / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
     assert "steps.meta.outputs.prerelease" in rel
