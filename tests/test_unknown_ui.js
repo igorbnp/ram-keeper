@@ -1,9 +1,11 @@
 // The `unknown` state must never render as "Healthy" — an unreadable signal
 // claiming all-clear is worse than no signal.
+const fs = require("fs");
 const path = require("path");
 // Resolve from this file's own location so the suite runs from a fresh clone.
 const PLUGIN = path.join(__dirname, "..");
 const M_PATH = path.join(PLUGIN, "qml", "Model.js");
+const PANEL_PATH = path.join(PLUGIN, "qml", "Panel.qml");
 
 const M = require(M_PATH);
 let fail = 0;
@@ -46,12 +48,51 @@ check("valid snapshot retains its forecast",
         && M.forecastForSnapshot({ state: "ok", memory_reading_valid: true,
                                    forecast: staleForecast }).urgency === "imminent");
 
+// D-20: watchLine, barLabel, barTooltip, heroMeta, and trendArrow must never
+// report healthy/watching or show stale trends when the sensor is unreadable.
+const unknownWatch = M.watchLine(missingReading, true);
+check("unknown watchLine does not claim nothing is needed",
+      unknownWatch.indexOf("nothing needed") < 0
+        && unknownWatch.indexOf("Watching automatically") < 0
+        && /unavailable/i.test(unknownWatch),
+      unknownWatch);
+check("unknown barLabel is '--'", M.barLabel(missingReading) === "--", M.barLabel(missingReading));
+check("unknown barTooltip says unavailable",
+      /unavailable/i.test(M.barTooltip(missingReading)), M.barTooltip(missingReading));
+check("unknown heroMeta explains unreadable memory",
+      /could not read memory/i.test(M.heroMeta(missingReading)), M.heroMeta(missingReading));
+check("unknown trendArrow is empty even with stale forecast",
+      M.trendArrow({ state: "unknown", memory_reading_valid: false, forecast: staleForecast }) === "");
+
+// D-20: Panel.qml must hide swap legend, noise-floor notice, and NEVER RECLAIMED
+// header when state === "unknown" even if zram.devices / groups are populated.
+const panelSrc = fs.readFileSync(PANEL_PATH, "utf8");
+function blockAround(needle) {
+  const idx = panelSrc.indexOf(needle);
+  if (idx < 0) return "";
+  const start = panelSrc.lastIndexOf("{", idx);
+  return panelSrc.slice(start, idx + needle.length + 120);
+}
+check("Panel swap legend guarded against unknown state",
+      /!Model\.isUnknown\(root\.state\)/.test(blockAround("Swap on zram stays in RAM")));
+check("Panel noise-floor notice guarded against unknown state",
+      /!Model\.isUnknown\(root\.state\)/.test(blockAround("Nothing above the noise floor")));
+check("Panel NEVER RECLAIMED header guarded against unknown state",
+      /!Model\.isUnknown\(root\.state\)/.test(blockAround('text: "NEVER RECLAIMED"')));
+
 const missingBreakdown = { state: "ok", memory_reading_valid: true,
                            memory_breakdown_valid: false, mem_total: 1000,
                            mem_available: 300, mem_used: 700,
                            cached: null, anon_and_kernel: null, groups: [] };
 check("no bar for unavailable memory breakdown", M.memoryPercentages(missingBreakdown).length === 0);
 check("no legend for unavailable memory breakdown", M.memorySegments(missingBreakdown).length === 0);
+
+const staleUnknownNumbers = { state: "unknown", memory_reading_valid: false,
+                              mem_total: 8e9, mem_used: 4e9, cached: 2e9 };
+check("no bar when state is unknown even with stale non-zero mem_total",
+      M.memoryPercentages(staleUnknownNumbers).length === 0);
+check("no legend when state is unknown even with stale non-zero mem_total",
+      M.memorySegments(staleUnknownNumbers).length === 0);
 
 // A healthy snapshot must still work (regression guard: the guard above must
 // not have broken the normal case).

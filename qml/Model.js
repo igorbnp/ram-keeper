@@ -8,15 +8,39 @@
 // Units and formatting
 // ---------------------------------------------------------------------------
 
+function safeNonNeg(value) {
+  if (value === null || value === undefined || typeof value === "boolean"
+      || typeof value === "object") {
+    return 0;
+  }
+  var n = Number(value);
+  return (isFinite(n) && n > 0) ? n : 0;
+}
+
 function formatBytes(bytes) {
+  if (bytes === null || bytes === undefined || typeof bytes === "boolean"
+      || Array.isArray(bytes)
+      || (typeof bytes === "string" && bytes.trim() === "")) {
+    return "0 MB";
+  }
   var n = Number(bytes);
   if (!isFinite(n) || n < 0) return "0 MB";
-  if (n < 1024) return Math.round(n) + " B";
+  if (n < 1024) {
+    var b = Math.round(n);
+    return b < 1024 ? b + " B" : "1 KB";
+  }
+  var kb = n / 1024;
+  if (Math.round(kb) < 1024) return Math.round(kb) + " KB";
   var mb = n / 1048576;
-  if (mb < 1024) return (mb < 10 ? mb.toFixed(1) : Math.round(mb)) + " MB";
+  if (Math.round(mb) < 1024) {
+    var mb1 = Number(mb.toFixed(1));
+    return (mb1 < 10 ? mb.toFixed(1) : Math.round(mb)) + " MB";
+  }
   var gb = mb / 1024;
-  if (gb < 100) return (gb < 10 ? gb.toFixed(2) : gb.toFixed(1)) + " GB";
-  return Math.round(gb) + " GB";
+  var gb1 = Number(gb.toFixed(1));
+  if (gb1 >= 100) return Math.round(gb) + " GB";
+  var gb2 = Number(gb.toFixed(2));
+  return (gb2 < 10 ? gb.toFixed(2) : gb.toFixed(1)) + " GB";
 }
 
 function formatRate(bytes) {
@@ -39,13 +63,19 @@ function formatRate(bytes) {
 // wide (clipped, so it looks full) and a legend claiming more memory than the
 // machine has. The total is the authority; the parts are clamped into it.
 function memoryParts(snapshot) {
-  if (!snapshot || snapshot.memory_breakdown_valid === false) return null;
+  if (!snapshot || typeof snapshot !== "object"
+      || snapshot.state === "unknown"
+      || snapshot.memory_reading_valid === false
+      || snapshot.memory_breakdown_valid === false) {
+    return null;
+  }
   var total = Number(snapshot.mem_total);
   if (!isFinite(total) || total <= 0) return null;
-  var used = Math.max(0, Number(snapshot.mem_used) || 0);
-  var cached = Math.max(0, Number(snapshot.cached) || 0);
+  var used = Math.min(total, safeNonNeg(snapshot.mem_used));
+  var cached = Math.min(total, safeNonNeg(snapshot.cached));
   var apps = Number(snapshot.anon_and_kernel);
-  if (!isFinite(apps) || apps < 0) {
+  if (!isFinite(apps) || apps < 0 || snapshot.anon_and_kernel === null
+      || typeof snapshot.anon_and_kernel === "boolean") {
     apps = Math.max(0, Math.min(used - cached, used));
   }
   apps = Math.max(0, Math.min(total, apps));
@@ -123,20 +153,23 @@ function isWarning(state) {
 // crossing a line; this reacts to its direction, which is the only way to act
 // before the line is crossed.
 function forecastRow(forecast) {
-  if (!forecast) return null;
-  var rate = Number(forecast.rate_bytes_per_sec) || 0;
-  var horizon = Number(forecast.horizon_seconds) || 0;
-  var urgency = forecast.urgency || "none";
-  var culprit = forecast.culprit || "";
+  if (!forecast || typeof forecast !== "object" || Array.isArray(forecast)) return null;
+  var rate = Number(forecast.rate_bytes_per_sec);
+  if (!isFinite(rate)) rate = 0;
+  var horizon = safeNonNeg(forecast.horizon_seconds);
+  var conf = safeNonNeg(forecast.confidence);
+  var urgency = typeof forecast.urgency === "string" && forecast.urgency ? forecast.urgency : "none";
+  var culprit = typeof forecast.culprit === "string" ? forecast.culprit : "";
+  var willCross = forecast.will_cross === true;
 
   var text;
-  if (urgency === "none" || !forecast.will_cross) {
+  if (urgency === "none" || !willCross) {
     if (Math.abs(rate) < 4 * 1024 * 1024) {
       text = "Steady — nothing is trending";
     } else {
       text = rate < 0
         ? "Falling " + formatBytes(Math.abs(rate)) + "/s"
-        : "Rising " + formatBytes(rate) + "/s";
+        : "Recovering +" + formatBytes(rate) + "/s";
     }
   } else if (urgency === "imminent") {
     text = "Will hit the floor in " + horizonLabel(horizon);
@@ -148,14 +181,19 @@ function forecastRow(forecast) {
 
   if (culprit && rate < 0) text += " · " + culprit + " is growing";
 
+  // Only flag as a warning when the forecast actually predicts crossing the
+  // threshold. A "Steady" or "Recovering" forecast with will_cross:false must
+  // never paint orange/red — the user would see urgency colour on a calm machine.
+  var warn = Boolean(willCross && (urgency === "soon" || urgency === "imminent"));
+
   return {
     urgency: urgency,
     horizonSeconds: horizon,
     rateBytesPerSec: rate,
-    confidence: Number(forecast.confidence) || 0,
+    confidence: conf,
     culprit: culprit,
     text: text,
-    isWarning: urgency === "soon" || urgency === "imminent"
+    isWarning: warn
   };
 }
 
@@ -167,7 +205,7 @@ function forecastForSnapshot(snapshot) {
 // Humanise a horizon. Seconds matter when they are small — "in 45s" is
 // actionable, "in 0.01 minutes" is noise.
 function horizonLabel(seconds) {
-  var s = Number(seconds) || 0;
+  var s = Number(seconds);
   if (!isFinite(s) || s <= 0) return "under a minute";
   if (s < 90) return Math.round(s) + "s";
   if (s < 5400) return Math.round(s / 60) + " min";
@@ -188,30 +226,39 @@ function rowAction(group) {
 }
 
 function reclaimableGroups(snapshot, limit) {
-  if (!snapshot || !snapshot.groups) return [];
-  var rows = snapshot.groups
-    .filter(function (g) {
-      if (g.protected) return false;
-      if (!g.reclaimable && !g.anon) return false;
-      return (g.reclaimable + g.anon) > 64 * 1024 * 1024;
-    })
-    .map(function (g) {
-      var give = (g.reclaimable || 0) + (g.anon || 0);
-      return {
-        key: g.name,
-        label: g.label || g.name,
-        bytes: g.current || 0,
-        anon: g.anon || 0,
-        cache: g.reclaimable || 0,
-        swap: g.swap || 0,
-        swapable: g.swapable !== false,
-        give: give,
-        protected: g.protected === true,
-        inviolable: g.inviolable === true,
-        action: rowAction(g),
-        kind: g.kind || ""
-      };
+  if (!snapshot || !Array.isArray(snapshot.groups)) return [];
+  var rows = [];
+  for (var i = 0; i < snapshot.groups.length; i++) {
+    var g = snapshot.groups[i];
+    if (!g || typeof g !== "object") continue;
+    if (g.protected) continue;
+    // swapable:false means MemorySwapMax=0 — the kernel will not move anon
+    // pages to zram, so only file/cache is recoverable.
+    var canSwap = g.swapable !== false;
+    var recl = safeNonNeg(g.reclaimable);
+    var anon = safeNonNeg(g.anon);
+    var give = recl + (canSwap ? anon : 0);
+    if (give <= 64 * 1024 * 1024) continue;
+    var thrashing = g.thrashing === true;
+    var giveLbl = formatBytes(give);
+    rows.push({
+      key: String(g.name || ""),
+      label: String(g.label || g.name || "process"),
+      bytes: safeNonNeg(g.current),
+      anon: anon,
+      cache: recl,
+      swap: safeNonNeg(g.swap),
+      swapable: canSwap,
+      give: give,
+      giveLabel: giveLbl,
+      thrashing: thrashing,
+      subLabel: "can free " + giveLbl + (thrashing ? " · thrashing" : ""),
+      protected: g.protected === true,
+      inviolable: g.inviolable === true,
+      action: rowAction(g),
+      kind: String(g.kind || "")
     });
+  }
   // Ordered by what this pass could RECOVER, which is not the same as size: a
   // 2 GB process holding 150 MB of giveable memory matters less than a 500 MB
   // process that can give 500 MB. The section is titled "available to reclaim",
@@ -221,21 +268,21 @@ function reclaimableGroups(snapshot, limit) {
 }
 
 function protectedGroups(snapshot, limit) {
-  if (!snapshot || !snapshot.groups) return [];
+  if (!snapshot || !Array.isArray(snapshot.groups)) return [];
   var rows = snapshot.groups
-    .filter(function (g) { return g.protected === true; })
+    .filter(function (g) { return g && typeof g === "object" && g.protected === true; })
     .map(function (g) {
       return {
-        key: g.name,
-        label: g.label || g.name,
-        bytes: g.current || 0,
-        anon: g.anon || 0,
-        cache: g.reclaimable || 0,
-        swap: g.swap || 0,
+        key: String(g.name || ""),
+        label: String(g.label || g.name || "protected"),
+        bytes: safeNonNeg(g.current),
+        anon: safeNonNeg(g.anon),
+        cache: safeNonNeg(g.reclaimable),
+        swap: safeNonNeg(g.swap),
         protected: true,
         inviolable: g.inviolable === true,
         action: rowAction(g),
-        kind: g.kind || ""
+        kind: String(g.kind || "")
       };
     });
   rows.sort(function (a, b) { return b.bytes - a.bytes; });
@@ -249,22 +296,34 @@ function protectedGroups(snapshot, limit) {
 // zram at 90% is NOT a problem: its "full" state is compressed RAM, not a
 // disk stall. Only flag the disk swapfile, which is the slow one.
 function swapRows(snapshot) {
-  if (!snapshot || !snapshot.zram || !snapshot.zram.devices) return [];
-  return snapshot.zram.devices.map(function (d) {
-    var isZram = String(d.name || "").indexOf("zram") >= 0;
-    var fraction = d.size > 0 ? d.used / d.size : 0;
-    return {
-      key: d.name,
-      label: isZram ? "zram (RAM)" : String(d.name || "swap"),
-      shortLabel: isZram ? "zram" : "disk",
-      bytes: d.used || 0,
-      size: d.size || 0,
-      fraction: fraction,
-      // Only disk swap degrades performance; zram swap is nearly free.
-      isConcern: !isZram && fraction > 0.25,
-      isZram: isZram
-    };
-  });
+  if (!snapshot || !snapshot.zram || !Array.isArray(snapshot.zram.devices)) return [];
+  return snapshot.zram.devices
+    .filter(function (d) { return d && typeof d === "object"; })
+    .map(function (d) {
+      // Prefer the daemon's own ram_backed flag; fall back to case-insensitive
+      // name heuristic only when the flag is absent (older daemon versions).
+      var isZram = typeof d.ram_backed === "boolean"
+        ? d.ram_backed
+        : String(d.name || "").toLowerCase().indexOf("zram") >= 0;
+      var size = safeNonNeg(d.size);
+      var used = safeNonNeg(d.used);
+      var fraction = size > 0 ? Math.min(1, used / size) : 0;
+      if (!isFinite(fraction) || fraction < 0) fraction = 0;
+      var isConcern = !isZram && fraction > 0.25;
+      var rawName = String(d.name || "swap");
+      return {
+        key: rawName,
+        label: isZram ? "zram (RAM)" : (isConcern ? rawName + " (slow disk)" : rawName),
+        shortLabel: isZram ? "zram" : "disk",
+        badge: isZram ? "RAM" : (isConcern ? "SLOW DISK" : "disk"),
+        bytes: used,
+        size: size,
+        fraction: fraction,
+        // Only disk swap degrades performance; zram swap is nearly free.
+        isConcern: isConcern,
+        isZram: isZram
+      };
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -276,7 +335,8 @@ function psiRow(psi) {
       || !isFinite(psi.some_avg60) || psi.some_avg60 < 0) {
     return { stallPercent: 0, severity: "unavailable", available: false };
   }
-  var stall = Math.max(psi.some_avg60, Number(psi.full_avg60) || 0);
+  var full60 = safeNonNeg(psi.full_avg60);
+  var stall = Math.max(psi.some_avg60, full60);
   var severity = "ok";
   if (stall >= 20) severity = "critical";
   else if (stall >= 6) severity = "warning";
@@ -287,7 +347,8 @@ function psiRow(psi) {
 function psiLabel(row) {
   if (!row || row.severity === "unavailable" || row.available === false) return "Unavailable";
   if (row.severity === "ok") return "None";
-  return row.stallPercent.toFixed(1) + "%";
+  var pct = safeNonNeg(row.stallPercent);
+  return pct.toFixed(1) + "%";
 }
 
 // ---------------------------------------------------------------------------
@@ -301,12 +362,14 @@ function parseSnapshot(raw) {
   } catch (e) {
     return null;
   }
-  if (!data || typeof data !== "object") return null;
+  if (!data || typeof data !== "object" || Array.isArray(data)) return null;
   // A fresh daemon snapshot with invalid memory metrics is still useful: it
   // tells the panel the sensor is unreadable. Do not reject it and keep an old
   // healthy reading on screen.
   if (data.state === "unknown" && data.memory_reading_valid === false) return data;
-  if (!data.mem_total) return null;
+  if (data.mem_total === null || typeof data.mem_total === "boolean") return null;
+  var mt = Number(data.mem_total);
+  if (!isFinite(mt) || mt <= 0) return null;
   return data;
 }
 
@@ -319,7 +382,7 @@ function parseResult(raw) {
   } catch (e) {
     return null;
   }
-  return (data && typeof data === "object") ? data : null;
+  return (data && typeof data === "object" && !Array.isArray(data)) ? data : null;
 }
 
 // The helper emits one JSON object; anything else means a broken run.
@@ -330,22 +393,83 @@ function parseJsonLine(line) {
 }
 
 function summaryLine(result) {
-  if (!result) return "";
+  if (!result || typeof result !== "object" || Array.isArray(result)) return "";
   if (result.skipped_anon === "no-zram-room" && !result.acted) {
     return "App memory was not moved to disk swap";
   }
+  if (result.skipped_anon === "psi-full-thrash" && !result.acted) {
+    return "Skipped swap — system is thrashing";
+  }
   if (!result.acted) return "Nothing to do — memory is comfortable";
   var parts = [];
-  if (result.freed > 0) parts.push("freed " + formatBytes(result.freed));
-  if (result.swapped_out > 0) parts.push("moved " + formatBytes(result.swapped_out) + " to zram");
+  var freed = safeNonNeg(result.freed);
+  var swapped = safeNonNeg(result.swapped_out);
+  if (freed > 0) parts.push("freed " + formatBytes(freed));
+  if (swapped > 0) parts.push("moved " + formatBytes(swapped) + " to zram");
   if (result.skipped_anon === "no-zram-room") parts.push("app memory was not moved to disk swap");
+  if (result.skipped_anon === "psi-full-thrash") parts.push("skipped swap due to thrashing");
   if (parts.length === 0) parts.push("no change");
   return parts.join(" · ");
 }
 
-function watchLine(snapshot, daemonUp) {
+// ---------------------------------------------------------------------------
+// F2 — Pause/snooze state helpers
+// ---------------------------------------------------------------------------
+
+function parsePauseState(snapshot, nowSeconds) {
+  if (!snapshot || typeof snapshot !== "object") {
+    return { paused: false, label: "", remaining: 0 };
+  }
+  if (snapshot.paused !== true) {
+    return { paused: false, label: "", remaining: 0 };
+  }
+  var untilRaw = snapshot.paused_until;
+  var hasUntil = untilRaw !== null && untilRaw !== undefined
+    && typeof untilRaw !== "boolean" && typeof untilRaw !== "object"
+    && isFinite(Number(untilRaw)) && Number(untilRaw) > 0;
+  var untilSec = hasUntil ? Number(untilRaw) : 0;
+  var nowSec = (nowSeconds !== undefined && nowSeconds !== null
+    && typeof nowSeconds !== "boolean" && typeof nowSeconds !== "object"
+    && isFinite(Number(nowSeconds)) && Number(nowSeconds) > 0)
+    ? Number(nowSeconds) : 0;
+
+  var remaining = 0;
+  if (hasUntil && nowSec > 0) {
+    remaining = Math.max(0, Math.round(untilSec - nowSec));
+  } else {
+    remaining = Math.round(safeNonNeg(snapshot.paused_remaining_s));
+    if (remaining === 0 && hasUntil) {
+      var refNow = safeNonNeg(snapshot.checked_at);
+      if (refNow > 0 && untilSec > refNow) {
+        remaining = Math.max(0, Math.round(untilSec - refNow));
+      }
+    }
+  }
+
+  var label = remaining > 0
+    ? ("Snoozed · resumes in " + horizonLabel(remaining))
+    : (hasUntil ? "Snoozed · resuming soon" : "Paused indefinitely");
+  return { paused: true, label: label, remaining: remaining };
+}
+
+function watchLine(snapshot, daemonUp, nowSeconds) {
+  var ps = parsePauseState(snapshot, nowSeconds);
+  if (ps.paused) {
+    if (ps.remaining > 0) {
+      return "Automatic protection snoozed · resumes in " + horizonLabel(ps.remaining);
+    }
+    if (ps.label === "Snoozed · resuming soon") {
+      return "Automatic protection snoozed · resuming soon";
+    }
+    return "Automatic protection is paused";
+  }
   if (!daemonUp) return "Automatic protection is paused";
-  var held = snapshot && Array.isArray(snapshot.held_by) ? snapshot.held_by : [];
+  if (snapshot && (snapshot.state === "unknown" || snapshot.memory_reading_valid === false)) {
+    return "Memory reading unavailable — cannot read /proc/meminfo";
+  }
+  var held = snapshot && Array.isArray(snapshot.held_by)
+    ? snapshot.held_by.filter(function (h) { return typeof h === "string" && h.length > 0; })
+    : [];
   if (held.length) {
     return "Memory is critically low. Protected apps are holding it: " + held.join(", ");
   }
@@ -353,6 +477,9 @@ function watchLine(snapshot, daemonUp) {
   if (relief && relief.skipped_anon === "no-zram-room") {
     if (relief.acted) return "Dropped cache. App memory was not moved to disk swap.";
     return "Memory is tight. App memory was not moved to disk swap.";
+  }
+  if (relief && relief.skipped_anon === "psi-full-thrash") {
+    return "Memory is stalling · skipped swap because the system is thrashing.";
   }
   return "Watching automatically · nothing needed from you";
 }
@@ -363,18 +490,130 @@ function watchLine(snapshot, daemonUp) {
 
 function freePercentLabel(snapshot) {
   if (!snapshot || snapshot.state === "unknown" || snapshot.memory_reading_valid === false) return "--%";
+  if (snapshot.free_percent === null || typeof snapshot.free_percent === "boolean") return "--%";
   var percent = Number(snapshot.free_percent);
   if (!isFinite(percent)) return "--%";
   return Math.round(percent) + "%";
 }
 
 function freeFraction(snapshot) {
-  if (!snapshot || !snapshot.mem_total) return 1;
-  return Math.max(0, Math.min(1, Number(snapshot.free_percent || 0) / 100));
+  if (!snapshot || safeNonNeg(snapshot.mem_total) <= 0) return 1;
+  if (snapshot.free_percent === null || typeof snapshot.free_percent === "boolean") return 1;
+  var pct = Number(snapshot.free_percent);
+  if (!isFinite(pct)) return 1;
+  return Math.max(0, Math.min(1, pct / 100));
 }
 
 function usedFraction(snapshot) {
   return 1 - freeFraction(snapshot);
+}
+
+// ---------------------------------------------------------------------------
+// F3 — Trend arrow, rich tooltip/hero, and session impact
+// ---------------------------------------------------------------------------
+
+// A subtle directional arrow for the bar label: "38% ↓" when memory is falling
+// fast enough to notice, "38% ↑" when it is recovering, nothing when steady.
+function trendArrow(snapshot) {
+  if (!snapshot || snapshot.state === "unknown" || snapshot.memory_reading_valid === false) return "";
+  var fc = snapshot.forecast;
+  if (!fc || typeof fc !== "object") return "";
+  var rate = Number(fc.rate_bytes_per_sec);
+  if (!isFinite(rate)) return "";
+  if (fc.will_cross === true && (fc.urgency === "imminent" || fc.urgency === "soon") && rate < 0) {
+    return " ↓";
+  }
+  if (Math.abs(rate) < 4 * 1024 * 1024) return "";
+  if (fc.confidence !== undefined && fc.confidence !== null) {
+    var conf = Number(fc.confidence);
+    if (!isFinite(conf) || conf < 0.35) return "";
+  }
+  return rate < 0 ? " ↓" : " ↑";
+}
+
+// Enhanced bar label: percentage + trend arrow (when relevant).
+function barLabel(snapshot) {
+  if (!snapshot || snapshot.state === "unknown" || snapshot.memory_reading_valid === false) return "--";
+  var pct = freePercentLabel(snapshot);
+  if (pct === "--%") return "--";
+  return pct + trendArrow(snapshot);
+}
+
+// Rich tooltip with ETA and culprit when available.
+function barTooltip(snapshot, nowSeconds) {
+  if (!snapshot || typeof snapshot !== "object") return "Measuring memory…";
+  if (snapshot.state === "unknown" || snapshot.memory_reading_valid === false) {
+    return "Memory reading unavailable";
+  }
+  var pct = freePercentLabel(snapshot);
+  var label = stateLabel(snapshot.state);
+  var tip = pct + " memory free — " + label;
+  var ps = parsePauseState(snapshot, nowSeconds);
+  if (ps.paused) return tip + " · " + ps.label;
+  var fc = forecastForSnapshot(snapshot);
+  if (fc && fc.isWarning && fc.horizonSeconds > 0) {
+    tip += " · floor in " + horizonLabel(fc.horizonSeconds);
+    if (fc.culprit) tip += " (" + fc.culprit + ")";
+  }
+  return tip;
+}
+
+// PanelHero subtitle with available/total plus live ETA or snooze countdown.
+function heroMeta(snapshot, nowSeconds) {
+  if (!snapshot || typeof snapshot !== "object") return "";
+  if (snapshot.state === "unknown" || snapshot.memory_reading_valid === false) {
+    return "The daemon could not read memory";
+  }
+  var base = formatBytes(snapshot.mem_available) + " available of "
+    + formatBytes(snapshot.mem_total);
+  var ps = parsePauseState(snapshot, nowSeconds);
+  if (ps.paused) return base + " · " + ps.label;
+  var fc = forecastForSnapshot(snapshot);
+  if (fc && fc.isWarning && fc.horizonSeconds > 0) {
+    base += " · floor in " + horizonLabel(fc.horizonSeconds);
+    if (fc.culprit) base += " · " + fc.culprit;
+  }
+  return base;
+}
+
+// Session impact summary: "Saved 1.00 GB · 5 actions · 512 MB freed 5 min ago"
+function sessionImpactRow(snapshot, nowSeconds) {
+  if (!snapshot || typeof snapshot !== "object" || !snapshot.session_stats
+      || typeof snapshot.session_stats !== "object") {
+    return null;
+  }
+  var ss = snapshot.session_stats;
+  var freed = safeNonNeg(ss.bytes_freed);
+  var actions = Math.round(safeNonNeg(ss.actions));
+  if (actions === 0 && freed === 0) return null;
+
+  var parts = [];
+  if (freed > 0) parts.push("Saved " + formatBytes(freed));
+  if (actions > 0) parts.push(actions + (actions === 1 ? " action" : " actions"));
+
+  var lastLabel = "";
+  var lastTs = safeNonNeg(ss.last_relief_ts);
+  var nowSec = Number(nowSeconds);
+  if (lastTs > 0 && isFinite(nowSec) && nowSec >= lastTs) {
+    var ago = nowSec - lastTs;
+    var agoStr = ago < 90 ? Math.max(1, Math.round(ago)) + "s ago"
+      : ago < 5400 ? Math.round(ago / 60) + " min ago"
+      : (ago / 3600).toFixed(1) + " h ago";
+    var lastBytes = safeNonNeg(ss.last_relief_bytes);
+    var who = typeof ss.last_relief_label === "string" && ss.last_relief_label.trim() !== ""
+      ? " (" + ss.last_relief_label.trim() + ")" : "";
+    if (lastBytes > 0) {
+      lastLabel = formatBytes(lastBytes) + who + " freed " + agoStr;
+    } else {
+      lastLabel = "last relief" + who + " " + agoStr;
+    }
+  }
+
+  return {
+    text: parts.join(" · ") + (lastLabel ? " · " + lastLabel : ""),
+    bytesSaved: freed,
+    actions: actions
+  };
 }
 
 // The shell loads this file as a plain QML import; the CommonJS export below
@@ -383,6 +622,7 @@ if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     formatBytes: formatBytes,
     formatRate: formatRate,
+    memoryParts: memoryParts,
     memorySegments: memorySegments,
     memoryPercentages: memoryPercentages,
     stateLabel: stateLabel,
@@ -393,6 +633,7 @@ if (typeof module !== "undefined" && module.exports) {
     forecastRow: forecastRow,
     forecastForSnapshot: forecastForSnapshot,
     horizonLabel: horizonLabel,
+    rowAction: rowAction,
     reclaimableGroups: reclaimableGroups,
     protectedGroups: protectedGroups,
     swapRows: swapRows,
@@ -402,9 +643,15 @@ if (typeof module !== "undefined" && module.exports) {
     parseResult: parseResult,
     parseJsonLine: parseJsonLine,
     summaryLine: summaryLine,
+    parsePauseState: parsePauseState,
     watchLine: watchLine,
     freePercentLabel: freePercentLabel,
     freeFraction: freeFraction,
-    usedFraction: usedFraction
+    usedFraction: usedFraction,
+    trendArrow: trendArrow,
+    barLabel: barLabel,
+    barTooltip: barTooltip,
+    heroMeta: heroMeta,
+    sessionImpactRow: sessionImpactRow
   };
 }
