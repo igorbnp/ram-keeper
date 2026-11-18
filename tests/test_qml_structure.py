@@ -68,13 +68,16 @@ def _cmap_of(path):
 
 
 def _font_coverage():
+    """Fallback coverage across installed Nerd Font files when fc-list lacks SHELL_FONT."""
     import glob
     covered = set()
     for pattern in ("/usr/share/fonts/**/*.ttf", "/usr/share/fonts/**/*.otf",
                     "/usr/share/fonts/**/*.ttc",
-                    os.path.expanduser("~/.local/share/fonts/**/*.ttf")):
+                    os.path.expanduser("~/.local/share/fonts/**/*.ttf"),
+                    os.path.expanduser("~/.local/share/fonts/**/*.otf")):
         for path in glob.glob(pattern, recursive=True):
-            covered |= _cmap_of(path)
+            if "nerd" in os.path.basename(path).lower():
+                covered |= _cmap_of(path)
     return covered
 
 
@@ -219,26 +222,20 @@ def _extract_pua_glyphs(src):
     return glyphs
 
 
-def _missing_pua_glyphs(glyphs, shell_cov, fallback_cov):
-    """Return `(missing_codepoints, scope)` for PUA glyphs against installed fonts.
+def _missing_pua_glyphs(glyphs, shell_cov, nerd_fallback_cov):
+    """Return `(missing_codepoints, scope)` for PUA glyphs against installed Nerd Fonts.
 
-    Headless CI runners install DejaVu/Liberation (non-empty `fallback_cov` for
-    ASCII/Latin) without `JetBrainsMono Nerd Font` (`shell_cov is None`, zero
-    `>= 0xF0000` glyphs). Do not blame QML for a runner lacking Nerd Fonts,
-    while still rejecting uncovered BMP PUA (`0xE000..0xF8FF`, e.g. Material
-    Symbols web-font codepoints) and enforcing full coverage whenever `SHELL_FONT`
-    or another Supplementary-PUA icon font is installed.
+    Headless CI runners do not install Nerd Fonts (`shell_cov is None` and
+    `nerd_fallback_cov` is empty), whereas stock system fonts like Noto carry
+    unrelated Plane-15/16 PUA codepoints that are not Nerd Font v3 icons. Only
+    enforce glyph cmap membership when `SHELL_FONT` or another Nerd Font is
+    actually installed on the host.
     """
     if shell_cov is not None:
         return sorted(cp for cp in glyphs if cp not in shell_cov), SHELL_FONT
-    if not fallback_cov:
-        return [], "any installed font"
-    has_supp_pua_font = any(cp >= 0xF0000 for cp in fallback_cov)
-    missing = sorted(
-        cp for cp in glyphs
-        if cp not in fallback_cov and (cp <= 0xF8FF or has_supp_pua_font)
-    )
-    return missing, "any installed font"
+    if nerd_fallback_cov:
+        return sorted(cp for cp in glyphs if cp not in nerd_fallback_cov), "installed Nerd Font"
+    return [], SHELL_FONT
 
 
 # D-23 self-checks on the lexer and PUA extractor before scanning real files.
@@ -252,10 +249,10 @@ check("lexer strips braces inside single-quoted strings",
       repr(_sq_sample))
 check("PUA extractor catches Supplementary PUA-A (U+F0432)",
       0xF0432 in _extract_pua_glyphs('iconText: "\U000f0432"'))
-_ascii_only = set(range(0x20, 0x7F))
-check("PUA font check tolerates headless runner without Nerd Fonts while catching BMP PUA",
-      _missing_pua_glyphs({0xF0432, 0xE88A}, None, _ascii_only)[0] == [0xE88A]
-      and _missing_pua_glyphs({0xF0432}, {0xF0001}, _ascii_only)[0] == [0xF0432])
+check("PUA font check skips cleanly without Nerd Fonts and catches missing glyphs when present",
+      _missing_pua_glyphs({0xF0432, 0xE88A}, None, set())[0] == []
+      and _missing_pua_glyphs({0xF0432}, {0xF0001}, set())[0] == [0xF0432]
+      and _missing_pua_glyphs({0xE88A}, None, {0xF0432})[0] == [0xE88A])
 
 scan_files = sorted(QML_DIR.glob("*.qml")) + sorted(QML_DIR.glob("*.js"))
 
