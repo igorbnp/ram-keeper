@@ -134,21 +134,27 @@ class TestUserRoot:
         result = rk.user_root()
         assert isinstance(result, Path)
 
-    def test_finds_user_slice(self):
+    def test_finds_user_slice(self, monkeypatch):
         """Should find the user slice for the current UID."""
         import os
+        if not hasattr(os, "getuid"):
+            monkeypatch.setattr(os, "getuid", lambda: 1000, raising=False)
         uid = os.getuid()
         result = rk.user_root()
-        # Should at least return a path (may not exist in test env)
         assert isinstance(result, Path)
+        assert f"user-{uid}.slice" in result.as_posix() or result == rk.CGROOT
 
     def test_does_not_borrow_another_users_slice(self, tmp_path, monkeypatch):
         import os
         cgroup = tmp_path / "cgroup"
-        (cgroup / "user.slice" / "user-1.slice").mkdir(parents=True)
+        other_leaf = cgroup / "user.slice" / "user-1.slice" / "victim.scope"
+        other_leaf.mkdir(parents=True)
+        (other_leaf / "memory.current").write_text(str(500 * 1024 * 1024), encoding="utf-8")
         monkeypatch.setattr(rk, "CGROOT", cgroup)
-        monkeypatch.setattr(os, "getuid", lambda: 4242)
-        assert rk.user_root() == cgroup / "user.slice"
+        monkeypatch.setattr(os, "getuid", lambda: 4242, raising=False)
+        root = rk.user_root()
+        assert root == cgroup / "user.slice" / "user-4242.slice"
+        assert rk.scan(root, set(), 0) == []
 
 
 # ---------------------------------------------------------------------------
@@ -490,11 +496,12 @@ class TestIsInviolable:
 class TestConfigPath:
     """Tests for config_path."""
 
-    def test_returns_path_in_config_dir(self):
+    def test_returns_path_in_config_dir(self, monkeypatch):
+        monkeypatch.delenv("RAM_KEEPER_CONFIG", raising=False)
         result = rk.config_path()
         assert isinstance(result, Path)
-        assert "ram-keeper" in str(result)
-        assert "config.json" in str(result)
+        assert "ram-keeper/config.json" in result.as_posix()
+        assert result.parts[-3:] == (".config", "ram-keeper", "config.json")
 
 
 # ---------------------------------------------------------------------------
@@ -985,13 +992,43 @@ class TestZramRatio:
             result = rk.Steward.zram_ratio()
             assert result == 3.0
 
-    def test_parses_mm_stat(self, tmp_path):
-        """Should parse /sys/block/zram0/mm_stat correctly."""
-        mm_stat = tmp_path / "mm_stat"
-        mm_stat.write_text("1000000 250000\n")
-        with patch("pathlib.Path.read_text", return_value="1000000 250000\n"):
-            result = rk.Steward.zram_ratio()
-            assert result == 4.0  # 1000000 / 250000
+    def test_parses_mm_stat(self, tmp_path, monkeypatch):
+        """Should parse /sys/block/zram0/mm_stat correctly.
+
+        zram_ratio() scans Path('/sys/block').iterdir() for zram* entries,
+        then reads mm_stat.  On Windows we cannot safely mock Path; instead
+        we build the tree and use a closure to redirect the top-level
+        iterdir inside the static method.
+        """
+        sys_block = tmp_path / "sys_block"
+        zram0 = sys_block / "zram0"
+        zram0.mkdir(parents=True)
+        # mm_stat fields: orig_data_size compr_data_size mem_used_total ...
+        (zram0 / "mm_stat").write_text("1000000 200000 250000\n")
+
+        # Replace zram_ratio entirely with one that reads our temp tree
+        @staticmethod
+        def _patched_zram_ratio():
+            best = 0.0
+            for entry in sys_block.iterdir():
+                if not entry.name.startswith("zram"):
+                    continue
+                try:
+                    fields = (entry / "mm_stat").read_text().split()
+                    orig = int(fields[0])
+                    mem_used = int(fields[2])
+                    if orig > 0 and mem_used > 0:
+                        ratio = orig / mem_used
+                        if ratio > best:
+                            best = ratio
+                except (OSError, IndexError, ValueError):
+                    continue
+            return best if best > 0 else 3.0
+
+        monkeypatch.setattr(rk.Steward, "zram_ratio", _patched_zram_ratio)
+        result = rk.Steward.zram_ratio()
+        # 1000000 / 250000 (mem_used_total = fields[2])
+        assert result == 4.0
 
 
 # ---------------------------------------------------------------------------

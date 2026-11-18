@@ -4,8 +4,8 @@ The suite has two shapes, deliberately:
 
 * **pytest modules** — a shared fixture model, one assertion per behaviour
   (test_ram_keeper_core, test_reclaim_policy, test_config_attacks,
-  test_unit_hardening, test_integration, test_process_guardian,
-  test_bugfixes). Run them with `python3 -m pytest tests/`.
+  test_unit_hardening, test_integration, test_bugfixes).
+  Run them with `python3 -m pytest tests/`.
 * **plain scripts** — self-contained, print PASS/FAIL lines and exit with a
   status (test_forecast, test_pass_budget, test_config_hostile,
   test_inviolable, test_resilience, test_no_oom_kill, test_critical_metrics,

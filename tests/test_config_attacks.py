@@ -105,7 +105,12 @@ def test_config_path_is_a_directory(cfg):
 
 
 def test_config_is_a_dangling_symlink(cfg):
-    cfg.symlink_to(cfg.parent / "missing-target.json")
+    try:
+        cfg.symlink_to(cfg.parent / "missing-target.json")
+    except OSError as exc:
+        if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+            pytest.skip("symlinks require privilege on Windows")
+        raise
     loaded = rk.load_config()
     assert loaded["target_free_percent"] == rk.DEFAULT_CONFIG["target_free_percent"]
 

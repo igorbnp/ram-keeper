@@ -227,17 +227,29 @@ class TestBug5_ConsecutiveFailures:
     Agora é limitado para evitar overflow."""
 
     def test_consecutive_failures_capped(self):
-        """consecutive_failures não deve crescer além de um limite."""
-        steward = Steward()
-        # Simular muitas falhas
-        for _ in range(100):
-            try:
-                raise Exception("fake error")
-            except Exception:
-                pass
-        # O backoff é limitado a 300s, então consecutive_failures
-        # não deve causar overflow
-        assert steward.config["interval_idle"] > 0
+        """run_forever exponential backoff caps at 300s without overflow."""
+        steward = Steward(config=dict(DEFAULT_CONFIG))
+        idle = steward.config["interval_idle"]
+        calls = 0
+        sleeps = []
+
+        def failing_pass():
+            nonlocal calls
+            calls += 1
+            if calls > 40:
+                raise KeyboardInterrupt()
+            raise RuntimeError("synthetic failure")
+
+        with patch.object(steward, "supervise_once", side_effect=failing_pass), \
+             patch.object(steward, "_sleep", side_effect=lambda s, **_kw: sleeps.append(s)), \
+             patch.object(steward, "log"):
+            steward.run_forever()
+
+        assert len(sleeps) == 40
+        assert sleeps[0] == min(300.0, idle * 2)
+        assert sleeps[1] == min(300.0, idle * 4)
+        assert sleeps[-1] == 300.0
+        assert all(0 < s <= 300.0 for s in sleeps)
 
 
 class TestBug6_CgroupSwap:
