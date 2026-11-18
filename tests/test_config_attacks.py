@@ -19,7 +19,8 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-import pytest
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _pytest_shim import pytest, install_unittest_bridge  # noqa: E402
 
 PLUGIN = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PLUGIN / "helper"))
@@ -105,7 +106,12 @@ def test_config_path_is_a_directory(cfg):
 
 
 def test_config_is_a_dangling_symlink(cfg):
-    cfg.symlink_to(cfg.parent / "missing-target.json")
+    try:
+        cfg.symlink_to(cfg.parent / "missing-target.json")
+    except OSError as exc:
+        if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+            pytest.skip("symlinks require privilege on Windows")
+        raise
     loaded = rk.load_config()
     assert loaded["target_free_percent"] == rk.DEFAULT_CONFIG["target_free_percent"]
 
@@ -131,10 +137,11 @@ def test_valid_config_produces_no_warnings(cfg):
 # ---------------------------------------------------------------------------
 
 def run_add(tmp_path, name, home):
+    cfg = Path(home) / ".config" / "ram-keeper" / "config.json"
     return subprocess.run(
         [sys.executable, HELPER, "--protected-add", name],
         capture_output=True, text=True, timeout=30,
-        env={**os.environ, "HOME": str(home)},
+        env={**os.environ, "HOME": str(home), "RAM_KEEPER_CONFIG": str(cfg)},
     )
 
 
@@ -213,3 +220,6 @@ def test_coerce_number_survives_overflow(value):
     rk._CONFIG_WARNINGS.clear()
     out = rk._coerce_number("target_free_percent", value, 18.0)
     assert 5.0 <= out <= 60.0
+
+
+install_unittest_bridge(globals())

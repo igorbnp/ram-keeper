@@ -9,8 +9,12 @@ ConditionEnvironment=WAYLAND_DISPLAY
 
 [Service]
 Type=simple
+Environment=RAM_KEEPER_PYTHON=@PYTHON@
 ExecStart=@PLUGIN_DIR@/helper/ram_keeper_notify
-Restart=always
+# on-failure, not always: the notifier exits 0 when no notification system is
+# available (a machine without a compositor) or another instance holds the lock,
+# and that is a deliberate stop, not a crash that should restart-loop.
+Restart=on-failure
 RestartSec=10
 
 # Three watchers, one script: journalctl plus two polling loops. That is a few
@@ -22,10 +26,14 @@ NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=read-only
 # Reads its own state and the journal; writes only its dedupe flags. The `-`
-# prefix keeps the unit startable if the state directory is missing — systemd
-# treats a non-existent path in ReadWritePaths as a fatal sandbox error.
+# prefix keeps the unit startable if the state directory is missing (user
+# tmpfiles pre-creates it at login, and the notifier falls back to in-memory
+# dedupe if the filesystem is read-only).
 ReadWritePaths=-%h/.local/state/ram-keeper
 PrivateTmp=yes
+# IPAddressDeny=any is omitted: in --user units without CAP_NET_ADMIN it is a
+# no-op that logs a warning every start, and RestrictAddressFamilies is omitted
+# here because seccomp filters are inherited across execve under NoNewPrivileges.
 RestrictSUIDSGID=yes
 LockPersonality=yes
 

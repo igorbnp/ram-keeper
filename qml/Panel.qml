@@ -18,13 +18,7 @@ Panel {
   ipcTarget: "io.github.igorbnp.ram-keeper"
   // manageIpc: false hands the single per-target IpcHandler to the Service,
   // which declares the union of panel verbs (open/close/show/hide/toggle) and
-  // daemon verbs (status/refresh/relieve/sweep) in ONE place.
-  //
-  // Why not a handler here: IpcHandler allows one registration per target, and
-  // a second one silently loses every function it declares. An earlier revision
-  // declared the panel verbs here as well, and the result was that
-  // `omarchy-shell ram-keeper toggle` answered "Function not found" — the
-  // panel could not be opened by IPC or by any keyboard-summon path.
+  // daemon verbs (status/refresh/relieve/sweep/pause/snooze/resume) in ONE place.
   manageIpc: false
 
   readonly property var keeper: root.bar && root.bar.shell
@@ -38,8 +32,18 @@ Panel {
   readonly property bool loaded: !!(root.keeper && root.keeper.loaded)
   readonly property bool busy: !!(root.keeper && root.keeper.busy)
   readonly property bool daemonUp: !!(root.keeper && root.keeper.daemonUp)
+  readonly property bool pausedOrSnoozed: !!(root.keeper && (root.keeper.pausedByUser || root.keeper.snoozed))
+  readonly property bool daemonOff: root.pausedOrSnoozed || (root.loaded && !root.daemonUp)
+  readonly property bool ctlBusy: !!(root.keeper && root.keeper.daemonCtlBusy)
+  readonly property double liveNow: {
+    var tick = root.keeper ? root.keeper.pollTicks : 0
+    void tick
+    return Date.now() / 1000
+  }
   readonly property var forecast: root.loaded
     ? Model.forecastForSnapshot(root.snap) : null
+  readonly property var sessionImpact: root.loaded
+    ? Model.sessionImpactRow(root.snap, root.liveNow) : null
 
   // True once the service object exists. Every control that calls into it must
   // gate on this, not on `!busy`: a null keeper makes `busy` false, so the busy
@@ -63,6 +67,7 @@ Panel {
 
   readonly property string glyph: Model.stateGlyph(state)
   readonly property string percentText: loaded ? Model.freePercentLabel(snap) : "--"
+  readonly property string barLabelText: loaded ? Model.barLabel(snap) : "--"
 
   // Free memory is the headline: the number the user actually cares about is
   // "how much room do I have", not "how much am I using".
@@ -99,14 +104,9 @@ Panel {
     anchors.fill: parent
     bar: root.bar
     slotSize: root.barWidth
-    text: root.showPercent && !root.verticalBar
-      ? root.percentText + " " + root.glyph
-      : root.glyph
-    tooltipText: root.loaded
-      ? (Model.isUnknown(root.state)
-          ? "Memory reading unavailable"
-          : root.percentText + " memory free — " + Model.stateLabel(root.state))
-      : "Measuring memory…"
+    text: root.glyph
+    labelText: (root.showPercent && !root.verticalBar) ? root.barLabelText : ""
+    tooltipText: root.loaded ? Model.barTooltip(root.snap, root.liveNow) : "Measuring memory…"
     onPressed: function(b) {
       if (b === Qt.RightButton) root.togglePercent()
       else root.toggle()
@@ -133,12 +133,39 @@ Panel {
       onCloseRequested: root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
 
-      Column {
-        id: column
-        anchors.left: parent.left
-        anchors.right: parent.right
-        anchors.top: parent.top
-        spacing: Style.space(12)
+      Keys.onUpPressed: flickable.contentY = Math.max(0, flickable.contentY - 40)
+      Keys.onDownPressed: {
+        var maxY = Math.max(0, flickable.contentHeight - flickable.height)
+        flickable.contentY = Math.min(maxY, flickable.contentY + 40)
+      }
+      Keys.onPressed: function(event) {
+        var maxY = Math.max(0, flickable.contentHeight - flickable.height)
+        if (event.key === Qt.Key_PageUp) {
+          flickable.contentY = Math.max(0, flickable.contentY - flickable.height * 0.8)
+          event.accepted = true
+        } else if (event.key === Qt.Key_PageDown) {
+          flickable.contentY = Math.min(maxY, flickable.contentY + flickable.height * 0.8)
+          event.accepted = true
+        }
+      }
+
+      Flickable {
+        id: flickable
+        anchors.fill: parent
+        contentHeight: column.implicitHeight
+        boundsBehavior: Flickable.StopAtBounds
+        flickableDirection: Flickable.VerticalFlick
+        clip: true
+
+        ScrollBar.vertical: ScrollBar {
+          policy: flickable.contentHeight > flickable.height
+            ? ScrollBar.AsNeeded : ScrollBar.AlwaysOff
+        }
+
+        Column {
+          id: column
+          width: parent.width
+          spacing: Style.space(12)
 
         // ---------------------------------------------------------- hero
         PanelHero {
@@ -146,6 +173,7 @@ Panel {
           iconComponent: Component {
             Text {
               text: root.glyph
+              textFormat: Text.PlainText
               color: root.stateColor
               font.family: Style.font.family
               font.pixelSize: Style.font.displayLarge
@@ -156,25 +184,16 @@ Panel {
                 ? "No memory reading"
                 : Model.stateLabel(root.state) + " · " + root.percentText + " free")
             : "Measuring memory…"
-          meta: root.loaded
-            ? (Model.isUnknown(root.state)
-                ? "The daemon could not read memory"
-                : Model.formatBytes(snap.mem_available) + " available of "
-                  + Model.formatBytes(snap.mem_total))
-            : ""
+          meta: root.loaded ? Model.heroMeta(root.snap, root.liveNow) : ""
           detail: root.busy ? "Reclaiming memory…"
             : (root.keeper && root.keeper.lastResult !== "" ? root.keeper.lastResult : "")
           trailingControl: Component {
             PanelActionButton {
-              // U+E2DB (Material Symbols "shield") has NO glyph on this machine:
-              // the only icon font installed is JetBrainsMono Nerd Font, whose
-              // Material range starts at U+F0xxx, so Qt drew a tofu box. Use
-              // U+F0432 — the power glyph the Omarchy shell itself puts in a
-              // PanelActionButton, proven to render in this exact setup.
+              // U+F0432 — proven to render in JetBrainsMono Nerd Font.
               iconText: "󰐲"
               tooltipText: !root.actionsReady ? "Not connected"
                 : (root.daemonUp ? "Automatic protection is on" : "Automatic protection is off")
-              foreground: root.foreground
+              foreground: root.daemonUp ? root.foreground : root.urgentColor
               hoverColor: root.daemonUp ? root.foreground : root.urgentColor
               enabled: root.actionsReady
               onClicked: {
@@ -199,14 +218,14 @@ Panel {
             && root.snap.memory_breakdown_valid === false
           width: parent.width
           text: "Memory breakdown unavailable"
+          textFormat: Text.PlainText
           color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.65)
           font.family: Style.font.family
           font.pixelSize: Style.font.bodySmall
           wrapMode: Text.Wrap
         }
 
-        // The stacked bar: apps / cache / free. Reading proportions off one
-        // strip is far faster than reading three numbers.
+        // The stacked bar: apps / cache / free.
         Item {
           visible: root.loaded && !Model.isUnknown(root.state)
             && root.snap.memory_breakdown_valid !== false
@@ -270,6 +289,7 @@ Panel {
 
               Text {
                 text: modelData.label + " " + Model.formatBytes(modelData.bytes)
+                textFormat: Text.PlainText
                 color: root.foreground
                 font.family: Style.font.family
                 font.pixelSize: Style.font.bodySmall
@@ -286,10 +306,7 @@ Panel {
 
           Button {
             width: (parent.width - Style.space(8)) / 2
-            text: root.busy ? "Working…" : "Free memory now"
-            // `keeper` is null until the service loads. `!root.busy` alone is
-            // then true, which INVERTS the guard and leaves an enabled button
-            // whose handler throws on a null object.
+            text: root.keeper && root.keeper.activeAction === "relieve" ? "Working…" : "Free memory now"
             enabled: root.actionsReady && !root.busy
             foreground: root.foreground
             accent: root.accentColor
@@ -298,12 +315,69 @@ Panel {
 
           Button {
             width: (parent.width - Style.space(8)) / 2
-            text: "Drop cache"
+            text: root.keeper && root.keeper.activeAction === "sweep" ? "Working…" : "Drop cache"
             enabled: root.actionsReady && !root.busy
             foreground: root.foreground
             accent: root.accentColor
             onClicked: if (root.keeper) root.keeper.sweep()
           }
+        }
+
+        // ---------------------------------------------- F2: snooze / pause
+        Row {
+          width: parent.width
+          spacing: Style.space(8)
+          visible: root.actionsReady
+
+          Button {
+            width: (parent.width - Style.space(8) * 2) / 3
+            text: "Snooze 30m"
+            enabled: root.actionsReady && !root.ctlBusy
+            foreground: root.foreground
+            accent: root.accentColor
+            onClicked: if (root.keeper) root.keeper.snoozeDaemon(30)
+          }
+
+          Button {
+            width: (parent.width - Style.space(8) * 2) / 3
+            text: "Snooze 1h"
+            enabled: root.actionsReady && !root.ctlBusy
+            foreground: root.foreground
+            accent: root.accentColor
+            onClicked: if (root.keeper) root.keeper.snoozeDaemon(60)
+          }
+
+          Button {
+            width: (parent.width - Style.space(8) * 2) / 3
+            text: root.pausedOrSnoozed ? "Resume" : (root.daemonOff ? "Start" : "Pause")
+            enabled: root.actionsReady && !root.ctlBusy
+            foreground: root.daemonOff ? root.accentColor : root.foreground
+            accent: root.accentColor
+            onClicked: {
+              if (!root.keeper) return
+              if (root.daemonOff) root.keeper.startDaemon()
+              else root.keeper.pauseDaemon()
+            }
+          }
+        }
+
+        Text {
+          width: parent.width
+          visible: root.pausedOrSnoozed
+          text: {
+            var ps = Model.parsePauseState(root.snap, root.liveNow)
+            if (ps.paused) return ps.label
+            if (root.keeper && root.keeper.snoozeRemaining > 0) {
+              return "Snoozed · resumes in " + Model.horizonLabel(root.keeper.snoozeRemaining)
+            }
+            return "Automatic protection is paused"
+          }
+          textFormat: Text.PlainText
+          color: Qt.darker(root.foreground, 1.35)
+          font.family: Style.font.family
+          font.pixelSize: Style.font.caption
+          horizontalAlignment: Text.AlignHCenter
+          wrapMode: Text.WordWrap
         }
 
         PanelSeparator { width: parent.width; foreground: root.foreground }
@@ -315,8 +389,6 @@ Panel {
           foreground: root.foreground
         }
 
-        // The forecast: where memory is heading. This is the one row that
-        // can say something before any number looks wrong.
         Item {
           width: parent.width
           height: Style.font.body * 1.7
@@ -324,26 +396,30 @@ Panel {
 
           readonly property color fcColor: {
             if (!root.forecast) return root.foreground
-            if (root.forecast.urgency === "imminent") return root.urgentColor
+            if (root.forecast.isWarning && root.forecast.urgency === "imminent") return root.urgentColor
             return root.forecast.isWarning
               ? Qt.darker(root.accentColor, 1.2) : Qt.darker(root.foreground, 1.35)
           }
 
           Text {
+            id: forecastTitle
             anchors.left: parent.left
             anchors.verticalCenter: parent.verticalCenter
             text: "Forecast"
+            textFormat: Text.PlainText
             color: root.foreground
             font.family: Style.font.family
             font.pixelSize: Style.font.bodySmall
           }
 
           Text {
+            anchors.left: forecastTitle.right
+            anchors.leftMargin: Style.space(8)
             anchors.right: parent.right
             anchors.verticalCenter: parent.verticalCenter
-            width: parent.width * 0.68
             horizontalAlignment: Text.AlignRight
             text: root.forecast ? root.forecast.text : ""
+            textFormat: Text.PlainText
             color: parent.fcColor
             font.family: Style.font.family
             font.pixelSize: Style.font.bodySmall
@@ -364,6 +440,7 @@ Panel {
             anchors.left: parent.left
             anchors.verticalCenter: parent.verticalCenter
             text: "Memory stall"
+            textFormat: Text.PlainText
             color: root.foreground
             font.family: Style.font.family
             font.pixelSize: Style.font.bodySmall
@@ -375,6 +452,7 @@ Panel {
             text: root.loaded
               ? Model.psiLabel(parent.psi) + (parent.psi.stallPercent > 0 ? " of the last minute" : "")
               : "—"
+            textFormat: Text.PlainText
             color: parent.psiColor
             font.family: Style.font.family
             font.pixelSize: Style.font.bodySmall
@@ -388,33 +466,71 @@ Panel {
           Item {
             required property var modelData
             width: column.width
-            height: Style.font.body * 1.7
+            height: Style.font.body * 2.2
 
-            Text {
-              anchors.left: parent.left
-              anchors.verticalCenter: parent.verticalCenter
-              text: modelData.label
-              color: root.foreground
-              font.family: Style.font.family
-              font.pixelSize: Style.font.bodySmall
+            Item {
+              id: swapHeaderRow
+              anchors.top: parent.top
+              width: parent.width
+              height: Style.font.body * 1.4
+
+              Text {
+                anchors.left: parent.left
+                anchors.right: swapSizeText.left
+                anchors.rightMargin: Style.space(8)
+                anchors.verticalCenter: parent.verticalCenter
+                text: modelData.label
+                textFormat: Text.PlainText
+                color: modelData.isConcern ? root.urgentColor : root.foreground
+                font.family: Style.font.family
+                font.pixelSize: Style.font.bodySmall
+                elide: Text.ElideRight
+              }
+
+              Text {
+                id: swapSizeText
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                text: Model.formatBytes(modelData.bytes) + " / " + Model.formatBytes(modelData.size)
+                textFormat: Text.PlainText
+                color: modelData.isConcern ? root.urgentColor
+                  : (modelData.isZram ? Qt.darker(root.foreground, 1.4) : root.foreground)
+                font.family: Style.font.family
+                font.pixelSize: Style.font.bodySmall
+              }
             }
 
-            Text {
-              anchors.right: parent.right
-              anchors.verticalCenter: parent.verticalCenter
-              text: Model.formatBytes(modelData.bytes) + " / " + Model.formatBytes(modelData.size)
-              color: modelData.isConcern ? root.urgentColor
-                : (modelData.isZram ? Qt.darker(root.foreground, 1.4) : root.foreground)
-              font.family: Style.font.family
-              font.pixelSize: Style.font.bodySmall
+            // F3: swap mini-bar contrasting fast zram vs slow disk swap.
+            Rectangle {
+              id: swapBarBg
+              anchors.top: swapHeaderRow.bottom
+              anchors.topMargin: Style.space(2)
+              width: parent.width
+              height: Style.space(4)
+              radius: 2
+              color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.08)
+              clip: true
+
+              Rectangle {
+                width: swapBarBg.width * Math.max(0, Math.min(1, modelData.fraction))
+                height: swapBarBg.height
+                radius: 2
+                color: modelData.isConcern
+                  ? root.urgentColor
+                  : (modelData.isZram
+                      ? Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.35)
+                      : root.accentColor)
+              }
             }
           }
         }
 
         Text {
           width: parent.width
-          visible: root.loaded && Model.swapRows(root.snap).length > 0
+          visible: root.loaded && !Model.isUnknown(root.state)
+            && Model.swapRows(root.snap).length > 0
           text: "Swap on zram stays in RAM — it costs CPU, not speed. Only disk swap is slow."
+          textFormat: Text.PlainText
           color: Qt.darker(root.foreground, 1.55)
           font.family: Style.font.family
           font.pixelSize: Style.font.caption
@@ -436,23 +552,70 @@ Panel {
           Item {
             required property var modelData
             width: column.width
-            height: Style.font.body * 1.8
+            height: Style.font.body * 2.5
 
-            Text {
+            readonly property bool isProtecting: !!(root.keeper
+              && root.keeper.pendingProtectKey === modelData.key
+              && root.keeper.listVerb === "protect")
+
+            Column {
               anchors.left: parent.left
+              anchors.right: protectBtn.visible ? protectBtn.left : reclaimSize.left
+              anchors.rightMargin: Style.space(8)
               anchors.verticalCenter: parent.verticalCenter
-              width: parent.width * 0.55
-              text: modelData.label
-              color: root.foreground
-              font.family: Style.font.family
-              font.pixelSize: Style.font.bodySmall
-              elide: Text.ElideRight
+              spacing: 1
+
+              Text {
+                width: parent.width
+                text: modelData.label
+                textFormat: Text.PlainText
+                color: root.foreground
+                font.family: Style.font.family
+                font.pixelSize: Style.font.bodySmall
+                elide: Text.ElideRight
+              }
+
+              Text {
+                width: parent.width
+                text: modelData.subLabel || ("can free " + (modelData.giveLabel || ""))
+                textFormat: Text.PlainText
+                color: modelData.thrashing
+                  ? root.urgentColor
+                  : Qt.darker(root.foreground, 1.5)
+                font.family: Style.font.family
+                font.pixelSize: Style.font.caption
+                elide: Text.ElideRight
+              }
             }
 
             Text {
+              id: protectBtn
+              anchors.right: reclaimSize.left
+              anchors.rightMargin: Style.space(8)
+              anchors.verticalCenter: parent.verticalCenter
+              visible: modelData.action === "protect"
+              text: parent.isProtecting ? "Protecting…" : "Protect"
+              textFormat: Text.PlainText
+              color: parent.isProtecting
+                ? Qt.darker(root.accentColor, 1.3) : root.accentColor
+              font.family: Style.font.family
+              font.pixelSize: Style.font.bodySmall
+              MouseArea {
+                anchors.fill: parent
+                anchors.margins: -Style.space(5)
+                cursorShape: Qt.PointingHandCursor
+                enabled: root.actionsReady
+                  && !(root.keeper && root.keeper.pendingProtectKey !== "")
+                onClicked: if (root.keeper) root.keeper.protect(modelData.key)
+              }
+            }
+
+            Text {
+              id: reclaimSize
               anchors.right: parent.right
               anchors.verticalCenter: parent.verticalCenter
               text: Model.formatBytes(modelData.bytes)
+              textFormat: Text.PlainText
               color: Qt.darker(root.foreground, 1.3)
               font.family: Style.font.family
               font.pixelSize: Style.font.bodySmall
@@ -462,8 +625,10 @@ Panel {
 
         Text {
           width: parent.width
-          visible: root.loaded && Model.reclaimableGroups(root.snap, 8).length === 0
+          visible: root.loaded && !Model.isUnknown(root.state)
+            && Model.reclaimableGroups(root.snap, 8).length === 0
           text: "Nothing above the noise floor — every app is small right now."
+          textFormat: Text.PlainText
           color: Qt.darker(root.foreground, 1.55)
           font.family: Style.font.family
           font.pixelSize: Style.font.caption
@@ -473,7 +638,8 @@ Panel {
         // ------------------------------------------------- protected list
         PanelSectionHeader {
           width: parent.width
-          visible: root.loaded && Model.protectedGroups(root.snap, 4).length > 0
+          visible: root.loaded && !Model.isUnknown(root.state)
+            && Model.protectedGroups(root.snap, 4).length > 0
           text: "NEVER RECLAIMED"
           foreground: root.foreground
         }
@@ -484,13 +650,19 @@ Panel {
           Item {
             required property var modelData
             width: column.width
-            height: Style.font.body * 1.7
+            height: Style.font.body * 1.8
+
+            readonly property bool isReleasing: !!(root.keeper
+              && root.keeper.pendingProtectKey === modelData.key
+              && root.keeper.listVerb === "release")
 
             Text {
               anchors.left: parent.left
+              anchors.right: releaseBtn.visible ? releaseBtn.left : sizeText.left
+              anchors.rightMargin: Style.space(8)
               anchors.verticalCenter: parent.verticalCenter
-              width: parent.width * 0.55
               text: modelData.label
+              textFormat: Text.PlainText
               color: Qt.darker(root.foreground, 1.5)
               font.family: Style.font.family
               font.pixelSize: Style.font.caption
@@ -498,13 +670,57 @@ Panel {
             }
 
             Text {
+              id: releaseBtn
+              anchors.right: sizeText.left
+              anchors.rightMargin: Style.space(8)
+              anchors.verticalCenter: parent.verticalCenter
+              visible: modelData.action === "release"
+              text: parent.isReleasing ? "Releasing…" : "Release"
+              textFormat: Text.PlainText
+              color: parent.isReleasing
+                ? Qt.darker(root.accentColor, 1.3) : root.accentColor
+              font.family: Style.font.family
+              font.pixelSize: Style.font.caption
+              MouseArea {
+                anchors.fill: parent
+                anchors.margins: -Style.space(5)
+                cursorShape: Qt.PointingHandCursor
+                enabled: root.actionsReady
+                  && !(root.keeper && root.keeper.pendingProtectKey !== "")
+                onClicked: if (root.keeper) root.keeper.unprotect(modelData.key)
+              }
+            }
+
+            Text {
+              id: sizeText
               anchors.right: parent.right
               anchors.verticalCenter: parent.verticalCenter
               text: Model.formatBytes(modelData.bytes)
+              textFormat: Text.PlainText
               color: Qt.darker(root.foreground, 1.65)
               font.family: Style.font.family
               font.pixelSize: Style.font.caption
             }
+          }
+        }
+
+        // ---------------------------------------------- F3: session impact
+        Column {
+          width: parent.width
+          spacing: Style.space(8)
+          visible: root.sessionImpact !== null
+
+          PanelSeparator { width: parent.width; foreground: root.foreground }
+
+          Text {
+            width: parent.width
+            text: root.sessionImpact ? root.sessionImpact.text : ""
+            textFormat: Text.PlainText
+            color: Qt.darker(root.foreground, 1.35)
+            font.family: Style.font.family
+            font.pixelSize: Style.font.caption
+            wrapMode: Text.WordWrap
+            horizontalAlignment: Text.AlignHCenter
           }
         }
 
@@ -518,9 +734,8 @@ Panel {
 
           Text {
             width: parent.width
-            text: root.daemonUp
-              ? "Watching automatically · nothing needed from you"
-              : "Automatic protection is paused"
+            text: Model.watchLine(root.snap, root.daemonUp, root.liveNow)
+            textFormat: Text.PlainText
             color: root.daemonUp ? Qt.darker(root.foreground, 1.5) : root.urgentColor
             font.family: Style.font.family
             font.pixelSize: Style.font.caption
@@ -532,10 +747,12 @@ Panel {
           width: parent.width
           visible: root.keeper !== null && root.keeper.lastError !== ""
           text: root.keeper ? root.keeper.lastError : ""
+          textFormat: Text.PlainText
           color: root.urgentColor
           font.family: Style.font.family
           font.pixelSize: Style.font.caption
           wrapMode: Text.WordWrap
+        }
         }
       }
     }

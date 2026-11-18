@@ -6,7 +6,8 @@ import time
 from pathlib import Path
 from unittest.mock import patch, MagicMock, mock_open
 
-import pytest
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _pytest_shim import pytest, install_unittest_bridge  # noqa: E402
 
 # Resolve the plugin directory from this file's own location
 PLUGIN = Path(__file__).resolve().parent.parent
@@ -134,13 +135,27 @@ class TestUserRoot:
         result = rk.user_root()
         assert isinstance(result, Path)
 
-    def test_finds_user_slice(self):
+    def test_finds_user_slice(self, monkeypatch):
         """Should find the user slice for the current UID."""
         import os
+        if not hasattr(os, "getuid"):
+            monkeypatch.setattr(os, "getuid", lambda: 1000, raising=False)
         uid = os.getuid()
         result = rk.user_root()
-        # Should at least return a path (may not exist in test env)
         assert isinstance(result, Path)
+        assert f"user-{uid}.slice" in result.as_posix() or result == rk.CGROOT
+
+    def test_does_not_borrow_another_users_slice(self, tmp_path, monkeypatch):
+        import os
+        cgroup = tmp_path / "cgroup"
+        other_leaf = cgroup / "user.slice" / "user-1.slice" / "victim.scope"
+        other_leaf.mkdir(parents=True)
+        (other_leaf / "memory.current").write_text(str(500 * 1024 * 1024), encoding="utf-8")
+        monkeypatch.setattr(rk, "CGROOT", cgroup)
+        monkeypatch.setattr(os, "getuid", lambda: 4242, raising=False)
+        root = rk.user_root()
+        assert root == cgroup / "user.slice" / "user-4242.slice"
+        assert rk.scan(root, set(), 0) == []
 
 
 # ---------------------------------------------------------------------------
@@ -361,11 +376,9 @@ class TestMeminfo:
         meminfo_content = "MemTotal: 8026562560 kB\nMemAvailable: notanumber kB\nCached: 1500000000 kB\n"
         with patch("pathlib.Path.read_text", return_value=meminfo_content):
             result = rk.meminfo()
-        # The function should not crash; result is a dict (possibly empty or partial)
-        assert isinstance(result, dict)
-        # MemTotal should be parsed (it comes before the malformed line)
-        if result:
-            assert result.get("MemTotal") == 8026562560 * 1024
+        assert result.get("MemTotal") == 8026562560 * 1024
+        assert result.get("Cached") == 1500000000 * 1024
+        assert "MemAvailable" not in result
 
 
 # ---------------------------------------------------------------------------
@@ -415,24 +428,27 @@ class TestZramStats:
         assert "used" in result
         assert "size" in result
 
-    def test_handles_subprocess_error(self):
-        """Should return empty result on subprocess error."""
-        with patch("subprocess.run", side_effect=OSError):
+    def test_handles_unreadable_swaps(self):
+        """Should return empty result when /proc/swaps cannot be read."""
+        with patch("pathlib.Path.read_text", side_effect=OSError):
             result = rk.zram_stats()
             assert result["devices"] == []
             assert result["used"] == 0
 
-    def test_parses_swapon_output(self):
-        """Should parse swapon output correctly."""
-        swapon_output = "/dev/zram0 partition 8025796608 2950127616 0\n/swap/swapfile file 8027074560 7417856 -2\n"
-        mock_result = MagicMock()
-        mock_result.stdout = swapon_output
-        with patch("subprocess.run", return_value=mock_result):
+    def test_parses_proc_swaps(self):
+        """Size and Used in /proc/swaps are KiB."""
+        swaps = (
+            "Filename\tType\tSize\tUsed\tPriority\n"
+            "/dev/zram0 partition 7837688 2880984 100\n"
+            "/swap/swapfile file 7838930 7244 -2\n"
+        )
+        with patch("pathlib.Path.read_text", return_value=swaps):
             result = rk.zram_stats()
             assert len(result["devices"]) == 2
-            assert result["used"] == 2950127616 + 7417856
-            assert result["ram_used"] == 2950127616
-            assert result["disk_used"] == 7417856
+            assert result["ram_used"] == 2880984 * 1024
+            assert result["disk_used"] == 7244 * 1024
+            assert result["devices"][0]["ram_backed"] is True
+            assert result["devices"][1]["ram_backed"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -452,6 +468,19 @@ class TestIsInviolable:
         ("quickshell.service", True),
         ("ram-keeper", True),
         ("ram-keeper.service", True),
+        ("ram-keeper-notify.service", True),
+        ("app-quickshell-1043.scope", True),
+        ("app-Hyprland-1234.scope", True),
+        ("app-hyprland.scope", True),
+        ("wayland-wm@Hyprland.service", True),
+        ("wayland-wm@HYPRLAND.desktop", True),
+        ("wayland-wm@hyprland.desktop.service", True),
+        ("app-Hyprland-gtk-launch-1aa92790.scope", False),
+        ("hyprland-gtk-launch.service", False),
+        ("wayland-wm@sway.service", False),
+        ("not-hyprland.service", False),
+        ("app-minha-session.scope", False),
+        ("quickshell-extra.service", False),
         ("app-org.chromium.Chromium-123.scope", False),
         ("syncthing.service", False),
         ("firefox", False),
@@ -468,11 +497,12 @@ class TestIsInviolable:
 class TestConfigPath:
     """Tests for config_path."""
 
-    def test_returns_path_in_config_dir(self):
+    def test_returns_path_in_config_dir(self, monkeypatch):
+        monkeypatch.delenv("RAM_KEEPER_CONFIG", raising=False)
         result = rk.config_path()
         assert isinstance(result, Path)
-        assert "ram-keeper" in str(result)
-        assert "config.json" in str(result)
+        assert "ram-keeper/config.json" in result.as_posix()
+        assert result.parts[-3:] == (".config", "ram-keeper", "config.json")
 
 
 # ---------------------------------------------------------------------------
@@ -963,13 +993,43 @@ class TestZramRatio:
             result = rk.Steward.zram_ratio()
             assert result == 3.0
 
-    def test_parses_mm_stat(self, tmp_path):
-        """Should parse /sys/block/zram0/mm_stat correctly."""
-        mm_stat = tmp_path / "mm_stat"
-        mm_stat.write_text("1000000 250000\n")
-        with patch("pathlib.Path.read_text", return_value="1000000 250000\n"):
-            result = rk.Steward.zram_ratio()
-            assert result == 4.0  # 1000000 / 250000
+    def test_parses_mm_stat(self, tmp_path, monkeypatch):
+        """Should parse /sys/block/zram0/mm_stat correctly.
+
+        zram_ratio() scans Path('/sys/block').iterdir() for zram* entries,
+        then reads mm_stat.  On Windows we cannot safely mock Path; instead
+        we build the tree and use a closure to redirect the top-level
+        iterdir inside the static method.
+        """
+        sys_block = tmp_path / "sys_block"
+        zram0 = sys_block / "zram0"
+        zram0.mkdir(parents=True)
+        # mm_stat fields: orig_data_size compr_data_size mem_used_total ...
+        (zram0 / "mm_stat").write_text("1000000 200000 250000\n")
+
+        # Replace zram_ratio entirely with one that reads our temp tree
+        @staticmethod
+        def _patched_zram_ratio():
+            best = 0.0
+            for entry in sys_block.iterdir():
+                if not entry.name.startswith("zram"):
+                    continue
+                try:
+                    fields = (entry / "mm_stat").read_text().split()
+                    orig = int(fields[0])
+                    mem_used = int(fields[2])
+                    if orig > 0 and mem_used > 0:
+                        ratio = orig / mem_used
+                        if ratio > best:
+                            best = ratio
+                except (OSError, IndexError, ValueError):
+                    continue
+            return best if best > 0 else 3.0
+
+        monkeypatch.setattr(rk.Steward, "zram_ratio", _patched_zram_ratio)
+        result = rk.Steward.zram_ratio()
+        # 1000000 / 250000 (mem_used_total = fields[2])
+        assert result == 4.0
 
 
 # ---------------------------------------------------------------------------
@@ -1047,49 +1107,49 @@ class TestSleep:
         s = rk.Steward()
         with patch("time.sleep") as mock_sleep:
             s._sleep(0)
-            mock_sleep.assert_called_once_with(20.0)
+            assert [call.args[0] for call in mock_sleep.call_args_list] == [1.0] * 20
 
     def test_rejects_negative(self):
         """Should reject negative values and use default."""
         s = rk.Steward()
         with patch("time.sleep") as mock_sleep:
             s._sleep(-5.0)
-            mock_sleep.assert_called_once_with(20.0)
+            assert [call.args[0] for call in mock_sleep.call_args_list] == [1.0] * 20
 
     def test_rejects_nan(self):
         """Should reject NaN and use default."""
         s = rk.Steward()
         with patch("time.sleep") as mock_sleep:
             s._sleep(float("nan"))
-            mock_sleep.assert_called_once_with(20.0)
+            assert [call.args[0] for call in mock_sleep.call_args_list] == [1.0] * 20
 
     def test_rejects_inf(self):
         """Should reject infinity and use default."""
         s = rk.Steward()
         with patch("time.sleep") as mock_sleep:
             s._sleep(float("inf"))
-            mock_sleep.assert_called_once_with(20.0)
+            assert [call.args[0] for call in mock_sleep.call_args_list] == [1.0] * 20
 
     def test_rejects_string(self):
         """Should reject string values and use default."""
         s = rk.Steward()
         with patch("time.sleep") as mock_sleep:
             s._sleep("abc")
-            mock_sleep.assert_called_once_with(20.0)
+            assert [call.args[0] for call in mock_sleep.call_args_list] == [1.0] * 20
 
     def test_rejects_none(self):
         """Should reject None and use default."""
         s = rk.Steward()
         with patch("time.sleep") as mock_sleep:
             s._sleep(None)
-            mock_sleep.assert_called_once_with(20.0)
+            assert [call.args[0] for call in mock_sleep.call_args_list] == [1.0] * 20
 
     def test_caps_at_3600(self):
         """Should cap sleep at 3600 seconds."""
         s = rk.Steward()
         with patch("time.sleep") as mock_sleep:
             s._sleep(7200.0)
-            mock_sleep.assert_called_once_with(3600.0)
+            assert [call.args[0] for call in mock_sleep.call_args_list] == [1.0] * 3600
 
 
 # ---------------------------------------------------------------------------
@@ -1150,3 +1210,24 @@ class TestPublishedSnapshot:
                    return_value=tmp_path / ".local/state/ram-keeper"):
             result = rk.published_snapshot()
             assert result is None
+
+
+class TestSuperviseOnce:
+    def test_acted_relief_refreshes_published_snapshot(self, tmp_path):
+        """When relief acts, supervise_once must publish fresh post-reclaim metrics."""
+        steward = rk.Steward()
+        steward.state_path = tmp_path / "state.json"
+        first_snap = {"state": "critical", "free_percent": 8.0, "mem_available": 100}
+        second_snap = {"state": "ok", "free_percent": 25.0, "mem_available": 500}
+
+        calls = [first_snap, second_snap]
+        with patch.object(steward, "snapshot", side_effect=lambda: calls.pop(0) if calls else second_snap), \
+             patch.object(steward, "relieve", return_value={"acted": True, "reason": "reclaimed"}):
+            published = steward.supervise_once()
+            assert published["state"] == "ok"
+            assert published["free_percent"] == 25.0
+            assert published["relief"]["acted"] is True
+
+
+install_unittest_bridge(globals())
+

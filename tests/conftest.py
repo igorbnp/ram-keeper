@@ -4,8 +4,8 @@ The suite has two shapes, deliberately:
 
 * **pytest modules** — a shared fixture model, one assertion per behaviour
   (test_ram_keeper_core, test_reclaim_policy, test_config_attacks,
-  test_unit_hardening, test_integration, test_process_guardian,
-  test_bugfixes). Run them with `python3 -m pytest tests/`.
+  test_unit_hardening, test_integration, test_bugfixes).
+  Run them with `python3 -m pytest tests/`.
 * **plain scripts** — self-contained, print PASS/FAIL lines and exit with a
   status (test_forecast, test_pass_budget, test_config_hostile,
   test_inviolable, test_resilience, test_no_oom_kill, test_critical_metrics,
@@ -28,6 +28,17 @@ collect_ignore = [
     "test_critical_metrics.py",
     "test_qml_structure.py",
 ]
+
+
+@pytest.fixture(autouse=True)
+def isolated_config(tmp_path, monkeypatch):
+    """No test may read or write the real config file.
+
+    The path is a fresh file under tmp_path. Tests that need a specific
+    document write that file, or point RAM_KEEPER_CONFIG somewhere else.
+    """
+    cfg = tmp_path / "ram-keeper" / "config.json"
+    monkeypatch.setenv("RAM_KEEPER_CONFIG", str(cfg))
 
 
 @pytest.fixture(autouse=True)

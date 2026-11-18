@@ -1,17 +1,169 @@
 #!/usr/bin/env bash
 # ram-keeper installer. Idempotent: safe to run again after an update.
+#
+# Usage:
+#   ./install.sh          Install and start the plugin
+#   ./install.sh --check  Post-install health check (no changes)
 set -euo pipefail
 
 PLUGIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 UNIT_SRC="$PLUGIN_DIR/units/ram-keeper.service"
 NOTIFY_SRC="$PLUGIN_DIR/helper/ram_keeper_notify"
 UNIT_DST="$HOME/.config/systemd/user/ram-keeper.service"
-STATE_DIR="$HOME/.local/state/ram-keeper"
+STATE_DIR="${RAM_KEEPER_STATE_DIR:-$HOME/.local/state/ram-keeper}"
 
 say() { printf '\033[1;36m▸\033[0m %s\n' "$1"; }
 ok()  { printf '\033[1;32m✓\033[0m %s\n' "$1"; }
 warn() { printf '\033[1;33m!\033[0m %s\n' "$1"; }
 die() { printf '\033[1;31m✗\033[0m %s\n' "$1" >&2; exit 1; }
+
+# --------------------------------------------------------------------------
+# --check: post-install health verification (F4)
+#
+# Invokes the daemon's --doctor mode plus checks the units, notifier script,
+# state directory and journal warnings. Makes no changes to the system.
+# --------------------------------------------------------------------------
+if [[ $# -gt 0 && "${1:-}" != "--check" ]]; then
+  die "unknown option: $1 (usage: ./install.sh [--check])"
+fi
+
+if [[ "${1:-}" == "--check" ]]; then
+  checks_failed=0
+  check_ok()   { printf '\033[1;32m✓\033[0m %s\n' "$1"; }
+  check_warn() { printf '\033[1;33m!\033[0m %s\n' "$1"; checks_failed=$((checks_failed + 1)); }
+
+  say "running post-install health check (read-only)"
+
+  # 1. Find a working python >= 3.9 interpreter (honouring RAM_KEEPER_PYTHON).
+  CHECK_PY=""
+  for c in "${RAM_KEEPER_PYTHON:-}" /usr/bin/python3 \
+           "$(command -v python3 2>/dev/null || true)" \
+           "$(command -v python 2>/dev/null || true)"; do
+    if [[ -n "$c" && -x "$c" ]] \
+       && "$c" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)' >/dev/null 2>&1; then
+      CHECK_PY="$c"
+      break
+    fi
+  done
+
+  # 2. Run the daemon's built-in --doctor (with graceful fallback to --once).
+  if [[ -n "$CHECK_PY" && -f "$PLUGIN_DIR/helper/ram_keeper.py" ]]; then
+    doc_rc=0
+    doc_out="$("$CHECK_PY" "$PLUGIN_DIR/helper/ram_keeper.py" --doctor 2>&1)" || doc_rc=$?
+    if (( doc_rc == 0 )); then
+      [[ -n "$doc_out" ]] && printf '%s\n' "$doc_out"
+      check_ok "ram_keeper.py --doctor passed"
+    elif (( doc_rc == 2 )) && [[ "$doc_out" == *"unrecognized arguments: --doctor"* ]]; then
+      if "$CHECK_PY" "$PLUGIN_DIR/helper/ram_keeper.py" --once >/dev/null 2>&1; then
+        check_ok "ram_keeper.py --once snapshot readable"
+      else
+        check_warn "ram_keeper.py --once failed"
+      fi
+    else
+      [[ -n "$doc_out" ]] && printf '%s\n' "$doc_out"
+      check_warn "ram_keeper.py --doctor reported issues (exit $doc_rc)"
+    fi
+  else
+    check_warn "cannot run --doctor: python3 >= 3.9 or helper not found"
+  fi
+
+  # 3. Units installed, enabled and active.
+  if systemctl --user is-enabled ram-keeper.service >/dev/null 2>&1; then
+    check_ok "ram-keeper.service is enabled"
+  else
+    check_warn "ram-keeper.service is not enabled (fix: bash $PLUGIN_DIR/install.sh)"
+  fi
+
+  if systemctl --user is-active --quiet ram-keeper.service; then
+    check_ok "ram-keeper.service is running"
+    restarts="$(systemctl --user show ram-keeper.service -p NRestarts --value 2>/dev/null || echo 0)"
+    if [[ "$restarts" != "0" ]]; then
+      check_warn "daemon has restarted $restarts time(s); check: journalctl --user -u ram-keeper -n 30"
+    fi
+  else
+    check_warn "ram-keeper.service is not running (fix: systemctl --user restart ram-keeper.service)"
+  fi
+
+  if [[ -f "$HOME/.config/systemd/user/ram-keeper-notify.service" ]]; then
+    if systemctl --user is-active --quiet ram-keeper-notify.service; then
+      check_ok "ram-keeper-notify.service is running"
+    elif command -v omarchy-notification-send >/dev/null 2>&1; then
+      check_warn "ram-keeper-notify.service is not running (fix: systemctl --user start ram-keeper-notify.service)"
+    else
+      say "omarchy-notification-send not on PATH; notifier intentionally idle"
+    fi
+  fi
+
+  if [[ -f "$NOTIFY_SRC" ]]; then
+    if bash -n "$NOTIFY_SRC" 2>/dev/null; then
+      check_ok "notifier script parses"
+    else
+      check_warn "notifier script has a syntax error"
+    fi
+  fi
+
+  # 4. State directory writable and snapshot fresh.
+  if [[ -d "$STATE_DIR/flags" && -w "$STATE_DIR/flags" ]]; then
+    check_ok "state directory writable: $STATE_DIR/flags"
+  else
+    check_warn "state directory missing or read-only: $STATE_DIR/flags (fix: bash $PLUGIN_DIR/install.sh)"
+  fi
+
+  if [[ -f "$STATE_DIR/state.json" ]]; then
+    age=$(( $(date +%s) - $(stat -c %Y "$STATE_DIR/state.json" 2>/dev/null || echo 0) ))
+    if (( age <= 180 )); then
+      check_ok "state.json is fresh (${age}s old)"
+    else
+      check_warn "state.json is stale (${age}s old)"
+    fi
+  fi
+
+  # 5. Kernel / Omarchy environment & AI diagnosis skill.
+  if [[ -e /sys/block/zram0 ]]; then
+    check_ok "zram0 swap present"
+  else
+    check_warn "zram0 not present (anonymous memory will not swap to compressed RAM)"
+  fi
+
+  if systemctl is-active --quiet systemd-oomd 2>/dev/null; then
+    check_ok "systemd-oomd is active"
+  else
+    check_warn "systemd-oomd is not active"
+  fi
+
+  HERMES_ROOT="${HERMES_HOME:-$HOME/.hermes}"
+  found_skill=""
+  for sk in "$HERMES_ROOT/skills/ram-memory-diagnosis/SKILL.md" \
+            "$HERMES_ROOT/profiles/"*/skills/ram-memory-diagnosis/SKILL.md; do
+    if [[ -f "$sk" ]]; then
+      found_skill="$sk"
+      break
+    fi
+  done
+  if [[ -n "$found_skill" ]]; then
+    check_ok "Hermes diagnosis skill present ($found_skill)"
+  else
+    say "Hermes skill optional: $HERMES_ROOT/skills/ram-memory-diagnosis/SKILL.md not installed"
+  fi
+
+  # 6. Journal warnings in the last hour.
+  if command -v journalctl >/dev/null 2>&1; then
+    warns="$(journalctl --user -u ram-keeper -u ram-keeper-notify --since '1 hour ago' -p warning --no-pager -q 2>/dev/null | wc -l | tr -d ' ')"
+    if (( warns > 0 )); then
+      check_warn "$warns journal warning(s) in the last hour; run: journalctl --user -u ram-keeper -u ram-keeper-notify -p warning --since '1 hour ago'"
+    else
+      check_ok "no journal warnings in the last hour"
+    fi
+  fi
+
+  echo
+  if (( checks_failed == 0 )); then
+    ok "all health checks passed"
+  else
+    warn "$checks_failed check(s) need attention"
+  fi
+  exit $(( checks_failed > 0 ? 1 : 0 ))
+fi
 
 # --------------------------------------------------------------------------
 # Preconditions
@@ -28,9 +180,11 @@ stat -fc %T /sys/fs/cgroup 2>/dev/null | grep -q cgroup2fs \
   || die "cgroup v2 is required (found: $(stat -fc %T /sys/fs/cgroup 2>/dev/null))"
 
 PYTHON=""
-for candidate in /usr/bin/python3 "$(command -v python3 2>/dev/null || true)"; do
+for candidate in "${RAM_KEEPER_PYTHON:-}" /usr/bin/python3 \
+                 "$(command -v python3 2>/dev/null || true)" \
+                 "$(command -v python 2>/dev/null || true)"; do
   if [[ -n "$candidate" && -x "$candidate" ]]; then
-    if "$candidate" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)' 2>/dev/null; then
+    if "$candidate" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)' >/dev/null 2>&1; then
       PYTHON="$candidate"
       break
     fi
@@ -53,7 +207,16 @@ fi
 # Install
 # --------------------------------------------------------------------------
 
-mkdir -p "$STATE_DIR" "$STATE_DIR/flags" "$HOME/.config/systemd/user"
+mkdir -p "$STATE_DIR" "$STATE_DIR/flags" "$HOME/.config/ram-keeper" \
+         "$HOME/.config/systemd/user" "$HOME/.config/user-tmpfiles.d"
+cat >"$HOME/.config/user-tmpfiles.d/ram-keeper.conf" <<'TMPFILES'
+d %h/.local/state/ram-keeper 0700 - - -
+d %h/.local/state/ram-keeper/flags 0700 - - -
+d %h/.config/ram-keeper 0700 - - -
+TMPFILES
+if command -v systemd-tmpfiles >/dev/null 2>&1; then
+  systemd-tmpfiles --user --create >/dev/null 2>&1 || true
+fi
 # Render @PLUGIN_DIR@ rather than hardcoding the install path. `omarchy plugin
 # add` clones into $PLUGINS_DIR/<manifest id>, so the directory name is chosen by
 # the id (which the marketplace requires to be namespaced) — a hardcoded path
@@ -161,7 +324,11 @@ fi
 # protection, it just does not get told about it.
 if [[ -f "$HOME/.config/systemd/user/ram-keeper-notify.service" ]]; then
   systemctl --user enable ram-keeper-notify.service >/dev/null 2>&1 || true
-  systemctl --user try-restart ram-keeper-notify.service >/dev/null 2>&1 || true
+  # `try-restart` is a no-op on an inactive unit, which means a fresh install
+  # never starts the notifier. Mirror the daemon's pattern: restart if running,
+  # otherwise start.
+  systemctl --user restart ram-keeper-notify.service >/dev/null 2>&1 \
+    || systemctl --user start ram-keeper-notify.service >/dev/null 2>&1 || true
   sleep 1
   if systemctl --user is-active --quiet ram-keeper-notify.service; then
     ok "ram-keeper-notify.service is running (alerts on, one-click AI)"
@@ -169,8 +336,11 @@ if [[ -f "$HOME/.config/systemd/user/ram-keeper-notify.service" ]]; then
     warn "notifier did not start (alerts off, protection unaffected)"
   fi
   if [[ -x "$NOTIFY_SRC" ]]; then
-    bash -n "$NOTIFY_SRC" && ok "notifier script parses" \
-      || warn "notifier script has a syntax error"
+    if bash -n "$NOTIFY_SRC"; then
+      ok "notifier script parses"
+    else
+      warn "notifier script has a syntax error"
+    fi
   fi
 fi
 
@@ -180,8 +350,8 @@ fi
 
 if "$PYTHON" "$PLUGIN_DIR/helper/ram_keeper.py" --once >/dev/null 2>&1; then
   SNAP="$("$PYTHON" "$PLUGIN_DIR/helper/ram_keeper.py" --once 2>/dev/null)"
-  FREE="$(printf '%s' "$SNAP" | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin)["free_percent"])' 2>/dev/null || echo '?')"
-  STATE="$(printf '%s' "$SNAP" | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin)["state"])' 2>/dev/null || echo '?')"
+  FREE="$(printf '%s' "$SNAP" | "$PYTHON" -c 'import json,sys; print(json.load(sys.stdin)["free_percent"])' 2>/dev/null || echo '?')"
+  STATE="$(printf '%s' "$SNAP" | "$PYTHON" -c 'import json,sys; print(json.load(sys.stdin)["state"])' 2>/dev/null || echo '?')"
   ok "memory readable: ${FREE}% free, state=$STATE"
 else
   warn "the helper could not produce a snapshot — run: $PYTHON $PLUGIN_DIR/helper/ram_keeper.py --once"

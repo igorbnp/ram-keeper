@@ -173,11 +173,13 @@ desktop session:
 | PSI (`/proc/pressure/memory`) | the stall signal | kernel 4.20+ |
 | `systemd` user units | supervision | Omarchy |
 | `zram` | compressed-RAM swap, the reclaim target | `zram-generator` (Arch) |
-| `jq`, `grep`, `md5sum` | the notifier only | coreutils / Arch |
+| `grep`, `md5sum` | the notifier only | coreutils / Arch |
 | `omarchy-notification-send` | desktop alerts | Omarchy |
 
-The daemon requires cgroup v2 and a `zram` device. `install.sh` checks both and
-says so plainly instead of failing later.
+The daemon requires cgroup v2. It moves anonymous memory only when a zram
+device still has free space (more than 64 MB). If zram is missing or full,
+that pass does not run, so apps are not pushed onto the disk swapfile.
+`install.sh` warns when `zram0` is absent.
 
 ## Install
 
@@ -201,7 +203,7 @@ it can read your memory state before reporting success.
 ### Versions and releases
 
 `manifest.json` carries the plugin version, and a release tag must match it
-(`v1.1.0` ↔ `1.1.0`) — the release workflow refuses to publish when they disagree.
+(`v1.2.0` ↔ `1.2.0`) — the release workflow refuses to publish when they disagree.
 A release is a source snapshot: `.tar.gz`, `.zip` and `SHA256SUMS`. The installer
 never downloads anything, so the number that tells you whether your checkout is
 current is the manifest version, which is what `omarchy plugin update` reads.
@@ -211,7 +213,8 @@ current is the manifest version, which is what `omarchy plugin update` reads.
 ```bash
 systemctl --user disable --now ram-keeper.service ram-keeper-notify.service
 rm -f ~/.config/systemd/user/ram-keeper.service \
-      ~/.config/systemd/user/ram-keeper-notify.service
+      ~/.config/systemd/user/ram-keeper-notify.service \
+      ~/.config/user-tmpfiles.d/ram-keeper.conf
 systemctl --user daemon-reload
 rm -rf ~/.config/omarchy/plugins/io.github.igorbnp.ram-keeper
 rm -rf ~/.local/state/ram-keeper ~/.config/ram-keeper
@@ -243,25 +246,30 @@ Click the bar widget (or `omarchy-shell shell toggle ram-keeper`). It shows:
 - **Available to reclaim** — the processes the daemon would take from, largest
   first, with their sizes.
 - **Never reclaimed** — what's protected and why it's still listed: Hyprland,
-  the Hermes gateway, SIA, Syncthing. Transparency about what it's choosing not
-  to touch.
+  the shell, PipeWire, Syncthing, Ollama, the Hermes gateway, SIA, and the
+  daemon. A name protects that unit only: `syncthing` does not cover
+  `syncthing-server`, and `hermes` does not cover `hermes-gateway` (that one
+  is listed on its own). Transparency about what it's choosing not to touch.
 
 Right-click the bar widget to toggle the percentage on and off.
 
 ## Verify it's working
 
 ```bash
-# is the daemon alive?
-systemctl --user status ram-keeper.service
+# full post-install health check (units, sandbox, zram, snapshot freshness)
+bash ~/.config/omarchy/plugins/io.github.igorbnp.ram-keeper/install.sh --check
 
-# what does it think is going on?
-python3 ~/.config/omarchy/plugins/ram-keeper/helper/ram_keeper.py --once
+# daemon diagnostics, recent reclaim history, or temporary snooze
+python3 ~/.config/omarchy/plugins/io.github.igorbnp.ram-keeper/helper/ram_keeper.py --doctor
+python3 ~/.config/omarchy/plugins/io.github.igorbnp.ram-keeper/helper/ram_keeper.py --history 20
+python3 ~/.config/omarchy/plugins/io.github.igorbnp.ram-keeper/helper/ram_keeper.py --pause 30
+python3 ~/.config/omarchy/plugins/io.github.igorbnp.ram-keeper/helper/ram_keeper.py --resume
 
-# what has it done today?
-tail -5 ~/.local/state/ram-keeper/log.jsonl | python3 -m json.tool --json-lines
+# what does it think is going on right now?
+python3 ~/.config/omarchy/plugins/io.github.igorbnp.ram-keeper/helper/ram_keeper.py --once
 
 # force one pass by hand
-python3 ~/.config/omarchy/plugins/ram-keeper/helper/ram_keeper.py --relieve
+python3 ~/.config/omarchy/plugins/io.github.igorbnp.ram-keeper/helper/ram_keeper.py --relieve
 ```
 
 ## Known limitations
@@ -280,10 +288,6 @@ one that names them.
   on all kernels — on the kernel this was developed against (7.2.5) every
   cgroup reports a bare `"1"`. Victims are scored by `memory.current` and
   `memory.stat` instead. Only the global `/proc/pressure/memory` is read.
-- **Process Guardian is not active in the production daemon.** The helper file
-  is experimental and unwired: it does not discover or dynamically protect new
-  processes at runtime. Protection currently comes from configured names and
-  the built-in inviolable cgroups; helper tests do not prove daemon integration.
 - **Reclaim cannot help if zram *and* disk swap are both full.** At that point
   the only remaining lever is killing a process, which this tool deliberately
   leaves to `systemd-oomd`. You will get a critical toast instead of a silent
@@ -309,7 +313,9 @@ one that names them.
 - **"Drop cache" drops cache.** It once ran the anonymous passes too, so
   clicking it on a healthy desktop swapped out Chromium and the Hyprland
   launcher: 658 MB into zram for no memory benefit, under a button labelled
-  "Drop cache". It is now cache-only.
+  "Drop cache". It is now cache-only, and the cache write asks the kernel for
+  `swappiness=0`. If that kernel rejects the token, the same write is retried
+  as a plain byte count.
 - **The first version of this plugin killed a browser, and only sustained load
   revealed it.** The anon pass asked a cgroup for as much as all of its
   anonymous memory; under continuous load that became a 1.5 GB request against a

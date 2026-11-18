@@ -13,9 +13,35 @@
 set -uo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
+# Never let a child inherit the owner's config. Track whether we created the
+# scratch paths ourselves so EXIT cleans up our temp files without touching
+# caller-supplied overrides.
+_own_cfg=""
+_own_state=""
+if [[ -z "${RAM_KEEPER_CONFIG:-}" ]]; then
+  _own_cfg="$(mktemp "${TMPDIR:-/tmp}/rk-config.XXXXXX")"
+  printf '{}\n' >"$_own_cfg"
+  export RAM_KEEPER_CONFIG="$_own_cfg"
+fi
+if [[ -z "${RAM_KEEPER_STATE_DIR:-}" ]]; then
+  _own_state="$(mktemp -d "${TMPDIR:-/tmp}/rk-state.XXXXXX")"
+  export RAM_KEEPER_STATE_DIR="$_own_state"
+fi
 fails=0
 test_out="$(mktemp "${TMPDIR:-/tmp}/ram-keeper-test.XXXXXX")"
-trap 'rm -f "$test_out"' EXIT
+trap 'rm -f "$test_out" ${_own_cfg:+"$_own_cfg"}; [[ -n "$_own_state" ]] && rm -rf "$_own_state"' EXIT
+
+PY=""
+for _cand in "${RAM_KEEPER_PYTHON:-}" /usr/bin/python3 \
+             "$(command -v python3 2>/dev/null || true)" \
+             "$(command -v python 2>/dev/null || true)"; do
+  if [[ -n "$_cand" && -x "$_cand" ]] \
+     && "$_cand" -c "import sys" >/dev/null 2>&1; then
+    PY="$_cand"
+    break
+  fi
+done
+[[ -n "$PY" ]] || PY=python3
 
 run() {
   local label="$1"; shift
@@ -37,7 +63,7 @@ run "inactive service start" bash test_installer_inactive_start.sh
 
 echo
 echo "qml structure (must pass BEFORE restarting the shell):"
-run "qml structure"      /usr/bin/python3 test_qml_structure.py
+run "qml structure"      "$PY" test_qml_structure.py
 
 echo
 echo "node tests (panel data shaping):"
@@ -48,17 +74,17 @@ command -v node >/dev/null && {
 
 echo
 echo "python tests (daemon logic and hostile input):"
-run "forecast maths"      env RAM_KEEPER_LIVE=1 /usr/bin/python3 test_forecast.py
-run "hostile configs"     env RAM_KEEPER_LIVE=1 /usr/bin/python3 test_config_hostile.py
-run "compositor shield"   env RAM_KEEPER_LIVE=1 /usr/bin/python3 test_inviolable.py
-run "resilience"          env RAM_KEEPER_LIVE=1 /usr/bin/python3 test_resilience.py
-run "critical metrics"    /usr/bin/python3 test_critical_metrics.py
+run "forecast maths"      env RAM_KEEPER_LIVE=1 "$PY" test_forecast.py
+run "hostile configs"     env RAM_KEEPER_LIVE=1 "$PY" test_config_hostile.py
+run "compositor shield"   env RAM_KEEPER_LIVE=1 "$PY" test_inviolable.py
+run "resilience"          env RAM_KEEPER_LIVE=1 "$PY" test_resilience.py
+run "critical metrics"    "$PY" test_critical_metrics.py
 if [[ "${RAM_KEEPER_DANGEROUS_TESTS:-0}" == "1" ]]; then
-  run "no OOM stress (live)" /usr/bin/python3 test_no_oom_kill.py
+  run "no OOM stress (live)" "$PY" test_no_oom_kill.py
 else
-  run "no OOM safety"     /usr/bin/python3 test_no_oom_kill.py
+  run "no OOM safety"     "$PY" test_no_oom_kill.py
 fi
-run "pass budget"        /usr/bin/python3 test_pass_budget.py
+run "pass budget"        "$PY" test_pass_budget.py
 
 echo
 echo "notifier (real script, stub binaries, throwaway HOME):"
@@ -72,7 +98,7 @@ echo "unit-test suites (pytest):"
 # been executed. pytest is an optional tool on a desktop, so report SKIP with
 # the one command that fixes it rather than pretending to pass.
 PYTEST_PY=""
-for candidate in /usr/bin/python3 python3; do
+for candidate in "$PY" /usr/bin/python3 python3; do
   if command -v "$candidate" >/dev/null 2>&1 \
      && "$candidate" -c 'import pytest' >/dev/null 2>&1; then
     PYTEST_PY="$candidate"
@@ -80,11 +106,11 @@ for candidate in /usr/bin/python3 python3; do
   fi
 done
 if [[ -n "$PYTEST_PY" ]]; then
-  run "pytest (core, policy, attacks)" bash -c \
-    "cd '$PWD' && '$PYTEST_PY' -m pytest -q -p no:cacheprovider \
-      test_ram_keeper_core.py test_integration.py test_process_guardian.py \
+  run "pytest (core, policy, attacks)" \
+    "$PYTEST_PY" -m pytest -q -p no:cacheprovider \
+      test_ram_keeper_core.py test_integration.py \
       test_bugfixes.py test_reclaim_policy.py test_config_attacks.py \
-      test_unit_hardening.py"
+      test_unit_hardening.py test_config_isolation.py
 else
   echo "  --   SKIP: pytest not installed for this python."
   echo "       install with: python3 -m pip install --user pytest   (see requirements.txt)"

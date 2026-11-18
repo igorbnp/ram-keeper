@@ -22,10 +22,12 @@
 
 set -uo pipefail
 
-readonly STATE_DIR="$HOME/.local/state/ram-keeper"
+readonly STATE_DIR="${RAM_KEEPER_STATE_DIR:-$HOME/.local/state/ram-keeper}"
 readonly FLAG_DIR="$STATE_DIR/flags"
 readonly LOG="$STATE_DIR/log.jsonl"
 readonly PIDFILE="$STATE_DIR/notify.pid"
+readonly RATE_FILE="$FLAG_DIR/.rate-timestamps"
+readonly RATE_LOCK="$FLAG_DIR/.rate.lock"
 readonly DEDUPE_SECONDS=${RAM_KEEPER_DEDUPE_SECONDS:-1800}
 # Poll intervals, overridable so the test suite can exercise a transition in
 # seconds instead of waiting 15 and 30 of them.
@@ -33,30 +35,48 @@ readonly DAEMON_POLL=${RAM_KEEPER_DAEMON_POLL:-15}
 readonly PRESSURE_POLL=${RAM_KEEPER_PRESSURE_POLL:-30}
 readonly UNIT=ram-keeper.service
 
+# Global anti-flood ceiling: at most 3 notifications in any 300-second window.
+readonly RATE_LIMIT_WINDOW=${RAM_KEEPER_RATE_WINDOW:-300}
+readonly RATE_LIMIT_MAX=${RAM_KEEPER_RATE_MAX:-3}
+
+declare -A MEM_DEDUPE=()
+declare -a TOAST_TIMESTAMPS=()
+declare -a SUP_PIDS=()
+_RATE_MEM_ONLY=0
+_SEND_LOCK_MODE=""
+
 # python3 is already a hard dependency of this plugin (the daemon is written in
-# it), so parse the snapshot with it instead of adding a jq dependency. A
-# missing jq used to make watch_pressure read state="" forever: a watcher that
-# is dead code but looks alive.
-PYTHON3="${RAM_KEEPER_PYTHON:-/usr/bin/python3}"
-[[ -x "$PYTHON3" ]] || PYTHON3="$(command -v python3 2>/dev/null || true)"
+# it), so parse the snapshot with it instead of adding a jq dependency. Validate
+# that the binary actually executes (ignoring dead stubs like WindowsApps).
+resolve_python() {
+  local cand
+  for cand in "${RAM_KEEPER_PYTHON:-}" /usr/bin/python3 \
+              "$(command -v python3 2>/dev/null || true)" \
+              "$(command -v python 2>/dev/null || true)"; do
+    if [[ -n "$cand" && -x "$cand" ]] \
+       && "$cand" -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 9) else 1)" >/dev/null 2>&1; then
+      printf '%s' "$cand"
+      return 0
+    fi
+  done
+  return 1
+}
+PYTHON3="$(resolve_python || true)"
 
 # The skill path is resolved at click time, not install time: a Hermes profile
 # switch or a skill reinstall must not leave the notifier pointing at a stale
 # path.
 skill_path() {
-  local found
-  for root in "${HERMES_HOME:-$HOME/.hermes}"; do
-    for candidate in "$root/skills/ram-memory-diagnosis/SKILL.md" \
-                     "$root/profiles/"*/skills/ram-memory-diagnosis/SKILL.md; do
-      [[ -f "$candidate" ]] && { echo "$candidate"; return 0; }
-    done
-    found="$root/skills/ram-memory-diagnosis/SKILL.md"
+  local root candidate
+  root="${HERMES_HOME:-$HOME/.hermes}"
+  for candidate in "$root/skills/ram-memory-diagnosis/SKILL.md" \
+                   "$root/profiles/"*/skills/ram-memory-diagnosis/SKILL.md; do
+    [[ -f "$candidate" ]] && { echo "$candidate"; return 0; }
   done
-  echo "$found"
+  echo "$root/skills/ram-memory-diagnosis/SKILL.md"
 }
-readonly SKILL_PATH="$(skill_path)"
 
-mkdir -p "$FLAG_DIR"
+mkdir -p "$FLAG_DIR" 2>/dev/null || true
 
 # nf-md-memory_alert / nf-md-check, escaped so this file reads without a Nerd Font.
 readonly ALERT_GLYPH=$'\U000f0535'
@@ -65,9 +85,6 @@ log_event() {
   printf '{"ts":%s,"event":"%s"}\n' "$(date +%s)" "$1" >>"$LOG" 2>/dev/null || true
 }
 
-# Dedupe by flag file: it exists means "already told the user recently".
-# Touching it restarts the window. Survives a restart of this script, which an
-# in-memory associative array would not.
 # Keep the dedupe directory bounded. OOM lines embed a PID and an RSS, so they
 # never collide: without pruning, a crash-looping app adds one file per boot,
 # permanently, and nothing ever removes them.
@@ -79,56 +96,174 @@ prune_flags() {
   rm -f "${all[@]:keep}" 2>/dev/null || true
 }
 
-should_announce() {
-  local marker="$FLAG_DIR/$1" now
+# Check eligibility WITHOUT writing the dedupe marker yet. Writing before
+# send() used to mute critical alerts for 30 minutes whenever the notification
+# daemon was not ready yet at login.
+can_announce() {
+  local key="$1" marker="$FLAG_DIR/$1" now mem_ts
   now=$(date +%s)
   if [[ -e "$marker" ]]; then
     local age=$(( now - $(stat -c %Y "$marker" 2>/dev/null || echo 0) ))
     (( age < DEDUPE_SECONDS )) && return 1
   fi
-  touch "$marker"
-  prune_flags 200
+  mem_ts="${MEM_DEDUPE[$key]:-0}"
+  if (( mem_ts > 0 && now - mem_ts < DEDUPE_SECONDS )); then
+    return 1
+  fi
   return 0
 }
 
-# A toast nobody sees is worse than no toast: it trains the user to ignore
-# notifications entirely. The shell owns the notification name, so wait for it
-# to claim the name — same reason omarchy-crash-watch does.
-#
-# The timeout is POSITIONAL: `omarchy-notification-wait [seconds]`. Passing
-# `--timeout` makes it treat the flag as the value of $1, and with `set -u` the
-# resulting unbound variable kills this whole notifier — taking the other two
-# watchers with it. Failures here must never be fatal.
+# Commit the dedupe window only AFTER send() succeeded. Falls back to in-memory
+# tracking when STATE_DIR is read-only (EROFS) or out of space (ENOSPC).
+mark_announced() {
+  local key="$1" marker="$FLAG_DIR/$1" now
+  now=$(date +%s)
+  MEM_DEDUPE["$key"]="$now"
+  if touch "$marker" 2>/dev/null; then
+    prune_flags 200
+  else
+    log_event "dedupe-mem-fallback"
+  fi
+}
+
+# Global rate-limit across all watchers via $RATE_FILE (falling back to
+# in-memory TOAST_TIMESTAMPS when disk is not writable / EROFS).
+rate_limit_check_and_record() {
+  local mode="$1" now cutoff ts
+  now=$(date +%s)
+  cutoff=$(( now - RATE_LIMIT_WINDOW ))
+
+  if (( _RATE_MEM_ONLY == 0 )) && mkdir -p "$FLAG_DIR" 2>/dev/null && [[ -d "$FLAG_DIR" && -w "$FLAG_DIR" ]]; then
+    local -a kept=()
+    if [[ -f "$RATE_FILE" && ! -p "$RATE_FILE" ]]; then
+      while IFS= read -r ts; do
+        [[ "$ts" =~ ^[0-9]+$ ]] && (( ts > cutoff )) && kept+=("$ts")
+      done < <(head -c 16384 "$RATE_FILE" 2>/dev/null)
+    fi
+    if [[ "$mode" == "check" ]]; then
+      if ( : >>"$RATE_FILE.probe.$$" ) 2>/dev/null; then
+        rm -f "$RATE_FILE.probe.$$" 2>/dev/null || true
+        (( ${#kept[@]} < RATE_LIMIT_MAX ))
+        return $?
+      fi
+      _RATE_MEM_ONLY=1
+    else
+      kept+=("$now")
+      if printf '%s\n' "${kept[@]}" >"$RATE_FILE.tmp.$$" 2>/dev/null \
+         && mv -f "$RATE_FILE.tmp.$$" "$RATE_FILE" 2>/dev/null; then
+        return 0
+      fi
+      rm -f "$RATE_FILE.tmp.$$" 2>/dev/null || true
+      _RATE_MEM_ONLY=1
+    fi
+  fi
+
+  local -a live=()
+  for ts in "${TOAST_TIMESTAMPS[@]:-}"; do
+    [[ -n "${ts:-}" ]] && (( ts > cutoff )) && live+=("$ts")
+  done
+  if (( ${#live[@]} > 0 )); then
+    TOAST_TIMESTAMPS=("${live[@]}")
+  else
+    TOAST_TIMESTAMPS=()
+  fi
+  if [[ "$mode" == "check" ]]; then
+    (( ${#TOAST_TIMESTAMPS[@]} < RATE_LIMIT_MAX ))
+    return $?
+  fi
+  TOAST_TIMESTAMPS+=("$now")
+  return 0
+}
+
+# Strict whitelist for process/unit names extracted from untrusted log text:
+# strips shell/prompt metacharacters and leading dashes, max 48 characters.
+sanitize_victim() {
+  local raw="$1" clean
+  clean="${raw//[^A-Za-z0-9._@-]/}"
+  clean="${clean#"${clean%%[A-Za-z0-9_@]*}"}"
+  printf '%s' "${clean:0:48}"
+}
+
+_acquire_send_lock() {
+  _SEND_LOCK_MODE=""
+  (( _RATE_MEM_ONLY == 0 )) || return 0
+  mkdir -p "$FLAG_DIR" 2>/dev/null || return 0
+  [[ -d "$FLAG_DIR" && -w "$FLAG_DIR" ]] || return 0
+  if command -v flock >/dev/null 2>&1 && ( exec 8>>"$RATE_LOCK" ) 2>/dev/null; then
+    exec 8>>"$RATE_LOCK"
+    if flock -w 10 8; then
+      _SEND_LOCK_MODE="flock"
+      return 0
+    fi
+    exec 8>&- 2>/dev/null || true
+    return 0
+  fi
+  local tries=0
+  while ! mkdir "$RATE_LOCK.d" 2>/dev/null; do
+    tries=$(( tries + 1 ))
+    if (( tries > 50 )); then
+      rmdir "$RATE_LOCK.d" 2>/dev/null || true
+      mkdir "$RATE_LOCK.d" 2>/dev/null || return 0
+      break
+    fi
+    sleep 0.1
+  done
+  _SEND_LOCK_MODE="mkdir"
+  return 0
+}
+
+_release_send_lock() {
+  if [[ "$_SEND_LOCK_MODE" == "flock" ]]; then
+    flock -u 8 2>/dev/null || true
+    exec 8>&- 2>/dev/null || true
+  elif [[ "$_SEND_LOCK_MODE" == "mkdir" ]]; then
+    rmdir "$RATE_LOCK.d" 2>/dev/null || true
+  fi
+  _SEND_LOCK_MODE=""
+}
+
+# Return codes:
+#   0 = delivered
+#   1 = transient failure (notification server unready or send failed)
+#   2 = dropped by global anti-flood rate-limit
 send() {
   local urgency="$1" glyph="$2" title="$3" body="$4" action="$5"
-  omarchy-notification-wait 5 || {
+  _acquire_send_lock
+  if ! rate_limit_check_and_record check; then
+    _release_send_lock
+    log_event "rate-limited"
+    return 2
+  fi
+  if ! omarchy-notification-wait 5 8>&-; then
+    _release_send_lock
     log_event "notify-server-unready"
     return 1
-  }
-  omarchy-notification-send \
+  fi
+  if omarchy-notification-send \
     --urgency "$urgency" \
     --glyph "$glyph" \
     "$title" \
     "$body" \
-    --exec bash -lc "$action" || log_event "notify-send-failed"
+    --exec bash -lc "$action" 8>&-; then
+    rate_limit_check_and_record record
+    _release_send_lock
+    return 0
+  fi
+  _release_send_lock
+  log_event "notify-send-failed"
+  return 1
 }
 
 # Build the click action as a single shell command string.
-#
-# Two things learned the hard way:
-#   * The prompt goes through printf %q so any quote inside it survives being
-#     handed to `bash -lc`.
-#   * NO `--inline`. That flag makes omarchy exec the agent directly, which
-#     fails for Hermes with "hermes-tui: no TTY" because a notification click
-#     has no terminal attached. Without it, omarchy-launch-tui opens a real
-#     terminal window — which is what omarchy-agent-crash does too, and the only
-#     shape that actually works.
-#   * The skill PATH is inlined in the prompt, exactly like omarchy-agent-crash
-#     does. An agent that cannot resolve skills by name should still be able to
-#     read the file.
 agent_action() {
-  local prompt="$1"
-  printf 'omarchy agent prompt %q' "Read and follow the skill at $SKILL_PATH.
+  local prompt="$1" skill lead
+  skill="$(skill_path)"
+  if [[ -n "$skill" && -f "$skill" ]]; then
+    lead="Read and follow the skill at $skill."
+  else
+    lead="Explain the memory situation from the numbers in this prompt."
+  fi
+  printf 'omarchy agent prompt %q' "$lead
 
 $prompt"
 }
@@ -137,24 +272,30 @@ $prompt"
 # 1. The daemon died — the one thing that must never be silent
 # ---------------------------------------------------------------------------
 watch_daemon() {
-  # Starts EMPTY on purpose. Initialising to 1 made the first iteration toast
-  # for a daemon that was already stopped at login — exactly the "a unit
-  # disabled at login is a choice, not a failure" case the comment below
-  # describes. Only a transition from running to stopped is an event.
-  local was_alive=""
+  local was_alive="" rc=0
   while true; do
     if systemctl --user is-active --quiet "$UNIT"; then
       was_alive=1
-    elif [[ "$was_alive" == "1" ]]; then
-      # Only speak if it was alive and has now stopped. A unit disabled at
-      # login is a choice, not a failure, and must not nag.
+    elif [[ -f "$STATE_DIR/paused-by-user" ]]; then
+      # The panel or CLI wrote this before pausing. A pause is not a crash.
       was_alive=0
+    elif [[ "$was_alive" == "1" ]]; then
       log_event "daemon-down"
-      if should_announce daemon-down; then
+      if ! can_announce daemon-down; then
+        was_alive=0
+      else
         send critical "$ALERT_GLYPH" \
           "RAM protection stopped" \
           "ram-keeper is not running. Click to restart it." \
           'systemctl --user restart ram-keeper.service; omarchy-shell io.github.igorbnp.ram-keeper refresh'
+        rc=$?
+        if (( rc == 0 )); then
+          mark_announced daemon-down
+          was_alive=0
+        elif (( rc == 2 )); then
+          was_alive=0
+        fi
+        # rc == 1 keeps was_alive=1 so the next poll retries delivery.
       fi
     fi
     sleep "$DAEMON_POLL"
@@ -164,106 +305,308 @@ watch_daemon() {
 # ---------------------------------------------------------------------------
 # 2. A process was actually killed for using too much memory
 # ---------------------------------------------------------------------------
+_oom_state_context() {
+  [[ -f "$STATE_DIR/state.json" && ! -p "$STATE_DIR/state.json" && -n "$PYTHON3" ]] || return 0
+  "$PYTHON3" -c '
+import json, math, os, stat, sys
+MAX_BYTES = 1048576
+try:
+    p = sys.argv[1]
+    st = os.lstat(p)
+    if not stat.S_ISREG(st.st_mode) or st.st_size <= 0 or st.st_size > MAX_BYTES:
+        raise SystemExit(0)
+    with open(p, encoding="utf-8") as fh:
+        d = json.loads(fh.read(MAX_BYTES + 1))
+except Exception:
+    raise SystemExit(0)
+if not isinstance(d, dict):
+    raise SystemExit(0)
+fc = d.get("forecast") if isinstance(d.get("forecast"), dict) else {}
+culprit = fc.get("culprit", "")
+relief = d.get("relief") if isinstance(d.get("relief"), dict) else {}
+stats = d.get("session_stats") if isinstance(d.get("session_stats"), dict) else {}
+freed = 0
+for cand in (relief.get("freed"), relief.get("freed_bytes"), stats.get("last_relief_bytes")):
+    if isinstance(cand, (int, float)) and not isinstance(cand, bool) and math.isfinite(cand) and cand > 0:
+        freed = int(cand)
+        break
+parts = []
+if isinstance(culprit, str) and culprit:
+    clean = "".join(c for c in culprit if c.isalnum() or c in "._@- ").strip()[:48]
+    if clean:
+        parts.append("culprit=" + clean)
+if freed >= 1048576:
+    parts.append(f"last_reclaimed={freed // 1048576}MB")
+if parts:
+    print(", ".join(parts))
+' "$STATE_DIR/state.json" 2>/dev/null || true
+}
+
+_handle_oom_line() {
+  local line="$1" key victim="" raw_unit="" ctx="" rc=0
+  [[ "$line" == *ram-keeper* ]] && return 0
+  [[ "$line" == *ram-memory-diagnosis* ]] && return 0
+  [[ "$line" == *"just killed a process on this machine"* ]] && return 0
+  [[ "$line" == *"use too much memory"* ]] && return 0
+
+  key="oom-$(printf '%s' "$line" | md5sum | cut -c1-8)"
+  can_announce "$key" || return 0
+  log_event "oom-kill"
+
+  if [[ "$line" =~ [Kk]illed\ process\ [0-9]+\ \(([^\)]+)\) ]]; then
+    victim="${BASH_REMATCH[1]}"
+  elif [[ "$line" =~ [Mm]arked\ (.+)\ for\ killing ]]; then
+    raw_unit="${BASH_REMATCH[1]}"
+    victim="$(basename -- "$raw_unit" 2>/dev/null || true)"
+    victim="${victim%.scope}"
+    victim="${victim%.service}"
+  elif [[ "$line" =~ [Kk]illed\ (.+)\ due\ to\ memory\ pressure ]]; then
+    raw_unit="${BASH_REMATCH[1]}"
+    victim="$(basename -- "$raw_unit" 2>/dev/null || true)"
+    victim="${victim%.scope}"
+    victim="${victim%.service}"
+  fi
+  victim="$(sanitize_victim "$victim")"
+  ctx="$(_oom_state_context)"
+
+  local title body prompt_text
+  if [[ -n "$victim" ]]; then
+    title="Process closed: $victim ran out of memory"
+    body="The system stopped $victim to protect your desktop. Click to diagnose."
+    prompt_text="The system OOM killer stopped the process '$victim' for using too much memory. Use the ram-memory-diagnosis skill to work out what happened and what to change."
+  else
+    title="A process was killed for using too much memory"
+    body="RAM Keeper should have prevented this. Click to find out what happened."
+    prompt_text="systemd-oomd just killed a process on this machine for using too much memory. Use the ram-memory-diagnosis skill to work out what happened and what to change."
+  fi
+  if [[ -n "$ctx" ]]; then
+    prompt_text="$prompt_text Measured context: $ctx."
+  fi
+
+  send critical "$ALERT_GLYPH" "$title" "$body" "$(agent_action "$prompt_text")"
+  rc=$?
+  if (( rc == 1 )); then
+    sleep 1
+    send critical "$ALERT_GLYPH" "$title" "$body" "$(agent_action "$prompt_text")"
+    rc=$?
+  fi
+  if (( rc == 0 )); then
+    mark_announced "$key"
+  fi
+}
+
+_watch_oom_plain() {
+  local line
+  while IFS= read -r line; do
+    _handle_oom_line "$line"
+  done < <(
+    journalctl -f -n 0 -o cat 2>/dev/null \
+      | grep --line-buffered -iE 'memory cgroup out of memory|out of memory: killed process|for killing due to memory pressure|killed .+ due to memory pressure'
+  )
+}
+
 watch_oom_kills() {
-  # What systemd-oomd actually writes is "Memory cgroup out of memory: Killed
-  # process NNNN (name)". The earlier pattern also accepted a bare
-  # "systemd-oomd", which only ever matches our OWN prompt text in the journal
-  # (the click action quotes "systemd-oomd just killed a process...") — so the
-  # filter could match the wrong thing and still miss the real event. Verified
-  # against `strings /usr/lib/systemd/systemd-oomd`.
-  #
-  # Per-line dedupe by content hash, so a crash-looping app cannot produce an
-  # endless stream of identical toasts while a genuinely different event still
-  # gets through.
-  # NOT `journalctl --user`: the kernel's OOM lines live in the SYSTEM journal
-  # and the user view never shows them (verified: 0 matches over a whole boot,
-  # and still 0 after a real oomd kill). This watcher was therefore dead code.
-  # Both vocabularies are matched — the kernel's
-  # "Memory cgroup out of memory: Killed process" and oomd's own
-  # "Marked <path> for killing due to memory pressure" — because either one
-  # means the user is about to lose a process.
-  journalctl -f -n 0 -o cat 2>/dev/null \
-    | grep --line-buffered -iE 'memory cgroup out of memory|for killing due to memory pressure' \
-    | while IFS= read -r line; do
-        # Never react to our own traffic. The click action's prompt is written
-        # into the journal by the agent it launches, and it contains the very
-        # words this watcher greps for. Without these guards one real kill
-        # toasts, the click echoes it, the echo toasts again, and the cycle
-        # continues until the dedupe window expires.
-        [[ "$line" == *ram-keeper* ]] && continue
-        [[ "$line" == *ram-memory-diagnosis* ]] && continue
-        [[ "$line" == *"just killed a process on this machine"* ]] && continue
-        [[ "$line" == *"use too much memory"* ]] && continue
-        key="oom-$(printf '%s' "$line" | md5sum | cut -c1-8)"
-        should_announce "$key" || continue
-        log_event "oom-kill"
-        send critical "$ALERT_GLYPH" \
-          "A process was killed for using too much memory" \
-          "RAM Keeper should have prevented this. Click to find out what happened." \
-          "$(agent_action "systemd-oomd just killed a process on this machine for using too much memory. Use the ram-memory-diagnosis skill to work out what happened and what to change.")"
-      done
+  # Test-only plain mode for stub suites that emit unformatted lines.
+  if [[ "${RAM_KEEPER_TRUST_STUB_JOURNAL:-}" == "1" ]]; then
+    _watch_oom_plain
+    return
+  fi
+  [[ -n "$PYTHON3" ]] || { sleep 30; return; }
+
+  # Authenticate journal entries via JSON metadata: only _TRANSPORT=kernel or
+  # _SYSTEMD_UNIT=systemd-oomd.service can trigger an OOM alert. Unprivileged
+  # processes writing to stdout/journal cannot forge _TRANSPORT=kernel.
+  local msg
+  while IFS= read -r msg; do
+    [[ -n "$msg" ]] && _handle_oom_line "$msg"
+  done < <(
+    journalctl -f -n 0 -o json 2>/dev/null | "$PYTHON3" -u -c '
+import json, sys
+NEEDLES = (
+    "memory cgroup out of memory",
+    "out of memory: killed process",
+    "for killing due to memory pressure",
+)
+for raw in sys.stdin:
+    try:
+        d = json.loads(raw)
+    except Exception:
+        continue
+    if not isinstance(d, dict):
+        continue
+    if d.get("_TRANSPORT") != "kernel" and d.get("_SYSTEMD_UNIT") != "systemd-oomd.service":
+        continue
+    m = d.get("MESSAGE", "")
+    if isinstance(m, list):
+        try:
+            m = bytes(int(x) & 0xFF for x in m).decode("utf-8", "replace")
+        except Exception:
+            continue
+    if not isinstance(m, str):
+        continue
+    clean = " ".join(m.splitlines()).strip()
+    low = clean.lower()
+    if any(n in low for n in NEEDLES) or ("killed " in low and "due to memory pressure" in low):
+        print(clean, flush=True)
+' 2>/dev/null
+  )
 }
 
 # ---------------------------------------------------------------------------
 # 3. Memory critical and staying there
 # ---------------------------------------------------------------------------
 
-# Read one snapshot without jq. Prints state<TAB>free_percent, or fails.
+# Prints 7 tab-separated fields using "-" for empty values so bash `IFS=$'\t'
+# read -r` never collapses adjacent tabs.
 snapshot_fields() {
   [[ -n "$PYTHON3" ]] || return 1
-  printf '%s' "$1" | "$PYTHON3" -c 'import json, sys
+  printf '%s' "$1" | "$PYTHON3" -c 'import json, math, sys
 try:
     d = json.load(sys.stdin)
 except Exception:
     raise SystemExit(1)
 if not isinstance(d, dict):
     raise SystemExit(1)
-print("%s\t%s" % (d.get("state") or "unknown",
-                  "?" if d.get("free_percent") is None else d["free_percent"]))' 2>/dev/null
+free = d.get("free_percent")
+if isinstance(free, bool) or not isinstance(free, (int, float)) or not math.isfinite(free) or free < 0 or free > 100:
+    raise SystemExit(1)
+relief = d.get("relief") if isinstance(d.get("relief"), dict) else {}
+acted = relief.get("acted")
+acted_s = "yes" if acted is True else "no" if acted is False else ""
+skipped = relief.get("skipped_anon") if isinstance(relief.get("skipped_anon"), str) else ""
+skipped = "".join(ch for ch in skipped if ch.isalnum() or ch in "-_")[:40]
+raw_held = d.get("held_by") if isinstance(d.get("held_by"), list) else []
+names = []
+for item in raw_held:
+    if not isinstance(item, str):
+        continue
+    clean = "".join(ch for ch in item if ch.isprintable() and ch not in "\t\r\n").strip()
+    if clean:
+        names.append(clean[:80])
+fc = d.get("forecast") if isinstance(d.get("forecast"), dict) else {}
+culprit = fc.get("culprit", "") if isinstance(fc.get("culprit"), str) else ""
+culprit = "".join(ch for ch in culprit if ch.isalnum() or ch in "._@- ").strip()[:48]
+stats = d.get("session_stats") if isinstance(d.get("session_stats"), dict) else {}
+freed_b = 0
+for cand in (relief.get("freed"), relief.get("freed_bytes"), stats.get("last_relief_bytes")):
+    if isinstance(cand, (int, float)) and not isinstance(cand, bool) and math.isfinite(cand) and cand > 0:
+        freed_b = int(cand)
+        break
+freed_mb = str(freed_b // 1048576) if freed_b >= 1048576 else ""
+cols = [str(d.get("state") or "unknown"), str(free), acted_s, skipped, ", ".join(names[:8]), culprit, freed_mb]
+print("\t".join(c if c else "-" for c in cols))' 2>/dev/null
+}
+
+read_bounded_state() {
+  local path="$1"
+  [[ -f "$path" && ! -p "$path" && -n "$PYTHON3" ]] || return 1
+  "$PYTHON3" -c '
+import os, stat, sys
+MAX_BYTES = 1048576
+p = sys.argv[1]
+try:
+    st = os.lstat(p)
+    if not stat.S_ISREG(st.st_mode) or st.st_size <= 0 or st.st_size > MAX_BYTES:
+        raise SystemExit(1)
+    with open(p, encoding="utf-8") as fh:
+        sys.stdout.write(fh.read(MAX_BYTES + 1))
+except Exception:
+    raise SystemExit(1)
+' "$path" 2>/dev/null
 }
 
 watch_pressure() {
   local last_state=""
   while true; do
-    [[ -f "$STATE_DIR/state.json" ]] || { sleep "$PRESSURE_POLL"; continue; }
+    [[ -f "$STATE_DIR/state.json" && ! -p "$STATE_DIR/state.json" ]] || { sleep "$PRESSURE_POLL"; continue; }
 
-    local snapshot state free fields
-    snapshot="$(cat "$STATE_DIR/state.json" 2>/dev/null)"
-    if ! fields="$(snapshot_fields "$snapshot")" || [[ -z "$fields" ]]; then
-      # A partial write or a corrupt file is not "critical". Say nothing.
+    local snapshot state free fields acted skipped held culprit freed_mb body prompt_ctx rc=0
+    if ! snapshot="$(read_bounded_state "$STATE_DIR/state.json")" || [[ -z "$snapshot" ]]; then
       sleep "$PRESSURE_POLL"
       continue
     fi
-    state="${fields%%$'\t'*}"
-    free="${fields#*$'\t'}"
-
-    # Only on the transition INTO critical, not every poll while critical. A
-    # single dip is normal and self-correcting; the daemon handles it silently,
-    # which is the entire point of having it.
-    if [[ "$state" == "critical" && "$last_state" != "critical" ]] \
-       && should_announce pressure-critical; then
-      log_event "pressure-critical"
-      send critical "$ALERT_GLYPH" \
-        "Memory is critically low" \
-        "Only ${free}% free. RAM Keeper is reclaiming now. Click if the machine feels slow." \
-        "$(agent_action "RAM Keeper reported critical memory pressure: only ${free}% of RAM free. Use the ram-memory-diagnosis skill to explain what is using the memory and whether anything needs to change.")"
+    if ! fields="$(snapshot_fields "$snapshot")" || [[ -z "$fields" ]]; then
+      sleep "$PRESSURE_POLL"
+      continue
     fi
-    last_state="$state"
+    IFS=$'\t' read -r state free acted skipped held culprit freed_mb <<<"$fields"
+    [[ "$acted" == "-" ]] && acted=""
+    [[ "$skipped" == "-" ]] && skipped=""
+    [[ "$held" == "-" ]] && held=""
+    [[ "$culprit" == "-" ]] && culprit=""
+    [[ "$freed_mb" == "-" ]] && freed_mb=""
+
+    if [[ "$state" == "critical" && "$last_state" != "critical" ]]; then
+      if ! can_announce pressure-critical; then
+        last_state="$state"
+      else
+        log_event "pressure-critical"
+        if [[ -n "$held" ]]; then
+          body="Only ${free}% free. Protected apps are holding the memory: ${held}."
+        elif [[ "$acted" == "yes" && -n "$freed_mb" ]]; then
+          body="Only ${free}% free. RAM Keeper is reclaiming now (${freed_mb} MB freed). Click if the machine feels slow."
+        elif [[ "$acted" == "yes" ]]; then
+          body="Only ${free}% free. RAM Keeper is reclaiming now. Click if the machine feels slow."
+        elif [[ "$skipped" == "no-zram-room" ]]; then
+          body="Only ${free}% free. App memory was not moved to disk swap."
+        elif [[ "$skipped" == "psi-full-thrash" ]]; then
+          body="Only ${free}% free. Swap paused due to thrashing."
+        else
+          body="Only ${free}% free. Click if the machine feels slow."
+        fi
+        if [[ -n "$culprit" ]]; then
+          body="$body Biggest grower: $culprit."
+        fi
+        prompt_ctx="RAM Keeper reported critical memory pressure: only ${free}% of RAM free."
+        [[ -n "$culprit" ]] && prompt_ctx="$prompt_ctx Fastest-growing group: $culprit."
+        [[ -n "$freed_mb" ]] && prompt_ctx="$prompt_ctx Last pass reclaimed ${freed_mb} MB."
+        send critical "$ALERT_GLYPH" \
+          "Memory is critically low" \
+          "$body" \
+          "$(agent_action "$prompt_ctx Use the ram-memory-diagnosis skill to explain what is using the memory and whether anything needs to change.")"
+        rc=$?
+        if (( rc == 0 )); then
+          mark_announced pressure-critical
+          last_state="$state"
+        elif (( rc == 2 )); then
+          last_state="$state"
+        fi
+        # rc == 1 leaves last_state unchanged so the next poll retries delivery.
+      fi
+    elif [[ "$state" != "critical" ]]; then
+      last_state="$state"
+    fi
     sleep "$PRESSURE_POLL"
   done
 }
 
 # ---------------------------------------------------------------------------
-# Supervision
+# Supervision & single-instance lock
 # ---------------------------------------------------------------------------
-#
-# `wait` on three background jobs does not restart a dead one: if journalctl
-# exits (journal rotation, a cgroup OOM kill of the pipeline, a broken pipe),
-# the OOM watcher is gone forever while the unit stays "active" and the user
-# believes alerts are on. Each watcher therefore restarts itself, and says so
-# in the log, which makes the failure visible instead of silent.
+_kill_tree() {
+  local target="$1" child
+  local -a children=()
+  [[ -n "$target" ]] || return 0
+  if [[ -r "/proc/$target/task/$target/children" ]]; then
+    read -r -a children <"/proc/$target/task/$target/children" 2>/dev/null || true
+    if (( ${#children[@]} > 0 )); then
+      for child in "${children[@]}"; do
+        [[ -n "$child" ]] && _kill_tree "$child"
+      done
+    fi
+  elif command -v ps >/dev/null 2>&1; then
+    for child in $(ps -o pid= --ppid "$target" 2>/dev/null); do
+      _kill_tree "$child"
+    done
+  fi
+  kill -TERM "$target" 2>/dev/null || true
+}
+
 supervise() {
+  # Do not let watcher subprocesses inherit the pidfile flock FD.
+  exec 9>&- 2>/dev/null || true
   local name="$1"; shift
+  trap '_release_send_lock; exit 0' INT TERM HUP
   while true; do
     "$@"
     log_event "watcher-exited:$name"
@@ -271,11 +614,6 @@ supervise() {
   done
 }
 
-# A PID file proves nothing: `kill -0` tests that the PID EXISTS. A notifier
-# killed by SIGKILL leaves the file behind, the PID is later recycled by an
-# unrelated process, and this script then refuses to start forever — the unit
-# looks active, every alert is silently off, and nothing is logged. Verify the
-# process identity from /proc.
 pid_is_this_script() {
   local pid="$1"
   [[ -n "$pid" && "$pid" =~ ^[0-9]+$ ]] || return 1
@@ -283,24 +621,59 @@ pid_is_this_script() {
   tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | grep -q 'ram_keeper_notify'
 }
 
+cleanup_notifier() {
+  trap - EXIT INT TERM HUP
+  local p
+  for p in "${SUP_PIDS[@]:-}"; do
+    [[ -n "${p:-}" ]] && _kill_tree "$p"
+  done
+  rm -f "$PIDFILE" 2>/dev/null || true
+  exec 9>&- 2>/dev/null || true
+}
+
 main() {
-  # Single instance: three of these looping would triple every notification.
+  # Nothing to say until a notification path exists; exit cleanly before
+  # touching PIDFILE so we never clobber another instance's lock.
+  command -v omarchy-notification-send >/dev/null || exit 0
+
+  local old_pid=""
   if [[ -f "$PIDFILE" ]]; then
-    if pid_is_this_script "$(cat "$PIDFILE" 2>/dev/null)"; then
+    old_pid="$(cat "$PIDFILE" 2>/dev/null || true)"
+  fi
+
+  if command -v flock >/dev/null 2>&1 && ( exec 9>>"$PIDFILE" ) 2>/dev/null; then
+    exec 9>>"$PIDFILE"
+    if ! flock -n 9; then
       exit 0
     fi
-    log_event "stale-pidfile"
+    if [[ -n "$old_pid" && "$old_pid" != "$$" ]]; then
+      if pid_is_this_script "$old_pid"; then
+        exit 0
+      fi
+      log_event "stale-pidfile"
+    fi
+    printf '%s\n' "$$" >"$PIDFILE" 2>/dev/null || true
+  else
+    if [[ -n "$old_pid" ]]; then
+      if pid_is_this_script "$old_pid"; then
+        exit 0
+      fi
+      log_event "stale-pidfile"
+    fi
+    printf '%s\n' "$$" >"$PIDFILE" 2>/dev/null || true
   fi
-  echo $$ >"$PIDFILE"
-  trap 'rm -f "$PIDFILE"' EXIT
 
-  # Nothing to say until a notification path exists.
-  command -v omarchy-notification-send >/dev/null || exit 0
+  trap 'cleanup_notifier; exit 0' INT TERM HUP
+  trap 'cleanup_notifier' EXIT
+
   [[ -n "$PYTHON3" ]] || log_event "no-python3"
 
   supervise daemon watch_daemon &
+  SUP_PIDS+=("$!")
   supervise pressure watch_pressure &
+  SUP_PIDS+=("$!")
   supervise oom watch_oom_kills &
+  SUP_PIDS+=("$!")
   wait
 }
 

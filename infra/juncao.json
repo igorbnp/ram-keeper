@@ -1,0 +1,7 @@
+{
+  "ensaio": "clone-juncao",
+  "afeta": "sem-grafo",
+  "motivo": "Repositorio sem scripts/ambiente.py nem grafo de consumidores da casa: ensaio clone-juncao roda a suite em tests/ via suite_paralela.py",
+  "dono": "orquestrador",
+  "prazo": "2027-01-31"
+}

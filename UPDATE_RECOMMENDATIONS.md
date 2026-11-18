@@ -24,14 +24,6 @@ live status or copy its contents into a user's configuration.
 - PSI carries an explicit `available` flag. An unreadable or malformed source is
   not a real zero-pressure reading.
 
-## Process Guardian status
-
-`helper/process_guardian.py` currently provides process-discovery and protection
-helpers, but the production daemon does not call it. Do not describe dynamic
-new-process protection as active until the runtime integration is implemented
-and verified. The daemon's current protections come from its own configuration
-and built-in inviolable rules.
-
 ## Test safety
 
 The deterministic request-sizing checks run by default. The optional live stress

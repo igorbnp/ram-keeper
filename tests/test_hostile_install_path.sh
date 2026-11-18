@@ -2,28 +2,73 @@
 # Render the units through the SHIPPED renderer and prove systemd accepts and
 # executes the result.
 #
-# The earlier version of this file carried its own copy of the substitution, so
-# it passed while the installer failed on a directory containing a space. Both
-# now call helper/render_unit.py — the single implementation — and every case
-# ends in a real `systemctl --user start`, because the quoting rules live in
-# systemd, not in us.
+# On CI runners or containers without a live `systemd --user` manager, the
+# rendering and quoting assertions run unconditionally and only the live
+# `systemctl --user start` step is skipped cleanly.
 set -uo pipefail
 
 PLUGIN="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RENDER="$PLUGIN/helper/render_unit.py"
+
+PY=""
+for _cand in "${RAM_KEEPER_PYTHON:-}" /usr/bin/python3 \
+             "$(command -v python3 2>/dev/null || true)" \
+             "$(command -v python 2>/dev/null || true)"; do
+  if [[ -n "$_cand" && -x "$_cand" ]] \
+     && "$_cand" -c "import sys" >/dev/null 2>&1; then
+    PY="$_cand"
+    break
+  fi
+done
+[[ -n "$PY" ]] || PY=python3
+
+HAS_BUS=0
+if [[ -z "${CI:-}" || "${RAM_KEEPER_LIVE:-0}" == "1" ]]; then
+  if command -v systemctl >/dev/null 2>&1 \
+     && { [[ -e "/run/user/$(id -u 2>/dev/null || echo 0)/bus" ]] || [[ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ]]; } \
+     && systemctl --user show-environment >/dev/null 2>&1; then
+    HAS_BUS=1
+  fi
+fi
+
+_own_cfg=""
+_own_state=""
+if [[ -z "${RAM_KEEPER_CONFIG:-}" ]]; then
+  _own_cfg="$(mktemp "${TMPDIR:-/tmp}/rk-config.XXXXXX")"
+  printf '{}\n' >"$_own_cfg"
+  export RAM_KEEPER_CONFIG="$_own_cfg"
+fi
+if [[ -z "${RAM_KEEPER_STATE_DIR:-}" ]]; then
+  _own_state="$(mktemp -d "${TMPDIR:-/tmp}/rk-state.XXXXXX")"
+  export RAM_KEEPER_STATE_DIR="$_own_state"
+fi
+
 fails=0
 B="$(mktemp -d)"
 UNIT_DIR="$HOME/.config/systemd/user"
-trap 'rm -rf "$B"; rm -f "$UNIT_DIR"/rk-hostile-*.service; systemctl --user daemon-reload >/dev/null 2>&1' EXIT
+cleanup() {
+  rm -rf "$B"
+  [[ -n "$_own_cfg" ]] && rm -f "$_own_cfg"
+  [[ -n "$_own_state" ]] && rm -rf "$_own_state"
+  if (( HAS_BUS )); then
+    rm -f "$UNIT_DIR"/rk-hostile-*.service
+    systemctl --user daemon-reload >/dev/null 2>&1 || true
+  fi
+}
+trap cleanup EXIT
 
 ok()  { echo "  ok   $1"; }
 bad() { echo "  FAIL $1"; fails=$((fails + 1)); }
 
 render() {  # render <template> <dir> [python]
-  PLUGIN_DIR="$2" /usr/bin/python3 "$RENDER" --stdout "$1" "$2" "${3:-/usr/bin/python3}"
+  local r="$RENDER" tpl="$1"
+  if command -v cygpath >/dev/null 2>&1; then
+    r="$(cygpath -m "$r")"
+    tpl="$(cygpath -m "$tpl")"
+  fi
+  MSYS2_ARG_CONV_EXCL='*' PLUGIN_DIR="$2" "$PY" "$r" --stdout "$tpl" "$2" "${3:-/usr/bin/python3}"
 }
 
-# Start a throwaway unit from one rendered ExecStart line and report the result.
 run_unit() {  # run_unit <label> <execstart-line>
   local label="$1" line="$2" unit
   unit="rk-hostile-$$-$RANDOM"
@@ -33,6 +78,8 @@ run_unit() {  # run_unit <label> <execstart-line>
     echo "Description=ram-keeper hostile path probe"
     echo "[Service]"
     echo "Type=oneshot"
+    echo "Environment=RAM_KEEPER_CONFIG=$RAM_KEEPER_CONFIG"
+    echo "Environment=RAM_KEEPER_STATE_DIR=$RAM_KEEPER_STATE_DIR"
     echo "$line"
   } >"$UNIT_DIR/$unit.service"
   systemctl --user daemon-reload >/dev/null 2>&1
@@ -52,7 +99,9 @@ run_unit() {  # run_unit <label> <execstart-line>
 }
 
 echo "── diretórios hostis: renderizar e EXECUTAR no systemd ──"
-# A ram-keeper copy is placed in each directory so --once runs the real helper.
+if (( HAS_BUS == 0 )); then
+  echo "  SKIP: no systemd --user bus; rendering-only checks follow"
+fi
 for dirname in 'plain' 'with space' 'with|pipe' 'with&amp' "with'quote" \
                'with@at' 'with"double' 'with%percent' 'with$dollar' \
                'with;semicolon' 'with#hash' 'with,comma' 'with=equals'; do
@@ -68,8 +117,10 @@ for dirname in 'plain' 'with space' 'with|pipe' 'with&amp' "with'quote" \
   if [[ -z "$line" ]]; then
     bad "$dirname — sem ExecStart"; printf '%s\n' "$out" | sed 's/^/         /'; continue
   fi
-  # The helper copies are identical; --once exits 0 only if it really ran.
-  run_unit "systemd executa: $dirname" "${line/--daemon/--once}"
+  ok "render: $dirname"
+  if (( HAS_BUS )); then
+    run_unit "systemd executa: $dirname" "${line/--daemon/--once}"
+  fi
 done
 
 echo
@@ -87,21 +138,30 @@ else
 fi
 
 echo
-echo "── o notifier recebe o mesmo tratamento ──"
-line="$(render "$PLUGIN/units/ram-keeper-notify.service.in" "$space" | grep '^ExecStart=' | head -1)"
+echo "── o notifier recebe o mesmo tratamento + PYTHON_OVERRIDE ──"
+notify_out="$(render "$PLUGIN/units/ram-keeper-notify.service.in" "$space" "/opt/py 3/bin/python3")"
+line="$(grep '^ExecStart=' <<<"$notify_out" | head -1)"
 want="ExecStart=\"$space/helper/ram_keeper_notify\""
 if [[ "$line" == "$want" ]]; then
-  ok "notifier com espaço"
+  ok "notifier ExecStart com espaço"
 else
-  bad "notifier com espaço"
+  bad "notifier ExecStart com espaço"
   echo "         esperado: $want"
   echo "         obtido:   $line"
+fi
+env_line="$(grep '^Environment=' <<<"$notify_out" | head -1)"
+want_env='Environment="RAM_KEEPER_PYTHON=/opt/py 3/bin/python3"'
+if [[ "$env_line" == "$want_env" ]]; then
+  ok "notifier propaga PYTHON_OVERRIDE com aspas"
+else
+  bad "notifier PYTHON_OVERRIDE incorreto"
+  echo "         esperado: $want_env"
+  echo "         obtido:   $env_line"
 fi
 
 echo
 echo "── um caminho que systemd NÃO consegue representar é recusado ──"
-newline_dir="$B/broken"$'\n'"path"
-mkdir -p "$newline_dir"
+newline_dir="/tmp/broken"$'\n'"path"
 if out="$(render "$PLUGIN/units/ram-keeper.service" "$newline_dir" 2>&1)"; then
   bad "aceitou um caminho com newline (o unit file viraria duas linhas)"
 else
