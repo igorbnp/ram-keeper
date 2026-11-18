@@ -76,8 +76,10 @@ Item {
   property string ctlPauseArg: "indefinite"
   property var queuedCtl: null
   property bool startFailed: false
+  property double failedMinHeartbeat: 0
   property double stoppedAt: 0
   property double lastCtlAt: 0
+  property double stateReadStartedAt: 0
 
   // D-22: remember a post-action refresh requested while stateReader was busy.
   property bool refreshPending: false
@@ -102,6 +104,7 @@ Item {
       return
     }
     root.refreshPending = false
+    root.stateReadStartedAt = Date.now() / 1000
     stateReader.command = ["cat", root.statePath]
     stateReader.running = true
   }
@@ -111,25 +114,26 @@ Item {
     if (!parsed) return          // partial write or not published yet; keep last good
     root.snapshot = parsed
     root.loaded = true
+    var nowSec = Date.now() / 1000
     // checked_at is the daemon's own clock at the moment it measured, so a
     // stale file shows a stale timestamp no matter when we read it.
     if (isFinite(Number(parsed.checked_at)) && Number(parsed.checked_at) > 0) {
       root.lastHeartbeat = Number(parsed.checked_at)
-      if (root.startFailed && root.lastHeartbeat > root.stoppedAt) {
+      if (root.startFailed && parsed.paused !== true
+          && root.lastHeartbeat > (root.failedMinHeartbeat || 0)
+          && root.lastHeartbeat <= nowSec + 0.001) {
         root.startFailed = false
       }
     }
-    // F2: sync pause/snooze fields published by the daemon, including automatic
-    // unpause when a timed snooze expires in the background.
-    var ps = Model.parsePauseState(parsed)
+    // F2: sync pause/snooze fields published by the daemon only when no
+    // lifecycle transition is in flight and this read did not start before the
+    // latest control request.
     if (!root.daemonCtlBusy && root.queuedCtl === null
-        && typeof parsed.paused === "boolean"
-        && (root.lastHeartbeat === 0 || root.lastHeartbeat >= root.lastCtlAt - 1)) {
+        && (root.stateReadStartedAt || 0) >= (root.lastCtlAt || 0)
+        && typeof parsed.paused === "boolean") {
+      var ps = Model.parsePauseState(parsed, nowSec)
       root.pausedByUser = ps.paused
       root.snoozed = ps.paused
-      root.snoozeRemaining = ps.remaining
-    } else if (ps.paused) {
-      root.snoozed = true
       root.snoozeRemaining = ps.remaining
     }
     root.noteHeartbeat()
@@ -407,8 +411,12 @@ Item {
       waitForEnd: true
       onStreamFinished: {
         var parsed = Model.parseResult(text)
-        root.lastResult = parsed ? Model.summaryLine(parsed) : "Done"
-        root.refresh()
+        if (parsed) {
+          root.lastResult = Model.summaryLine(parsed)
+          root.refresh()
+        } else {
+          root.lastResult = ""
+        }
       }
     }
     stderr: StdioCollector {
@@ -442,6 +450,7 @@ Item {
         } else {
           // Fallback for pre-v1.2 helper without --pause: write paused-by-user
           // safely via argv (no shell interpolation) and stop the unit.
+          root.snoozeRemaining = 0
           root.ctlStep = "pause-fallback-flag"
           daemonCtlProc.command = ["python3", "-c",
             "import pathlib,sys; p=pathlib.Path(sys.argv[1]); p.parent.mkdir(parents=True, exist_ok=True); p.write_text('1\\n', encoding='utf-8')",
@@ -507,6 +516,7 @@ Item {
         root.ctlStep = ""
         if (exitCode !== 0) {
           root.startFailed = true
+          root.failedMinHeartbeat = Math.max(Date.now() / 1000, root.lastHeartbeat || 0)
           root.daemonUp = false
           root.lastError = "Could not start the ram-keeper daemon"
         } else {
@@ -527,11 +537,16 @@ Item {
   Process {
     id: pauseRead
     onExited: function(code) {
+      root.pauseKnown = true
+      if ((root.lastCtlAt || 0) > 0 || root.daemonCtlBusy || root.queuedCtl !== null
+          || (root.loaded && root.snapshot && typeof root.snapshot.paused === "boolean")) {
+        root.daemonActive()
+        return
+      }
       root.pausedByUser = (code === 0)
       root.snoozed = (code === 0)
-      root.pauseKnown = true
       root.daemonActive()
-      if (!root.pausedByUser) startDaemonTimer.restart()
+      if (!root.pausedByUser && !root.daemonUp) startDaemonTimer.restart()
     }
   }
 
@@ -602,7 +617,10 @@ Item {
     interval: 600
     repeat: false
     onTriggered: {
-      if (root.pauseKnown && !root.pausedByUser) root.startDaemon()
+      if (root.pauseKnown && !root.daemonUp && !root.pausedByUser
+          && !root.snoozed && !root.daemonCtlBusy && root.queuedCtl === null) {
+        root.startDaemon()
+      }
     }
   }
 

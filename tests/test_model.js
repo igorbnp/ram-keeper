@@ -567,8 +567,10 @@ console.log("\n== Service.qml behavioral harness (B-06, B-07, D-22, F2, F3) ==")
         ctlPauseArg: "indefinite",
         queuedCtl: null,
         startFailed: false,
+        failedMinHeartbeat: 0,
         stoppedAt: 0,
         lastCtlAt: 0,
+        stateReadStartedAt: 0,
         refreshPending: false,
         snoozed: false,
         snoozeRemaining: 0,
@@ -576,7 +578,7 @@ console.log("\n== Service.qml behavioral harness (B-06, B-07, D-22, F2, F3) ==")
         listVerb: "release"
       }
     };
-    for (const k of ["manifestReader", "stateReader", "protectProc", "daemonCtlProc", "versionRestart"]) {
+    for (const k of ["manifestReader", "stateReader", "protectProc", "daemonCtlProc", "pauseRead", "versionRestart"]) {
       let running = false;
       Object.defineProperty(ctx[k], "running", {
         get() { return running; },
@@ -601,6 +603,7 @@ console.log("\n== Service.qml behavioral harness (B-06, B-07, D-22, F2, F3) ==")
     ctx.daemonCtlProc.onExited = vm.runInContext(extractProcessOnExited(svcSrc, "daemonCtlProc"), ctx);
     ctx.versionRestart.onExited = vm.runInContext(extractProcessOnExited(svcSrc, "versionRestart"), ctx);
     ctx.protectProc.onExited = vm.runInContext(extractProcessOnExited(svcSrc, "protectProc"), ctx);
+    ctx.pauseRead.onExited = vm.runInContext(extractProcessOnExited(svcSrc, "pauseRead"), ctx);
     return ctx;
   }
 
@@ -693,6 +696,77 @@ console.log("\n== Service.qml behavioral harness (B-06, B-07, D-22, F2, F3) ==")
                                          checked_at: tNow, paused: false, paused_remaining_s: null }));
   check("expired daemon snooze automatically restores daemonUp=true (F2)",
     h5.root.pausedByUser === false && h5.root.snoozed === false && h5.root.daemonUp === true);
+
+  // Adversarial Round-1 regressions (Attacks A, B, C1, C2, D + live snooze + object coercion)
+  const hA = makeServiceHarness();
+  hA.root.startDaemon();
+  hA.daemonCtlProc.running = false; hA.daemonCtlProc.onExited(0);
+  hA.daemonCtlProc.running = false; hA.daemonCtlProc.onExited(1); // systemctl start failed with stoppedAt===0
+  hA.root.applySnapshot(JSON.stringify({ state: "ok", mem_total: 8e9, free_percent: 40, checked_at: tNow - 30 }));
+  check("Attack A: failed start with stoppedAt===0 rejects 30s-old snapshot",
+    hA.root.startFailed === true && hA.root.daemonUp === false);
+  const realDateNow = Date.now;
+  try {
+    const recoveredSec = (hA.root.failedMinHeartbeat || tNow) + 2;
+    Date.now = () => recoveredSec * 1000;
+    hA.root.applySnapshot(JSON.stringify({ state: "ok", mem_total: 8e9, free_percent: 40, checked_at: recoveredSec }));
+    check("external start with fresh checked_at > failedMinHeartbeat clears startFailed",
+      hA.root.startFailed === false && hA.root.daemonUp === true);
+  } finally {
+    Date.now = realDateNow;
+  }
+
+  const hB = makeServiceHarness();
+  hB.root.stopDaemon();
+  const afterStop = hB.root.stoppedAt + 0.05;
+  hB.daemonCtlProc.running = false; hB.daemonCtlProc.onExited(0);
+  hB.root.startDaemon();
+  hB.daemonCtlProc.running = false; hB.daemonCtlProc.onExited(0);
+  hB.daemonCtlProc.running = false; hB.daemonCtlProc.onExited(1);
+  hB.root.applySnapshot(JSON.stringify({ state: "ok", mem_total: 8e9, free_percent: 40, checked_at: afterStop }));
+  check("Attack B: failed start rejects snapshot stamped before start failure",
+    hB.root.startFailed === true && hB.root.daemonUp === false);
+
+  const hFb = makeServiceHarness();
+  hFb.root.snoozeDaemon(30);
+  hFb.daemonCtlProc.running = false; hFb.daemonCtlProc.onExited(2); // pre-v1.2 helper without --pause
+  check("pre-v1.2 pause fallback clears snoozeRemaining",
+    hFb.root.ctlStep === "pause-fallback-flag" && hFb.root.snoozeRemaining === 0);
+
+  const hC = makeServiceHarness();
+  const t0 = tNow - 20;
+  hC.root.applySnapshot(JSON.stringify({ state: "ok", mem_total: 8e9, free_percent: 40,
+                                         checked_at: t0, paused: true, paused_remaining_s: 1500 }));
+  hC.root.resumeDaemon();
+  hC.root.applySnapshot(JSON.stringify({ state: "ok", mem_total: 8e9, free_percent: 40,
+                                         checked_at: t0, paused: true, paused_remaining_s: 1500 }));
+  check("Attack C1: in-flight pre-resume snapshot does not resurrect snoozed",
+    hC.root.snoozed === false && hC.root.pausedByUser === false);
+  hC.daemonCtlProc.running = false; hC.daemonCtlProc.onExited(0);
+  hC.daemonCtlProc.running = false; hC.daemonCtlProc.onExited(0);
+  hC.root.applySnapshot(JSON.stringify({ state: "ok", mem_total: 8e9, free_percent: 40,
+                                         checked_at: t0, paused: false, paused_remaining_s: null }));
+  check("Attack C2: post-resume snapshot with preserved checked_at restores daemonUp=true",
+    hC.root.snoozed === false && hC.root.daemonUp === true);
+
+  const hD = makeServiceHarness();
+  hD.root.pauseKnown = false;
+  hD.pauseRead.running = true;
+  hD.root.pauseDaemon();
+  hD.pauseRead.running = false; hD.pauseRead.onExited(1);
+  check("Attack D: late pauseRead exit does not overwrite active pause or start timer",
+    hD.root.pausedByUser === true && hD.root.snoozed === true && hD.startDaemonTimer.restarted === 0);
+
+  const psSubSec = M.parsePauseState({ paused: true, paused_until: 1700000000.4,
+                                       paused_remaining_s: 0, checked_at: 1700000000.1 });
+  check("sub-second expiring snooze says 'Snoozed · resuming soon' instead of indefinite",
+    psSubSec.paused === true && psSubSec.label === "Snoozed · resuming soon", psSubSec.label);
+  const psLive = M.parsePauseState({ paused: true, paused_until: 1700000035,
+                                     paused_remaining_s: 60, checked_at: 1699999975 }, 1700000000);
+  check("parsePauseState computes live countdown from paused_until and nowSeconds",
+    psLive.remaining === 35 && psLive.label === "Snoozed · resumes in 35s", psLive.label);
+  check("array/object values in numeric fields coerce to 0, not single-element number",
+    M.reclaimableGroups({ groups: [{ name: "arr.scope", anon: [500 * MB], reclaimable: [200 * MB], protected: false }] }).length === 0);
 }
 
 console.log(failures === 0 ? "\nALL PASS" : `\n${failures} FAILURES`);

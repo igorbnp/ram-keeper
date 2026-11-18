@@ -349,19 +349,39 @@ check("Panel has clamped keyboard scroll (G-26)",
       and "Math.max(0, flickable.contentHeight - flickable.height)" in panel)
 
 # D-19: EVERY Text block in Panel.qml must set textFormat: Text.PlainText
+# Count strictly on comment/literal-stripped `panel_clean` AND verify per block.
 panel_clean = strip_comments_and_literals(panel)
-text_blocks = re.findall(r"(?<![A-Za-z0-9_])Text\s*\{", panel_clean)
-plain_text_count = panel.count("textFormat: Text.PlainText")
+text_starts = [m.start() for m in re.finditer(r"(?<![A-Za-z0-9_])Text\s*\{", panel_clean)]
+plain_text_count = len(re.findall(r"\btextFormat\s*:\s*Text\.PlainText\b", panel_clean))
+missing_plain_blocks = 0
+for ts in text_starts:
+    bstart = panel_clean.index("{", ts)
+    depth = 0
+    for bi in range(bstart, len(panel_clean)):
+        if panel_clean[bi] == "{":
+            depth += 1
+        elif panel_clean[bi] == "}":
+            depth -= 1
+            if depth == 0:
+                block_body = panel_clean[bstart:bi + 1]
+                if not re.search(r"\btextFormat\s*:\s*Text\.PlainText\b", block_body):
+                    missing_plain_blocks += 1
+                break
 check("every Text element in Panel.qml uses Text.PlainText (D-19)",
-      len(text_blocks) > 0 and len(text_blocks) == plain_text_count,
-      "%d Text blocks vs %d PlainText" % (len(text_blocks), plain_text_count))
+      len(text_starts) > 0 and len(text_starts) == plain_text_count and missing_plain_blocks == 0,
+      "%d Text blocks, %d PlainText, %d missing" % (len(text_starts), plain_text_count, missing_plain_blocks))
 
-# B-06: serialized daemonCtlProc + queuedCtl + startFailed, no sh -c, no racing pauseWrite/pauseClear
-check("daemon control serialized with queue and startFailed guard (B-06)",
-      "id: daemonCtlProc" in service and "queuedCtl" in service and "startFailed" in service
+# B-06: serialized daemonCtlProc + queuedCtl + startFailed + failedMinHeartbeat, no sh -c
+check("daemon control serialized with queue and failedMinHeartbeat guard (B-06)",
+      "id: daemonCtlProc" in service and "queuedCtl" in service
+      and "startFailed" in service and "failedMinHeartbeat" in service
+      and "stateReadStartedAt" in service
       and "id: pauseWrite" not in service and "id: pauseClear" not in service)
 check("Service.qml never shells out via sh -c",
       '"sh"' not in service and '"bash"' not in service)
+action_section = service.split("id: actionProc", 1)[1].split("id: daemonCtlProc", 1)[0]
+check("actionProc does not claim Done on empty/failed stdout",
+      '"Done"' not in action_section)
 
 # B-07: versionRestart clears lastError on success and refreshManifest caches diskVersion
 vr_section = service.split("id: versionRestart", 1)[1].split("Timer {", 1)[0]
@@ -390,8 +410,10 @@ check("IPC handler exposes pause, typed snooze, and resume verbs (F2)",
       "function pause(): void" in service
       and "function snooze(minutes: string): void" in service
       and "function resume(): void" in service)
-check("Panel exposes Snooze 30m / 1h / Pause-Resume controls (F2)",
-      '"Snooze 30m"' in panel and '"Snooze 1h"' in panel and '"Resume"' in panel)
+check("Panel exposes Snooze 30m / 1h / Start-Pause-Resume controls and liveNow (F2)",
+      '"Snooze 30m"' in panel and '"Snooze 1h"' in panel
+      and '"Resume"' in panel and '"Start"' in panel
+      and "root.daemonOff" in panel and "root.liveNow" in panel)
 check("Panel shows immediate Protecting…/Releasing… feedback and swap mini-bar (F3)",
       '"Protecting…"' in panel and '"Releasing…"' in panel
       and "pendingProtectKey" in service and "swapBarBg" in panel

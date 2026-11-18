@@ -9,7 +9,10 @@
 // ---------------------------------------------------------------------------
 
 function safeNonNeg(value) {
-  if (value === null || value === undefined || typeof value === "boolean") return 0;
+  if (value === null || value === undefined || typeof value === "boolean"
+      || typeof value === "object") {
+    return 0;
+  }
   var n = Number(value);
   return (isFinite(n) && n > 0) ? n : 0;
 }
@@ -60,7 +63,12 @@ function formatRate(bytes) {
 // wide (clipped, so it looks full) and a legend claiming more memory than the
 // machine has. The total is the authority; the parts are clamped into it.
 function memoryParts(snapshot) {
-  if (!snapshot || snapshot.memory_breakdown_valid === false) return null;
+  if (!snapshot || typeof snapshot !== "object"
+      || snapshot.state === "unknown"
+      || snapshot.memory_reading_valid === false
+      || snapshot.memory_breakdown_valid === false) {
+    return null;
+  }
   var total = Number(snapshot.mem_total);
   if (!isFinite(total) || total <= 0) return null;
   var used = Math.min(total, safeNonNeg(snapshot.mem_used));
@@ -408,32 +416,52 @@ function summaryLine(result) {
 // F2 — Pause/snooze state helpers
 // ---------------------------------------------------------------------------
 
-function parsePauseState(snapshot) {
+function parsePauseState(snapshot, nowSeconds) {
   if (!snapshot || typeof snapshot !== "object") {
     return { paused: false, label: "", remaining: 0 };
   }
   if (snapshot.paused !== true) {
     return { paused: false, label: "", remaining: 0 };
   }
-  var remaining = Math.round(safeNonNeg(snapshot.paused_remaining_s));
-  if (remaining === 0 && isFinite(Number(snapshot.paused_until)) && Number(snapshot.paused_until) > 0) {
-    var refNow = isFinite(Number(snapshot.checked_at)) && Number(snapshot.checked_at) > 0
-      ? Number(snapshot.checked_at) : (Date.now() / 1000);
-    var delta = Math.round(Number(snapshot.paused_until) - refNow);
-    if (delta > 0) remaining = delta;
+  var untilRaw = snapshot.paused_until;
+  var hasUntil = untilRaw !== null && untilRaw !== undefined
+    && typeof untilRaw !== "boolean" && typeof untilRaw !== "object"
+    && isFinite(Number(untilRaw)) && Number(untilRaw) > 0;
+  var untilSec = hasUntil ? Number(untilRaw) : 0;
+  var nowSec = (nowSeconds !== undefined && nowSeconds !== null
+    && typeof nowSeconds !== "boolean" && typeof nowSeconds !== "object"
+    && isFinite(Number(nowSeconds)) && Number(nowSeconds) > 0)
+    ? Number(nowSeconds) : 0;
+
+  var remaining = 0;
+  if (hasUntil && nowSec > 0) {
+    remaining = Math.max(0, Math.round(untilSec - nowSec));
+  } else {
+    remaining = Math.round(safeNonNeg(snapshot.paused_remaining_s));
+    if (remaining === 0 && hasUntil) {
+      var refNow = safeNonNeg(snapshot.checked_at);
+      if (refNow > 0 && untilSec > refNow) {
+        remaining = Math.max(0, Math.round(untilSec - refNow));
+      }
+    }
   }
+
   var label = remaining > 0
     ? ("Snoozed · resumes in " + horizonLabel(remaining))
-    : "Paused indefinitely";
+    : (hasUntil ? "Snoozed · resuming soon" : "Paused indefinitely");
   return { paused: true, label: label, remaining: remaining };
 }
 
-function watchLine(snapshot, daemonUp) {
-  var ps = parsePauseState(snapshot);
+function watchLine(snapshot, daemonUp, nowSeconds) {
+  var ps = parsePauseState(snapshot, nowSeconds);
   if (ps.paused) {
-    return ps.remaining > 0
-      ? ("Automatic protection snoozed · resumes in " + horizonLabel(ps.remaining))
-      : "Automatic protection is paused";
+    if (ps.remaining > 0) {
+      return "Automatic protection snoozed · resumes in " + horizonLabel(ps.remaining);
+    }
+    if (ps.label === "Snoozed · resuming soon") {
+      return "Automatic protection snoozed · resuming soon";
+    }
+    return "Automatic protection is paused";
   }
   if (!daemonUp) return "Automatic protection is paused";
   if (snapshot && (snapshot.state === "unknown" || snapshot.memory_reading_valid === false)) {
@@ -512,7 +540,7 @@ function barLabel(snapshot) {
 }
 
 // Rich tooltip with ETA and culprit when available.
-function barTooltip(snapshot) {
+function barTooltip(snapshot, nowSeconds) {
   if (!snapshot || typeof snapshot !== "object") return "Measuring memory…";
   if (snapshot.state === "unknown" || snapshot.memory_reading_valid === false) {
     return "Memory reading unavailable";
@@ -520,7 +548,7 @@ function barTooltip(snapshot) {
   var pct = freePercentLabel(snapshot);
   var label = stateLabel(snapshot.state);
   var tip = pct + " memory free — " + label;
-  var ps = parsePauseState(snapshot);
+  var ps = parsePauseState(snapshot, nowSeconds);
   if (ps.paused) return tip + " · " + ps.label;
   var fc = forecastForSnapshot(snapshot);
   if (fc && fc.isWarning && fc.horizonSeconds > 0) {
@@ -531,14 +559,14 @@ function barTooltip(snapshot) {
 }
 
 // PanelHero subtitle with available/total plus live ETA or snooze countdown.
-function heroMeta(snapshot) {
+function heroMeta(snapshot, nowSeconds) {
   if (!snapshot || typeof snapshot !== "object") return "";
   if (snapshot.state === "unknown" || snapshot.memory_reading_valid === false) {
     return "The daemon could not read memory";
   }
   var base = formatBytes(snapshot.mem_available) + " available of "
     + formatBytes(snapshot.mem_total);
-  var ps = parsePauseState(snapshot);
+  var ps = parsePauseState(snapshot, nowSeconds);
   if (ps.paused) return base + " · " + ps.label;
   var fc = forecastForSnapshot(snapshot);
   if (fc && fc.isWarning && fc.horizonSeconds > 0) {

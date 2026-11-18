@@ -87,6 +87,13 @@ const missingBreakdown = { state: "ok", memory_reading_valid: true,
 check("no bar for unavailable memory breakdown", M.memoryPercentages(missingBreakdown).length === 0);
 check("no legend for unavailable memory breakdown", M.memorySegments(missingBreakdown).length === 0);
 
+const staleUnknownNumbers = { state: "unknown", memory_reading_valid: false,
+                              mem_total: 8e9, mem_used: 4e9, cached: 2e9 };
+check("no bar when state is unknown even with stale non-zero mem_total",
+      M.memoryPercentages(staleUnknownNumbers).length === 0);
+check("no legend when state is unknown even with stale non-zero mem_total",
+      M.memorySegments(staleUnknownNumbers).length === 0);
+
 // A healthy snapshot must still work (regression guard: the guard above must
 // not have broken the normal case).
 const healthy = { mem_total: 8026562560, mem_available: 3000000000,

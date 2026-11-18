@@ -33,14 +33,17 @@ Panel {
   readonly property bool busy: !!(root.keeper && root.keeper.busy)
   readonly property bool daemonUp: !!(root.keeper && root.keeper.daemonUp)
   readonly property bool pausedOrSnoozed: !!(root.keeper && (root.keeper.pausedByUser || root.keeper.snoozed))
+  readonly property bool daemonOff: root.pausedOrSnoozed || (root.loaded && !root.daemonUp)
   readonly property bool ctlBusy: !!(root.keeper && root.keeper.daemonCtlBusy)
-  readonly property var forecast: root.loaded
-    ? Model.forecastForSnapshot(root.snap) : null
-  readonly property var sessionImpact: {
+  readonly property double liveNow: {
     var tick = root.keeper ? root.keeper.pollTicks : 0
     void tick
-    return root.loaded ? Model.sessionImpactRow(root.snap, Date.now() / 1000) : null
+    return Date.now() / 1000
   }
+  readonly property var forecast: root.loaded
+    ? Model.forecastForSnapshot(root.snap) : null
+  readonly property var sessionImpact: root.loaded
+    ? Model.sessionImpactRow(root.snap, root.liveNow) : null
 
   // True once the service object exists. Every control that calls into it must
   // gate on this, not on `!busy`: a null keeper makes `busy` false, so the busy
@@ -103,7 +106,7 @@ Panel {
     slotSize: root.barWidth
     text: root.glyph
     labelText: (root.showPercent && !root.verticalBar) ? root.barLabelText : ""
-    tooltipText: root.loaded ? Model.barTooltip(root.snap) : "Measuring memory…"
+    tooltipText: root.loaded ? Model.barTooltip(root.snap, root.liveNow) : "Measuring memory…"
     onPressed: function(b) {
       if (b === Qt.RightButton) root.togglePercent()
       else root.toggle()
@@ -181,7 +184,7 @@ Panel {
                 ? "No memory reading"
                 : Model.stateLabel(root.state) + " · " + root.percentText + " free")
             : "Measuring memory…"
-          meta: root.loaded ? Model.heroMeta(root.snap) : ""
+          meta: root.loaded ? Model.heroMeta(root.snap, root.liveNow) : ""
           detail: root.busy ? "Reclaiming memory…"
             : (root.keeper && root.keeper.lastResult !== "" ? root.keeper.lastResult : "")
           trailingControl: Component {
@@ -346,13 +349,13 @@ Panel {
 
           Button {
             width: (parent.width - Style.space(8) * 2) / 3
-            text: root.pausedOrSnoozed ? "Resume" : "Pause"
+            text: root.pausedOrSnoozed ? "Resume" : (root.daemonOff ? "Start" : "Pause")
             enabled: root.actionsReady && !root.ctlBusy
-            foreground: root.pausedOrSnoozed ? root.accentColor : root.foreground
+            foreground: root.daemonOff ? root.accentColor : root.foreground
             accent: root.accentColor
             onClicked: {
               if (!root.keeper) return
-              if (root.pausedOrSnoozed) root.keeper.resumeDaemon()
+              if (root.daemonOff) root.keeper.startDaemon()
               else root.keeper.pauseDaemon()
             }
           }
@@ -362,7 +365,7 @@ Panel {
           width: parent.width
           visible: root.pausedOrSnoozed
           text: {
-            var ps = Model.parsePauseState(root.snap)
+            var ps = Model.parsePauseState(root.snap, root.liveNow)
             if (ps.paused) return ps.label
             if (root.keeper && root.keeper.snoozeRemaining > 0) {
               return "Snoozed · resumes in " + Model.horizonLabel(root.keeper.snoozeRemaining)
@@ -731,7 +734,7 @@ Panel {
 
           Text {
             width: parent.width
-            text: Model.watchLine(root.snap, root.daemonUp)
+            text: Model.watchLine(root.snap, root.daemonUp, root.liveNow)
             textFormat: Text.PlainText
             color: root.daemonUp ? Qt.darker(root.foreground, 1.5) : root.urgentColor
             font.family: Style.font.family
