@@ -1190,15 +1190,25 @@ class SessionStats:
         def _nonneg_int(val: object) -> int | None:
             if isinstance(val, bool) or not isinstance(val, (int, float)):
                 return None
-            if not math.isfinite(val) or val < 0:
+            try:
+                if not math.isfinite(val) or val < 0:
+                    return None
+                return int(val)
+            except OverflowError:
                 return None
-            return int(val)
 
         started = data.get("started_at")
-        if isinstance(started, bool) or not isinstance(started, (int, float)):
+        if started is None:
+            started_f = time.time()
+        elif isinstance(started, bool) or not isinstance(started, (int, float)):
             return None
-        if not math.isfinite(started) or started <= 0:
-            return None
+        else:
+            try:
+                started_f = float(started)
+            except OverflowError:
+                return None
+            if not math.isfinite(started_f) or started_f <= 0:
+                return None
         actions = _nonneg_int(data.get("actions", 0))
         freed = _nonneg_int(data.get("bytes_freed", 0))
         last_bytes = _nonneg_int(data.get("last_relief_bytes", 0))
@@ -1207,14 +1217,20 @@ class SessionStats:
         raw_ts = data.get("last_relief_ts")
         if raw_ts is None:
             last_ts = None
-        elif isinstance(raw_ts, bool) or not isinstance(raw_ts, (int, float)) or not math.isfinite(raw_ts) or raw_ts < 0:
+        elif isinstance(raw_ts, bool) or not isinstance(raw_ts, (int, float)):
             return None
         else:
-            last_ts = float(raw_ts)
+            try:
+                ts_f = float(raw_ts)
+            except OverflowError:
+                return None
+            if not math.isfinite(ts_f) or ts_f < 0:
+                return None
+            last_ts = ts_f
         raw_lbl = data.get("last_relief_label", "")
         label = raw_lbl if isinstance(raw_lbl, str) else ""
         return cls(
-            started_at=float(started),
+            started_at=started_f,
             actions=actions,
             bytes_freed=freed,
             last_relief_ts=last_ts,
@@ -1934,11 +1950,11 @@ class Steward:
         except OSError:
             pass
 
-    def _sync_session_stats_from_store(self) -> None:
+    def _sync_session_stats_from_store(self) -> bool:
         """Pull cumulative session_stats (including manual CLI actions) into memory."""
         path, lock_path = self._session_stats_paths()
         if not self._session_store_active and not path.exists():
-            return
+            return False
         try:
             with _file_lock(lock_path):
                 stored = self._read_session_stats_unlocked(path)
@@ -1946,18 +1962,27 @@ class Steward:
             stored = None
         if stored is not None:
             self.session_stats = stored
+            return True
+        return False
 
     def _record_session_stats(self, freed: int, label: str = "") -> None:
-        """Record a reclaim action in memory and, when active, in session_stats.json."""
+        """Record a reclaim action in memory and, when the daemon store is active, on disk.
+
+        Only the long-running daemon (`_session_store_active=True`) writes here;
+        manual CLI passes (`--relieve` / `--sweep-cache`) commit atomically via
+        `record_manual_session_stats()` so a corrupt `session_stats.json` falls
+        back to `state.json` instead of being clobbered with `actions=1`.
+        """
+        prior = SessionStats(**self.session_stats.as_dict())
         self.session_stats.record(freed, label=label)
-        path, lock_path = self._session_stats_paths()
-        if not self._session_store_active and not path.exists():
+        if not self._session_store_active:
             return
+        path, lock_path = self._session_stats_paths()
         try:
             with _file_lock(lock_path):
                 base = self._read_session_stats_unlocked(path)
                 if base is None:
-                    base = SessionStats(started_at=self.session_stats.started_at)
+                    base = prior
                 base.record(freed, label=label)
                 self._write_session_stats_unlocked(path, base)
                 self.session_stats = base
@@ -1978,29 +2003,24 @@ class Steward:
                             return stored.as_dict()
                 except OSError:
                     pass
-            return existing_ss.as_dict() if existing_ss is not None else existing_snapshot.get("session_stats")
+            return existing_ss.as_dict() if existing_ss is not None else None
 
-        # If session_stats.json already existed when relieve() ran, _record_session_stats()
-        # already incremented it atomically; otherwise seed it from existing state.json now.
         try:
             with _file_lock(lock_path):
                 stored = self._read_session_stats_unlocked(path)
-                if stored is not None:
-                    self.session_stats = stored
-                    return stored.as_dict()
-                seed = existing_ss if existing_ss is not None else SessionStats(
-                    started_at=self.session_stats.started_at
-                )
+                base = stored if stored is not None else existing_ss
+                if base is None:
+                    base = SessionStats(started_at=self.session_stats.started_at)
                 actions = result.get("actions") or []
                 first_lbl = ""
                 for a in actions:
                     if isinstance(a, dict) and (a.get("freed") or 0) > 0:
                         first_lbl = str(a.get("label") or "")
                         break
-                seed.record(int(result.get("freed") or 0), label=first_lbl)
-                self._write_session_stats_unlocked(path, seed)
-                self.session_stats = seed
-                return seed.as_dict()
+                base.record(int(result.get("freed") or 0), label=first_lbl)
+                self._write_session_stats_unlocked(path, base)
+                self.session_stats = base
+                return base.as_dict()
         except OSError:
             return self.session_stats.as_dict()
 
@@ -2259,7 +2279,7 @@ def _sync_state_after_ctl() -> None:
         existing = published_snapshot(max_age=86400)
         steward = Steward()
         steward._check_pause()
-        steward._sync_session_stats_from_store()
+        loaded_from_store = steward._sync_session_stats_from_store()
         fresh = steward.snapshot()
         paused_rem = (
             max(0, int(steward._paused_until - time.time()))
@@ -2270,11 +2290,19 @@ def _sync_state_after_ctl() -> None:
         if existing is not None:
             if fresh.get("memory_reading_valid") and fresh.get("groups"):
                 out = dict(fresh)
-                for key in ("forecast", "session_stats", "relief", "checked_at"):
+                for key in ("forecast", "relief", "checked_at"):
                     if existing.get(key) is not None:
                         out[key] = existing[key]
+                if not loaded_from_store and existing.get("session_stats") is not None:
+                    valid_existing_ss = SessionStats.from_dict(existing.get("session_stats"))
+                    if valid_existing_ss is not None:
+                        out["session_stats"] = valid_existing_ss.as_dict()
             else:
                 out = dict(existing)
+                if loaded_from_store:
+                    out["session_stats"] = steward.session_stats.as_dict()
+                elif "session_stats" in out and SessionStats.from_dict(out.get("session_stats")) is None:
+                    out["session_stats"] = steward.session_stats.as_dict()
                 prot_set = set(steward.config["protected"])
                 never_set = set(steward.config["never_reclaim"])
                 raw_groups = out.get("groups")

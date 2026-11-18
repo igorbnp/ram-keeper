@@ -711,14 +711,49 @@ class TestCliPauseStateContract:
         assert snap1["session_stats"]["actions"] == 1
         assert snap1["session_stats"]["bytes_freed"] == 120 * 1024 * 1024
 
-        # 4. Corrupt / hostile session_stats.json or dicts are safely rejected.
+        # 4. Corrupt / hostile session_stats.json or 400-digit ints are safely rejected
+        #    WITHOUT losing accumulated stats on subsequent daemon or CLI reclaims!
+        huge_int = int("1" + "0" * 400)
         for bad in (None, [], "x", {"started_at": True}, {"started_at": -1},
+                    {"started_at": huge_int, "actions": 1},
+                    {"started_at": 100.0, "actions": huge_int},
+                    {"started_at": 100.0, "bytes_freed": huge_int},
+                    {"started_at": 100.0, "last_relief_bytes": huge_int},
+                    {"started_at": 100.0, "last_relief_ts": huge_int},
                     {"started_at": 100.0, "actions": -5}, {"started_at": 100.0, "bytes_freed": float("nan")},
                     {"started_at": 100.0, "last_relief_ts": float("inf")}):
             assert rk.SessionStats.from_dict(bad) is None
+
+        # Corrupt session_stats.json followed by daemon reclaim preserves in-memory history (1 -> 2).
         (st_dir / "session_stats.json").write_text("{corrupt", encoding="utf-8")
-        snap2 = daemon.supervise_once()
-        assert snap2["session_stats"]["actions"] == 1
+        daemon._record_session_stats(50 * 1024 * 1024, label="App")
+        assert daemon.session_stats.actions == 2
+        assert daemon.session_stats.bytes_freed == 170 * 1024 * 1024
+
+        # Corrupt session_stats.json followed by manual CLI reclaim recovers from state.json (2 -> 3).
+        daemon.supervise_once()
+        (st_dir / "session_stats.json").write_text("{corrupt", encoding="utf-8")
+        monkeypatch.setattr(sys, "argv", ["ram_keeper.py", "--sweep-cache"])
+        assert rk.main() == 0
+        st_recovered = json.loads((st_dir / "state.json").read_text(encoding="utf-8"))
+        assert st_recovered["session_stats"]["actions"] == 3
+        assert st_recovered["session_stats"]["bytes_freed"] == 290 * 1024 * 1024
+
+        # Sync daemon to actions=3, then test 400-digit int in session_stats.json.
+        daemon.supervise_once()
+        assert daemon.session_stats.actions == 3
+        (st_dir / "session_stats.json").write_text(
+            '{"started_at": ' + ("1" + "0" * 400) + ', "actions": 1}', encoding="utf-8"
+        )
+        r_pause = self._run_cli(["--pause", "10"], cfg_path, st_dir, cg_root=cg_root)
+        assert r_pause.returncode == 0, r_pause.stderr
+
+        # Fresh session_stats.json wins over stale state.json during _sync_state_after_ctl().
+        daemon._record_session_stats(10 * 1024 * 1024, label="App")  # store now has actions=4
+        r_resume = self._run_cli(["--resume"], cfg_path, st_dir, cg_root=cg_root)
+        assert r_resume.returncode == 0, r_resume.stderr
+        st_synced = json.loads((st_dir / "state.json").read_text(encoding="utf-8"))
+        assert st_synced["session_stats"]["actions"] == 4
 
 
 install_unittest_bridge(globals())
