@@ -19,6 +19,7 @@ the rest keep their defaults. Delete the file to return to defaults.
 | `target_free_percent` | `18.0` | Free-memory floor. Below this, reclaim starts. This is the number that matters most: set it higher on a machine that must stay responsive, lower to let apps keep more resident. |
 | `critical_free_percent` | `10.0` | Below this, reclaim is urgent. Must be lower than `target_free_percent`. |
 | `psi_some_percent` | `6.0` | Memory stall (`/proc/pressure/memory`, `some` avg over 60 s) that counts as pressure even when free RAM looks healthy. This catches the case where free memory exists but everything is stalling anyway. Raise it to be more patient; lower it to react sooner. |
+| `psi_full_abort_percent` | `10.0` | Full memory stall (`full` avg over 10 s) at or above which anonymous swap passes are aborted (`skipped_anon="psi-full-thrash"`) so reclaim stays cache-only instead of feeding a swap storm. |
 | `min_target_bytes` | `100663296` (96 MB) | Cgroups smaller than this are left alone. Reclaiming from a small cgroup costs more than it frees. |
 | `max_victim_fraction` | `25` | Largest share of **one** cgroup's memory a single pass may reclaim. **Do not raise this casually** — see below. |
 | `max_reclaim_per_pass` | `2147483648` (2 GB) | Ceiling on one pass. Guarantees a spike can't turn into a system-wide swap storm. |
@@ -73,7 +74,10 @@ services that keep your session alive:
 ```
   wayland-wm@hyprland.desktop   the compositor; a dead WM is a dead desktop
   quickshell                    the shell that draws the panel
-  pipewire.service              audio (not pipewire-pulse, and not a name that only shares the prefix)
+  pipewire.service              audio server
+  pipewire-pulse.service        PulseAudio compatibility layer
+  wireplumber.service           PipeWire session manager
+  xdg-desktop-portal*           desktop portals (screen share, file chooser)
   syncthing.service             file sync (not syncthing-server)
   ollama.service                local model server
   hermes                        the Hermes gateway process
@@ -176,6 +180,21 @@ python3 ~/.config/omarchy/plugins/io.github.igorbnp.ram-keeper/helper/ram_keeper
 ```
 
 ## Troubleshooting
+
+Run a read-only post-install diagnosis at any time:
+
+```bash
+bash ~/.config/omarchy/plugins/io.github.igorbnp.ram-keeper/install.sh --check
+python3 ~/.config/omarchy/plugins/io.github.igorbnp.ram-keeper/helper/ram_keeper.py --doctor
+python3 ~/.config/omarchy/plugins/io.github.igorbnp.ram-keeper/helper/ram_keeper.py --history 20
+```
+
+To snooze or pause automatic reclamation while keeping telemetry and trends warm:
+
+```bash
+python3 ~/.config/omarchy/plugins/io.github.igorbnp.ram-keeper/helper/ram_keeper.py --pause 30
+python3 ~/.config/omarchy/plugins/io.github.igorbnp.ram-keeper/helper/ram_keeper.py --resume
+```
 
 **The panel says the daemon is off** — liveness comes from the snapshot the
 daemon publishes every pass (5 s under pressure, 20 s idle); no snapshot for

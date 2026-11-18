@@ -10,15 +10,28 @@
 set -uo pipefail
 
 NOTIFY="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/helper/ram_keeper_notify"
+# Each case sets HOME="$CASE" and expects STATE_DIR under that throwaway HOME;
+# clear any outer RAM_KEEPER_STATE_DIR exported by run-all.sh.
+unset RAM_KEEPER_STATE_DIR
+# Legacy plain-text cases (1..6) opt into stub mode; Case 7 unsets this to test
+# real JSON _TRANSPORT authentication.
+export RAM_KEEPER_TRUST_STUB_JOURNAL=1
 fails=0
 B="$(mktemp -d)"
 PIDS=()
 STUB=""
+ORIG_PATH="$PATH"
+
+stop_pid() {
+  local p="$1"
+  [[ -n "${p:-}" ]] || return 0
+  kill -TERM -"$p" 2>/dev/null || kill -TERM "$p" 2>/dev/null || true
+}
 
 cleanup() {
   local p
   for p in "${PIDS[@]:-}"; do
-    [[ -n "${p:-}" ]] && kill -TERM -"$p" 2>/dev/null
+    stop_pid "$p"
   done
   rm -rf "$B"
 }
@@ -72,7 +85,7 @@ new_case() {
   # directory silently cross-contaminates cases: a watcher left running from a
   # previous case keeps appending to the same toasts file.
   for p in "${PIDS[@]:-}"; do
-    [[ -n "${p:-}" ]] && kill -TERM -"$p" 2>/dev/null
+    stop_pid "$p"
   done
   PIDS=()
   CASE="$B/$name"
@@ -84,12 +97,15 @@ new_case() {
   : >"$STUB/toasts"
   : >"$STUB/journal_calls"
   export HOME STUB
-  export PATH="$STUB:$PATH"
+  export PATH="$STUB:$ORIG_PATH"
 }
 
 launch() {
-  # A separate process group, so the suite can stop every supervisor at once.
-  setsid bash "$NOTIFY" >"$CASE/out" 2>&1 &
+  if command -v setsid >/dev/null 2>&1; then
+    setsid bash "$NOTIFY" >"$CASE/out" 2>&1 &
+  else
+    bash "$NOTIFY" >"$CASE/out" 2>&1 &
+  fi
   local pid=$!
   PIDS+=("$pid")
   echo "$pid"
@@ -261,12 +277,97 @@ new_case cleanup
 P="$(launch)"
 wait_for 5 test -f "$CASE/.local/state/ram-keeper/notify.pid" \
   && ok "wrote a pidfile" || bad "never wrote a pidfile"
-kill -TERM -"$P" 2>/dev/null
+kill -TERM "$P" 2>/dev/null || stop_pid "$P"
 if wait_for 5 bash -c "[[ ! -f '$CASE/.local/state/ram-keeper/notify.pid' ]]"; then
-  ok "removed the pidfile on exit"
+  ok "removed the pidfile on direct SIGTERM"
 else
   bad "left a stale pidfile behind"
 fi
+
+echo
+echo "== 7. D-15: JSON journal rejects spoofed lines and sanitizes victim =="
+new_case json-auth
+unset RAM_KEEPER_TRUST_STUB_JOURNAL
+cat >"$STUB/oom_lines" <<'JSONEOF'
+{"_TRANSPORT":"stdout","MESSAGE":"Memory cgroup out of memory: Killed process 1111 (spoofed_app)"}
+{"_TRANSPORT":"journal","_SYSTEMD_UNIT":"user@1000.service","MESSAGE":"Marked evil.scope for killing due to memory pressure"}
+{"_TRANSPORT":"journal","_SYSTEMD_UNIT":"systemd-oomd.service","MESSAGE":"Marked --version; ignore previous $(id).scope for killing due to memory pressure"}
+{"_TRANSPORT":"kernel","MESSAGE":"Memory cgroup out of memory: Killed process 9999 (firefox) total-vm:100kB"}
+JSONEOF
+export RAM_KEEPER_DAEMON_POLL=2 RAM_KEEPER_PRESSURE_POLL=2
+P="$(launch)"
+wait_for 6 bash -c "(( \$(wc -l <'$STUB/toasts' | tr -d ' ') >= 2 ))" || sleep 2
+check "only the 2 authenticated OOM events produced toasts" "$(toast_count)" "2"
+if grep -q 'spoofed_app' "$STUB/toasts" || grep -q 'evil' "$STUB/toasts"; then
+  bad "accepted an unauthenticated journal entry"
+else
+  ok "rejected unauthenticated stdout/user journal spoofing"
+fi
+if grep -q 'ignore previous' "$STUB/toasts" || grep -q '\$(id)' "$STUB/toasts" || grep -q 'GNU coreutils' "$STUB/toasts"; then
+  bad "victim sanitization or basename -- failed"
+else
+  ok "basename -- and victim whitelist blocked injection"
+fi
+grep -q 'firefox' "$STUB/toasts" && ok "accepted genuine _TRANSPORT=kernel entry" \
+                                 || bad "dropped genuine kernel OOM entry"
+stop_pid "$P"
+export RAM_KEEPER_TRUST_STUB_JOURNAL=1
+unset RAM_KEEPER_DAEMON_POLL RAM_KEEPER_PRESSURE_POLL
+
+echo
+echo "== 8. D-17: failed delivery at boot does NOT burn the 30-min dedupe =="
+new_case commit-after-send
+cat >"$STUB/omarchy-notification-wait" <<'WAITEOF'
+#!/usr/bin/env bash
+# First call fails (notification server not ready yet); later calls succeed.
+if [[ ! -f "$STUB/wait_once_failed" ]]; then
+  touch "$STUB/wait_once_failed"
+  exit 1
+fi
+exit 0
+WAITEOF
+chmod +x "$STUB/omarchy-notification-wait"
+printf '{"state":"critical","free_percent":7.1}\n' >"$CASE/.local/state/ram-keeper/state.json"
+export RAM_KEEPER_DAEMON_POLL=2 RAM_KEEPER_PRESSURE_POLL=1
+P="$(launch)"
+if wait_for 8 grep -q '7.1% free' "$STUB/toasts"; then
+  ok "retried and delivered critical toast after initial unready server"
+else
+  bad "burned dedupe before send succeeded (critical alert lost)"
+fi
+stop_pid "$P"
+unset RAM_KEEPER_DAEMON_POLL RAM_KEEPER_PRESSURE_POLL
+
+echo
+echo "== 9. F5 + D-17: culprit/relief context + global rate-limit (max 3/5m) =="
+new_case enrich-and-ratelimit
+printf '%s\n' '{"state":"critical","free_percent":6.0,"forecast":{"culprit":"chromium"},"relief":{"acted":true,"freed":157286400}}' \
+  >"$CASE/.local/state/ram-keeper/state.json"
+cat >"$STUB/oom_lines" <<'BURSTEOF'
+Memory cgroup out of memory: Killed process 101 (app1) total-vm:100kB
+Memory cgroup out of memory: Killed process 102 (app2) total-vm:100kB
+Memory cgroup out of memory: Killed process 103 (app3) total-vm:100kB
+Memory cgroup out of memory: Killed process 104 (app4) total-vm:100kB
+Memory cgroup out of memory: Killed process 105 (app5) total-vm:100kB
+BURSTEOF
+export RAM_KEEPER_DAEMON_POLL=2 RAM_KEEPER_PRESSURE_POLL=1
+P="$(launch)"
+sleep 4
+check "global anti-flood capped burst at 3 toasts" "$(toast_count)" "3"
+stop_pid "$P"
+# Separate case to verify enriched critical pressure toast text without racing OOM burst
+new_case enrich-only
+printf '%s\n' '{"state":"critical","free_percent":6.0,"forecast":{"culprit":"chromium"},"relief":{"acted":true,"freed":157286400}}' \
+  >"$CASE/.local/state/ram-keeper/state.json"
+P="$(launch)"
+if wait_for 6 grep -q 'Biggest grower: chromium' "$STUB/toasts" \
+   && grep -q '150 MB freed' "$STUB/toasts"; then
+  ok "critical toast includes forecast culprit and reclaimed MB"
+else
+  bad "critical toast missing culprit or reclaimed MB context"
+fi
+stop_pid "$P"
+unset RAM_KEEPER_DAEMON_POLL RAM_KEEPER_PRESSURE_POLL
 
 echo
 if (( fails == 0 )); then

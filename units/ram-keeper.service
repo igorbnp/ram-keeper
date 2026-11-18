@@ -35,12 +35,19 @@ ProtectHome=read-only
 # A leading `-` is not decoration. Measured on this machine: a ReadWritePaths
 # target that does not exist fails the unit with 226/NAMESPACE before ExecStart
 # ever runs, and ReadOnlyPaths fails the same way with ProtectSystem=strict or
-# when both are missing. The config is optional and the state directory can be
-# deleted; neither should turn protection into a permanent restart loop.
+# when both are missing. Note that when a `-` path is missing at mount time,
+# ProtectHome=read-only leaves %h/.local/state read-only (EROFS), so install.sh
+# also registers ~/.config/user-tmpfiles.d/ram-keeper.conf to ensure the
+# directories exist at session login before the unit starts.
 ReadOnlyPaths=-%h/.config/ram-keeper
 ReadWritePaths=-%h/.local/state/ram-keeper
 PrivateTmp=yes
-IPAddressDeny=any
+# IPAddressDeny=any is ineffective in a --user unit (systemd's BPF-based
+# socket filtering requires CAP_NET_ADMIN, which user managers lack).
+# RestrictAddressFamilies denies the socket() syscall itself, which works
+# without privileges and actually prevents the daemon from opening a network
+# connection.
+RestrictAddressFamilies=AF_UNIX
 RestrictSUIDSGID=yes
 RestrictRealtime=yes
 LockPersonality=yes

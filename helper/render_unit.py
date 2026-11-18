@@ -88,7 +88,16 @@ def render(content: str, plugin_dir: str, python: str) -> str:
         rendered,
     )
 
-    if "@PLUGIN_DIR@" in rendered:
+    # Units that launch a shell script (like ram-keeper-notify.service) receive
+    # the chosen interpreter via Environment=RAM_KEEPER_PYTHON=@PYTHON@ so a
+    # non-default python3 >= 3.9 selected by install.sh is honoured everywhere.
+    rendered = re.sub(
+        r"(?m)^(Environment=)([A-Za-z_][A-Za-z0-9_]*=)@PYTHON@$",
+        lambda m: m.group(1) + quote_path(m.group(2) + python, "python path"),
+        rendered,
+    )
+
+    if "@PLUGIN_DIR@" in rendered or "@PYTHON@" in rendered:
         raise RenderError("placeholder survived rendering")
     return rendered
 

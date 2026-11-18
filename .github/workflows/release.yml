@@ -17,6 +17,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       - name: Verify tag and manifest agree
         run: |
           tag="${GITHUB_REF_NAME#v}"
@@ -35,6 +40,14 @@ jobs:
           sha256sum "${name}.tar.gz" "${name}.zip" > SHA256SUMS
           ls -l "${name}".* SHA256SUMS
 
+      - name: Determine prerelease
+        id: meta
+        run: |
+          case "${GITHUB_REF_NAME}" in
+            *-*) echo "prerelease=true"  >> "$GITHUB_OUTPUT" ;;
+            *)   echo "prerelease=false" >> "$GITHUB_OUTPUT" ;;
+          esac
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
@@ -44,4 +57,4 @@ jobs:
             SHA256SUMS
           generate_release_notes: true
           draft: false
-          prerelease: false
+          prerelease: ${{ steps.meta.outputs.prerelease }}
