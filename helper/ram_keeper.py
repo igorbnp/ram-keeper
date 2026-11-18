@@ -21,11 +21,13 @@ the user systemd unit. See CONFIG.md for the policy and thresholds.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import errno
 import json
 import math
 import os
 import re
+import stat
 import subprocess
 import sys
 import time
@@ -33,6 +35,117 @@ from dataclasses import dataclass, field, asdict
 from pathlib import Path
 
 CGROOT = Path("/sys/fs/cgroup")
+_UNSET = object()
+
+
+def _read_regular_bytes(path: Path, max_bytes: int = 1024 * 1024) -> tuple[bytes | None, str | None]:
+    """Read up to max_bytes from a regular file without blocking on FIFOs."""
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
+    try:
+        st_outer = path.stat()
+    except FileNotFoundError:
+        return None, "missing"
+    except OSError:
+        return None, "oserror"
+    if not stat.S_ISREG(st_outer.st_mode):
+        return None, "non-regular"
+    if st_outer.st_size > max_bytes:
+        return None, "oversized"
+    try:
+        fd = os.open(str(path), flags)
+    except FileNotFoundError:
+        return None, "missing"
+    except OSError:
+        return None, "oserror"
+    try:
+        st_fd = os.fstat(fd)
+        if not stat.S_ISREG(st_fd.st_mode):
+            return None, "non-regular"
+        if st_fd.st_size > max_bytes:
+            return None, "oversized"
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = os.read(fd, min(65536, max_bytes - total + 1))
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > max_bytes:
+                return None, "oversized"
+            chunks.append(chunk)
+        return b"".join(chunks), None
+    except OSError:
+        return None, "oserror"
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def _atomic_replace(src: Path, dst: Path) -> None:
+    """Atomically replace dst with src, retrying brief Windows share locks."""
+    if os.name != "nt":
+        src.replace(dst)
+        return
+    last_exc: Exception | None = None
+    for attempt in range(25):
+        try:
+            src.replace(dst)
+            return
+        except PermissionError as exc:
+            last_exc = exc
+            time.sleep(0.005 * (attempt + 1))
+    if last_exc is not None:
+        raise last_exc
+
+
+@contextlib.contextmanager
+def _file_lock(lock_path: Path):
+    """Cross-platform exclusive file lock (fcntl on POSIX, msvcrt on Windows)."""
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "a+b") as fh:
+        locked_posix = False
+        locked_win = False
+        try:
+            try:
+                import fcntl
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+                locked_posix = True
+            except ImportError:
+                try:
+                    import msvcrt
+                    fh.seek(0, os.SEEK_END)
+                    if fh.tell() == 0:
+                        fh.write(b"\0")
+                        fh.flush()
+                    while True:
+                        try:
+                            fh.seek(0)
+                            msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
+                            locked_win = True
+                            break
+                        except OSError:
+                            time.sleep(0.01)
+                except (ImportError, OSError):
+                    pass
+            except OSError:
+                pass
+            yield fh
+        finally:
+            if locked_posix:
+                try:
+                    import fcntl
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    pass
+            elif locked_win:
+                try:
+                    import msvcrt
+                    fh.seek(0)
+                    msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+                except OSError:
+                    pass
 
 # ---------------------------------------------------------------------------
 # Discovery: where this user's memory actually lives
@@ -210,31 +323,61 @@ def unit_aliases(name: str) -> frozenset[str]:
         # Do NOT add the template base (e.g. "wayland-wm") alone — it
         # would match ALL instances of that template, so protecting
         # wayland-wm@hyprland would inadvertently protect wayland-wm@sway.
-    if base[:4].casefold() == "app-":
-        rest = base[4:]
-        aliases.add(rest)
-        aliases.add(_TRAILING_ID.sub("", base))
-        trimmed = _TRAILING_ID.sub("", rest)
-        aliases.add(trimmed)
-        # Strip trailing noise segments (.desktop, .client, .Client) BEFORE
-        # rsplit so "org.telegram.desktop" → "org.telegram" → "telegram".
-        clean = trimmed
+    # For @instance units, expand the base part (without instance) through
+    # the app- pipeline so that app-org.chromium.Chromium@12345.service also
+    # yields "chromium".  Never expose a bare WM template ("wayland-wm") on
+    # its own, or wayland-wm@sway would collide with wayland-wm@hyprland.
+    _app_expand_texts = [base]
+    if instance and text_without_instance:
+        base_no_instance = _strip_unit_suffix(text_without_instance)
+        if (base_no_instance
+                and base_no_instance not in aliases
+                and base_no_instance.casefold() not in ("wayland-wm", "app-wayland-wm")):
+            _app_expand_texts.append(base_no_instance)
+
+    _UWSM_PREFIXES = ("hyprland-", "sway-", "niri-", "uwsm-")
+    _COMPOSITORS = {"hyprland", "sway", "niri", "uwsm", "wayland-wm"}
+
+    def _add_dotted_aliases(candidate: str) -> str:
+        clean = candidate
         while "." in clean:
             tail = clean.rsplit(".", 1)[-1]
             if tail.casefold() in _DOTTED_NOISE:
                 clean = clean[: -(len(tail) + 1)]
             else:
                 break
-        if clean != trimmed:
+        if clean and clean != candidate:
             aliases.add(clean)
-        # org.chromium.Chromium-991 → Chromium; Hyprland-chromium-ea8ee5ca →
-        # Hyprland-chromium (the hash is already stripped above).
         if "." in clean:
             last_part = clean.rsplit(".", 1)[-1]
             rest_part = clean.split(".", 1)[-1]
-            aliases.add(last_part)
-            if rest_part != last_part:
+            if last_part:
+                aliases.add(last_part)
+            if rest_part and rest_part != last_part:
                 aliases.add(rest_part)
+        return clean
+
+    for _atext in _app_expand_texts:
+        if _atext[:4].casefold() != "app-":
+            continue
+        rest = _atext[4:]
+        aliases.add(rest)
+        aliases.add(_TRAILING_ID.sub("", _atext))
+        trimmed = _TRAILING_ID.sub("", rest)
+        aliases.add(trimmed)
+        clean = _add_dotted_aliases(trimmed)
+        # uwsm compositor scopes/services: app-Hyprland-chromium-ea8ee5ca.scope
+        # After stripping app- and trailing ID, recognise known compositor
+        # launcher prefixes and extract the app name without splitting hyphens.
+        clean_lower = clean.casefold()
+        for pfx in _UWSM_PREFIXES:
+            if clean_lower.startswith(pfx) and len(clean) > len(pfx):
+                app_after_pfx = clean[len(pfx):]
+                if app_after_pfx and app_after_pfx.casefold() not in _COMPOSITORS:
+                    aliases.add(app_after_pfx)
+                    _add_dotted_aliases(app_after_pfx)
+                break  # only one prefix can match
+
     return frozenset(a.casefold() for a in aliases if a)
 
 
@@ -720,11 +863,11 @@ def load_config() -> dict:
     # instead of a warning. Same for a pathologically nested document:
     # json.loads raises RecursionError (a RuntimeError), which `except
     # ValueError` does not catch.
-    raw: bytes | None = None
-    try:
-        raw = config_path().read_bytes()
-    except OSError:
-        raw = None
+    raw, read_err = _read_regular_bytes(config_path(), max_bytes=1024 * 1024)
+    if read_err == "non-regular":
+        _CONFIG_WARNINGS.append("config.json is not a regular file; using defaults")
+    elif read_err == "oversized":
+        _CONFIG_WARNINGS.append("config.json exceeds 1 MiB limit; using defaults")
     if raw is not None:
         text: str | None = None
         try:
@@ -870,15 +1013,25 @@ class TrendTracker:
     def forecast(self, target_bytes: int) -> Forecast:
         """Least-squares slope of free memory, extrapolated to the floor."""
         if len(self.samples) < 4:
-            return Forecast()
+            return Forecast(samples=len(self.samples))
 
         now = self._clock()
         # Only the recent window matters: a machine's memory use changes shape
         # over minutes, and a 40-minute-old sample would bias the slope toward
         # a regime that no longer exists.
         window = [s for s in self.samples if now - s[0] <= 600.0]
+
+        # Discard samples before a >180s gap (post-suspension, hibernate, etc.)
+        # so we don't mix pre- and post-sleep regimes.
+        if len(window) >= 2:
+            last_valid = 0
+            for i in range(1, len(window)):
+                if window[i][0] - window[i - 1][0] > 180.0:
+                    last_valid = i
+            if last_valid > 0:
+                window = window[last_valid:]
         if len(window) < 4:
-            window = self.samples[-4:]
+            return Forecast(samples=len(window))
 
         t0 = window[0][0]
         xs = [s[0] - t0 for s in window]
@@ -1052,6 +1205,7 @@ class Steward:
     # Pause/snooze state
     _paused: bool = field(default=False, repr=False, compare=False)
     _paused_until: float | None = field(default=None, repr=False, compare=False)
+    _seen_pause_mtime: float | None = field(default=None, repr=False, compare=False)
     # Captured once. A later edit of manifest.json must not make this process
     # claim it is already the new build: the panel compares this string with
     # the file it reads itself, and restarts the unit when they differ.
@@ -1074,7 +1228,7 @@ class Steward:
                     previous.unlink()
                 except OSError:
                     pass
-                self.log_path.replace(previous)
+                _atomic_replace(self.log_path, previous)
             with self.log_path.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(event, ensure_ascii=False) + "\n")
         except OSError:
@@ -1096,7 +1250,7 @@ class Steward:
             # PID-stamped to avoid collision between concurrent CLI invocations.
             tmp = self.state_path.with_suffix(f".tmp.{os.getpid()}")
             tmp.write_text(json.dumps(snapshot, default=str), encoding="utf-8")
-            tmp.replace(self.state_path)
+            _atomic_replace(tmp, self.state_path)
         except OSError:
             pass
 
@@ -1386,8 +1540,7 @@ class Steward:
         """
         try:
             if victim_bytes is None:
-                victim_bytes = int(meminfo().get(
-                    "MemTotal", 8 * 1024 * 1024 * 1024) or 0)
+                victim_bytes = int(meminfo().get("MemTotal") or (8 * 1024 * 1024 * 1024))
             size = max(0, int(victim_bytes))
             fraction = max(0.0, min(100.0, float(self.config["max_victim_fraction"])))
         except (TypeError, ValueError, OverflowError):
@@ -1665,7 +1818,10 @@ class Steward:
             self.session_stats.record(total_freed, label=real[0].label if real else "")
         reason = f"state={state}, free={free_percent}%, target={target_free}%"
         if skipped_anon:
-            reason = "No ram-backed swap with room, so app memory was not moved to disk swap"
+            if skipped_anon == "psi-full-thrash":
+                reason = "PSI full indicates system thrashing; anonymous reclaim aborted to avoid worsening pressure"
+            else:
+                reason = "No ram-backed swap with room, so app memory was not moved to disk swap"
         summary = {
             "acted": bool(real),
             "reason": reason,
@@ -1723,36 +1879,59 @@ class Steward:
     def _check_pause(self) -> None:
         """Read pause.json from state_dir and update self._paused state."""
         pause_path = state_dir() / "pause.json"
-        try:
-            data = json.loads(pause_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+        marker_path = state_dir() / "paused-by-user"
+        raw, err = _read_regular_bytes(pause_path, max_bytes=64 * 1024)
+        if raw is None or err is not None:
             self._paused = False
             self._paused_until = None
+            self._seen_pause_mtime = None
+            return
+        try:
+            st_mtime = pause_path.stat().st_mtime
+        except OSError:
+            st_mtime = None
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError, RecursionError):
+            self._paused = False
+            self._paused_until = None
+            self._seen_pause_mtime = st_mtime
             return
         if not isinstance(data, dict):
             self._paused = False
             self._paused_until = None
+            self._seen_pause_mtime = st_mtime
             return
         paused_until = data.get("paused_until")
         if paused_until is None:
             # Indefinite pause
             self._paused = True
             self._paused_until = None
-        elif isinstance(paused_until, (int, float)) and math.isfinite(paused_until):
+            self._seen_pause_mtime = st_mtime
+        elif (isinstance(paused_until, (int, float))
+              and not isinstance(paused_until, bool)
+              and math.isfinite(paused_until)):
             if time.time() < paused_until:
                 self._paused = True
-                self._paused_until = paused_until
+                self._paused_until = float(paused_until)
+                self._seen_pause_mtime = st_mtime
             else:
-                # Pause expired — clean up
+                # Pause expired — clean up both pause.json and paused-by-user
                 self._paused = False
                 self._paused_until = None
+                self._seen_pause_mtime = None
                 try:
                     pause_path.unlink()
+                except OSError:
+                    pass
+                try:
+                    marker_path.unlink()
                 except OSError:
                     pass
         else:
             self._paused = False
             self._paused_until = None
+            self._seen_pause_mtime = st_mtime
 
     # -- loop ------------------------------------------------------------
     def run_forever(self) -> None:
@@ -1793,8 +1972,12 @@ class Steward:
                 # bought a full 51-cgroup walk and a swap read every
                 # five seconds, forever, doing nothing.
                 pressure = snap["state"] in ("tight", "critical", "trending", "stalling")
-                self._sleep(self.config["interval_pressure"] if pressure
-                            else self.config["interval_idle"])
+                self._sleep(
+                    self.config["interval_pressure"] if pressure
+                    else self.config["interval_idle"],
+                    seen_config=seen_mtime,
+                    seen_pause=self._seen_pause_mtime,
+                )
 
             except KeyboardInterrupt:
                 break
@@ -1812,11 +1995,13 @@ class Steward:
                 if consecutive_failures in (1, 5, 25):
                     print(f"ram-keeper: pass failed ({exc!r}); retrying in {backoff:.0f}s",
                           file=sys.stderr, flush=True)
-                self._sleep(backoff)
+                self._sleep(backoff, seen_config=seen_mtime,
+                            seen_pause=self._seen_pause_mtime)
 
         self.log({"event": "stop"})
 
-    def _sleep(self, seconds: float) -> None:
+    def _sleep(self, seconds: float, seen_config: object = _UNSET,
+               seen_pause: object = _UNSET) -> None:
         """Sleep, refusing to pass a value time.sleep would reject.
 
         load_config clamps intervals, but this is the last line of defence:
@@ -1830,30 +2015,31 @@ class Steward:
         if not (value == value) or value <= 0 or value == float("inf"):
             value = 20.0
         remaining = min(value, 3600.0)
-        try:
-            seen_config = config_path().stat().st_mtime
-        except OSError:
-            seen_config = None
+        if seen_config is _UNSET:
+            try:
+                seen_config = config_path().stat().st_mtime
+            except OSError:
+                seen_config = None
         pause_path = state_dir() / "pause.json"
-        try:
-            seen_pause = pause_path.stat().st_mtime
-        except OSError:
-            seen_pause = None
+        if seen_pause is _UNSET:
+            try:
+                seen_pause = pause_path.stat().st_mtime
+            except OSError:
+                seen_pause = None
         while remaining > 0:
             try:
                 cur_config = config_path().stat().st_mtime
             except OSError:
                 cur_config = None
-            # Wake on ANY change: initial creation (seen is None, current not
-            # None) OR mtime change.
-            if cur_config is not None and (seen_config is None or cur_config != seen_config):
+            # Wake on ANY transition: creation (None → float), modification
+            # (float → float), or deletion (float → None).
+            if cur_config != seen_config:
                 return
-            # Also wake on pause.json creation or change
             try:
                 cur_pause = pause_path.stat().st_mtime
             except OSError:
                 cur_pause = None
-            if cur_pause is not None and (seen_pause is None or cur_pause != seen_pause):
+            if cur_pause != seen_pause:
                 return
             step = min(1.0, remaining)
             time.sleep(step)
@@ -1877,19 +2063,86 @@ def published_snapshot(max_age: float = 120.0) -> dict | None:
         st = path.stat()
         # Reject non-regular files (FIFO would block), oversized files (OOM
         # under MemoryMax=384M), and future mtime (clock skew).
-        if not __import__("stat").S_ISREG(st.st_mode):
+        if not stat.S_ISREG(st.st_mode):
             return None
         if st.st_size > 10 * 1024 * 1024:   # 10 MB cap
             return None
         age = time.time() - st.st_mtime
         if age > max_age or age < -60:       # future mtime = clock skew
             return None
-        data = json.loads(path.read_text(encoding="utf-8"))
+        raw, err = _read_regular_bytes(path, max_bytes=10 * 1024 * 1024)
+        if raw is None or err is not None:
+            return None
+        data = json.loads(raw.decode("utf-8"))
         if isinstance(data, dict) and data.get("mem_total"):
             return data
-    except (OSError, ValueError, RecursionError):
+    except (OSError, UnicodeDecodeError, ValueError, RecursionError):
         pass
     return None
+
+
+def _sync_state_after_ctl() -> None:
+    """Update state.json after a CLI control mutation (--pause/--resume/--protected-*).
+
+    Preserves the daemon's forecast, session_stats, relief, and checked_at
+    heartbeat while recalculating pause fields and cgroup protection flags.
+    """
+    try:
+        existing = published_snapshot(max_age=86400)
+        steward = Steward()
+        steward._check_pause()
+        fresh = steward.snapshot()
+        paused_rem = (
+            max(0, int(steward._paused_until - time.time()))
+            if steward._paused and steward._paused_until is not None
+            else None
+        )
+
+        if existing is not None:
+            if fresh.get("memory_reading_valid") and fresh.get("groups"):
+                out = dict(fresh)
+                for key in ("forecast", "session_stats", "relief", "checked_at"):
+                    if existing.get(key) is not None:
+                        out[key] = existing[key]
+            else:
+                out = dict(existing)
+                prot_set = set(steward.config["protected"])
+                never_set = set(steward.config["never_reclaim"])
+                raw_groups = out.get("groups")
+                if isinstance(raw_groups, list):
+                    reclaimable_total = 0
+                    updated_groups = []
+                    for g in raw_groups:
+                        if not isinstance(g, dict):
+                            continue
+                        g_copy = dict(g)
+                        gname = str(g_copy.get("name") or "")
+                        inv = is_inviolable(gname)
+                        is_prot = (names_match(gname, prot_set)
+                                   or names_match(gname, never_set)
+                                   or inv)
+                        g_copy["inviolable"] = inv
+                        g_copy["protected"] = is_prot
+                        if not is_prot:
+                            try:
+                                reclaimable_total += max(0, int(g_copy.get("reclaimable") or 0))
+                            except (TypeError, ValueError):
+                                pass
+                        updated_groups.append(g_copy)
+                    out["groups"] = updated_groups
+                    out["reclaimable_total"] = reclaimable_total
+            out["paused"] = steward._paused
+            out["paused_until"] = steward._paused_until
+            out["paused_remaining_s"] = paused_rem
+            out["interval_idle"] = float(steward.config.get("interval_idle", 20.0))
+            steward.publish(out)
+        elif fresh.get("memory_reading_valid"):
+            # No prior state.json on Linux: publish fresh without spoofing a
+            # running daemon's heartbeat if no daemon is active yet.
+            fresh["checked_at"] = 0
+            steward.publish(fresh)
+    except OSError:
+        pass
 
 
 def add_never_reclaim(name: str) -> list[str]:
@@ -1911,21 +2164,20 @@ def add_never_reclaim(name: str) -> list[str]:
 
     path = config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    lock_path = path.with_suffix(".lock")
-    with open(lock_path, "a", encoding="utf-8") as lock_handle:
-        try:
-            import fcntl
-            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
-        except (ImportError, OSError):
-            pass
+    lock_path = path.parent / f".{path.name}.lock"
+    with _file_lock(lock_path):
+        target = path.resolve() if path.is_symlink() else path
+        target.parent.mkdir(parents=True, exist_ok=True)
 
         existing: dict = {}
-        try:
-            loaded = json.loads(path.read_bytes().decode("utf-8-sig"))
-            if isinstance(loaded, dict):
-                existing = loaded
-        except (OSError, ValueError, UnicodeDecodeError, RecursionError):
-            existing = {}
+        raw, err = _read_regular_bytes(target, max_bytes=1024 * 1024)
+        if raw is not None and err is None:
+            try:
+                loaded = json.loads(raw.decode("utf-8-sig"))
+                if isinstance(loaded, dict):
+                    existing = loaded
+            except (ValueError, UnicodeDecodeError, RecursionError):
+                existing = {}
 
         current = existing.get("never_reclaim")
         if isinstance(current, str):
@@ -1948,9 +2200,10 @@ def add_never_reclaim(name: str) -> list[str]:
             if isinstance(v, str) and v.strip() and not names_match(v, [name])
         ]
 
-        tmp = path.with_suffix(f".tmp.{os.getpid()}")
+        tmp = target.parent / f".{target.name}.tmp.{os.getpid()}"
         tmp.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
-        tmp.replace(path)
+        _atomic_replace(tmp, target)
+    _sync_state_after_ctl()
     return names
 
 
@@ -1970,21 +2223,20 @@ def remove_protection(name: str) -> list[str]:
 
     path = config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    lock_path = path.with_suffix(".lock")
-    with open(lock_path, "a", encoding="utf-8") as lock_handle:
-        try:
-            import fcntl
-            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
-        except (ImportError, OSError):
-            pass
+    lock_path = path.parent / f".{path.name}.lock"
+    with _file_lock(lock_path):
+        target = path.resolve() if path.is_symlink() else path
+        target.parent.mkdir(parents=True, exist_ok=True)
 
         existing: dict = {}
-        try:
-            loaded = json.loads(path.read_bytes().decode("utf-8-sig"))
-            if isinstance(loaded, dict):
-                existing = loaded
-        except (OSError, ValueError, UnicodeDecodeError, RecursionError):
-            existing = {}
+        raw, err = _read_regular_bytes(target, max_bytes=1024 * 1024)
+        if raw is not None and err is None:
+            try:
+                loaded = json.loads(raw.decode("utf-8-sig"))
+                if isinstance(loaded, dict):
+                    existing = loaded
+            except (ValueError, UnicodeDecodeError, RecursionError):
+                existing = {}
 
         def _listed(key: str) -> list[str]:
             current = existing.get(key)
@@ -2017,44 +2269,100 @@ def remove_protection(name: str) -> list[str]:
             gone.append(name)
         existing["unprotect"] = gone
 
-        tmp = path.with_suffix(f".tmp.{os.getpid()}")
+        tmp = target.parent / f".{target.name}.tmp.{os.getpid()}"
         tmp.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
-        tmp.replace(path)
+        _atomic_replace(tmp, target)
+    _sync_state_after_ctl()
     return existing["unprotect"]
 
 
-def pause_daemon(minutes: float | None = None) -> dict:
-    """Write pause.json so the daemon skips reclaim passes.
+def pause_daemon(minutes: float | str | None = None) -> dict:
+    """Write pause.json and paused-by-user so the daemon skips reclaim passes.
 
-    minutes=None → indefinite pause.
-    minutes=0 → resume (deletes pause.json).
-    minutes>0 → pause for that many minutes.
+    minutes=None / 'indefinite' / -1 → indefinite pause.
+    minutes=0 / '0' → resume (deletes pause.json and paused-by-user).
+    minutes>0 → pause for that many minutes (clamped to 1..1440).
     """
-    pause_path = state_dir() / "pause.json"
-    pause_path.parent.mkdir(parents=True, exist_ok=True)
+    parsed_minutes: float | None
+    if minutes is None:
+        parsed_minutes = None
+    elif isinstance(minutes, bool):
+        raise ValueError("pause minutes must be a number or 'indefinite'")
+    elif isinstance(minutes, str):
+        token = minutes.strip()
+        if not token:
+            raise ValueError("pause minutes cannot be empty")
+        if token.casefold() == "indefinite":
+            parsed_minutes = None
+        else:
+            try:
+                num = float(token)
+            except ValueError as exc:
+                raise ValueError(f"expected minutes or 'indefinite', got {minutes!r}") from exc
+            if not math.isfinite(num):
+                raise ValueError(f"pause minutes must be finite, got {minutes!r}")
+            if num == -1.0:
+                parsed_minutes = None
+            elif num < 0.0:
+                raise ValueError(f"pause minutes must be >= 0 (or -1 for indefinite), got {minutes!r}")
+            else:
+                parsed_minutes = num
+    elif isinstance(minutes, (int, float)):
+        num = float(minutes)
+        if not math.isfinite(num):
+            raise ValueError(f"pause minutes must be finite, got {minutes!r}")
+        if num == -1.0:
+            parsed_minutes = None
+        elif num < 0.0:
+            raise ValueError(f"pause minutes must be >= 0 (or -1 for indefinite), got {minutes!r}")
+        else:
+            parsed_minutes = num
+    else:
+        raise ValueError(f"unsupported pause minutes {minutes!r}")
 
-    if minutes is not None and minutes <= 0:
+    sdir = state_dir()
+    pause_path = sdir / "pause.json"
+    marker_path = sdir / "paused-by-user"
+    sdir.mkdir(parents=True, exist_ok=True)
+
+    if parsed_minutes is not None and parsed_minutes == 0.0:
         # Resume
         try:
             pause_path.unlink()
         except OSError:
             pass
+        try:
+            marker_path.unlink()
+        except OSError:
+            pass
+        _sync_state_after_ctl()
         return {"paused": False}
 
-    data: dict = {"set_at": time.time()}
-    if minutes is not None:
-        data["paused_until"] = time.time() + minutes * 60.0
+    now = time.time()
+    data: dict = {"set_at": now}
+    if parsed_minutes is not None:
+        clamped = max(1.0, min(1440.0, parsed_minutes))
+        data["paused_until"] = now + clamped * 60.0
     else:
         data["paused_until"] = None
 
-    tmp = pause_path.with_suffix(f".tmp.{os.getpid()}")
-    tmp.write_text(json.dumps(data), encoding="utf-8")
-    tmp.replace(pause_path)
+    tmp_pause = sdir / f".pause.json.tmp.{os.getpid()}"
+    tmp_pause.write_text(json.dumps(data, allow_nan=False), encoding="utf-8")
+    _atomic_replace(tmp_pause, pause_path)
+
+    tmp_marker = sdir / f".paused-by-user.tmp.{os.getpid()}"
+    try:
+        tmp_marker.write_text("", encoding="utf-8")
+        _atomic_replace(tmp_marker, marker_path)
+    except OSError:
+        pass
+
+    _sync_state_after_ctl()
     return {"paused": True, **data}
 
 
 def resume_daemon() -> dict:
-    """Remove pause.json to resume the daemon."""
+    """Remove pause.json and paused-by-user to resume the daemon."""
     return pause_daemon(minutes=0)
 
 
@@ -2129,19 +2437,35 @@ def doctor(as_json: bool = False) -> tuple[int, str]:
     state_ok = False
     state_detail = "no state.json"
     try:
-        age = time.time() - state_path.stat().st_mtime
-        if 0 <= age <= 120:
-            state_ok = True
-            state_detail = f"age={age:.0f}s"
+        st = state_path.stat()
+        if stat.S_ISREG(st.st_mode):
+            age = time.time() - st.st_mtime
+            if 0 <= age <= 120:
+                state_ok = True
+                state_detail = f"age={age:.0f}s"
+            else:
+                state_detail = f"stale (age={age:.0f}s)"
         else:
-            state_detail = f"stale (age={age:.0f}s)"
+            state_detail = "not a regular file"
     except OSError:
         pass
     checks.append({"name": "state_freshness", "ok": state_ok, "detail": state_detail})
 
-    # 9. pause state
+    # 9. pause state (read-only check without mutating files)
     pause_path = state_dir() / "pause.json"
-    paused = pause_path.exists()
+    paused = False
+    raw_pause, err_pause = _read_regular_bytes(pause_path, max_bytes=64 * 1024)
+    if raw_pause is not None and err_pause is None:
+        try:
+            pdata = json.loads(raw_pause.decode("utf-8"))
+            if isinstance(pdata, dict):
+                pu = pdata.get("paused_until")
+                if pu is None:
+                    paused = True
+                elif isinstance(pu, (int, float)) and not isinstance(pu, bool) and math.isfinite(pu):
+                    paused = time.time() < pu
+        except (UnicodeDecodeError, ValueError, RecursionError):
+            pass
     checks.append({"name": "pause", "ok": True,
                     "detail": "paused" if paused else "not paused"})
 
@@ -2171,27 +2495,33 @@ def history(count: int = 20, as_json: bool = False) -> str:
     """Read the last N events from the reclaim log.
 
     Returns a human-readable summary (or JSON when as_json=True).
+    count <= 0 returns an empty shown list (not all events).
     """
     log_path = state_dir() / "log.jsonl"
     log_prev = state_dir() / "log.jsonl.1"
     events: list[dict] = []
 
     for path in (log_prev, log_path):
-        try:
-            for line in path.read_text(encoding="utf-8").splitlines():
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    events.append(json.loads(line))
-                except (ValueError, RecursionError):
-                    continue
-        except OSError:
+        raw, err = _read_regular_bytes(path, max_bytes=10 * 1024 * 1024)
+        if raw is None or err is not None:
             continue
+        try:
+            text = raw.decode("utf-8", errors="replace")
+        except Exception:
+            continue
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                parsed = json.loads(line)
+                if isinstance(parsed, dict):
+                    events.append(parsed)
+            except (ValueError, RecursionError):
+                continue
 
-    # Filter to reclaim events and take last N
     reclaims = [e for e in events if e.get("event") == "reclaim"]
-    tail = reclaims[-count:]
+    tail = reclaims[-count:] if count > 0 else []
 
     if as_json:
         return json.dumps({"total_events": len(reclaims), "shown": tail}, indent=2, default=str)
@@ -2250,8 +2580,10 @@ def main() -> int:
                         help="read-only health check; exit 0=ok, 1=problem")
     parser.add_argument("--history", nargs="?", const=20, type=int, metavar="N",
                         help="show last N reclaim events (default: 20)")
-    parser.add_argument("--pause", nargs="?", const=-1, type=float, metavar="MINUTES",
-                        help="pause reclaim for MINUTES (omit for indefinite, 0 to resume)")
+    parser.add_argument("--pause", nargs="?", const="indefinite", type=str,
+                        metavar="MINUTES",
+                        help="pause reclaim for MINUTES (omit or 'indefinite' "
+                             "for indefinite, 0 to resume)")
     parser.add_argument("--resume", action="store_true",
                         help="resume reclaim (alias for --pause 0)")
     parser.add_argument("--json", action="store_true",
@@ -2300,13 +2632,19 @@ def main() -> int:
 
     if args.resume:
         result = resume_daemon()
-        print(json.dumps(result))
+        print(json.dumps(result, allow_nan=False))
         return 0
 
     if args.pause is not None:
-        minutes = None if args.pause < 0 else args.pause
-        result = pause_daemon(minutes=minutes)
-        print(json.dumps(result, default=str))
+        try:
+            result = pause_daemon(minutes=args.pause)
+        except ValueError as exc:
+            print(f"ram-keeper: invalid --pause value: {exc}", file=sys.stderr)
+            return 2
+        except OSError as exc:
+            print(f"ram-keeper: could not write pause state: {exc}", file=sys.stderr)
+            return 1
+        print(json.dumps(result, allow_nan=False))
         return 0
 
     steward = Steward()
@@ -2317,42 +2655,33 @@ def main() -> int:
         if published is not None:
             print(json.dumps(published, default=str))
         else:
+            check_pause = getattr(steward, "_check_pause", None)
+            if callable(check_pause):
+                check_pause()
             print(json.dumps(steward.snapshot(), default=str))
         return 0
 
-    if args.relieve:
-        # Merge relief into the daemon's existing snapshot if available,
-        # so we don't destroy its forecast/session_stats.
-        result = steward.relieve(force=True)
+    if args.relieve or args.sweep_cache:
+        result = steward.sweep_cache() if args.sweep_cache else steward.relieve(force=True)
         print(json.dumps(result, default=str))
-        existing = published_snapshot() or {}
+        existing = published_snapshot(max_age=86400) or {}
+        check_pause = getattr(steward, "_check_pause", None)
+        if callable(check_pause):
+            check_pause()
         fresh = steward.snapshot()
-        # Preserve the daemon's forecast and session_stats if they exist
-        for key in ("forecast", "session_stats", "paused", "paused_until",
-                    "paused_remaining_s", "interval_idle"):
-            if key in existing and key not in fresh:
-                fresh[key] = existing[key]
-            elif key in existing and existing[key] is not None:
-                fresh[key] = existing[key]
-        fresh["relief"] = {
-            "acted": bool(result.get("acted")),
-            "reason": str(result.get("reason") or ""),
-            "skipped_anon": str(result.get("skipped_anon") or ""),
-        }
-        steward.publish(fresh)
-        return 0
-
-    if args.sweep_cache:
-        result = steward.sweep_cache()
-        print(json.dumps(result, default=str))
-        existing = published_snapshot() or {}
-        fresh = steward.snapshot()
-        for key in ("forecast", "session_stats", "paused", "paused_until",
-                    "paused_remaining_s", "interval_idle"):
-            if key in existing and key not in fresh:
-                fresh[key] = existing[key]
-            elif key in existing and existing[key] is not None:
-                fresh[key] = existing[key]
+        if fresh.get("memory_reading_valid") is False and existing.get("mem_total"):
+            merged = dict(existing)
+            merged["paused"] = getattr(steward, "_paused", False)
+            merged["paused_until"] = getattr(steward, "_paused_until", None)
+            merged["paused_remaining_s"] = fresh.get("paused_remaining_s")
+            merged["interval_idle"] = fresh.get("interval_idle", existing.get("interval_idle", 20.0))
+            fresh = merged
+        else:
+            # Preserve only the live daemon's forecast and session_stats,
+            # never overwriting current pause state with stale values.
+            for key in ("forecast", "session_stats"):
+                if existing.get(key) is not None:
+                    fresh[key] = existing[key]
         fresh["relief"] = {
             "acted": bool(result.get("acted")),
             "reason": str(result.get("reason") or ""),

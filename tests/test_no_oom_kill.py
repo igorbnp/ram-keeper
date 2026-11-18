@@ -74,7 +74,7 @@ print("== 1. the cap is derived from the victim's size, not fixed ==")
 s = rk.Steward()
 teto = s.max_victim_slice()
 frac = s.config["max_victim_fraction"]
-total = int(rk.meminfo().get("MemTotal", 0) or 0)
+total = int(rk.meminfo().get("MemTotal") or (8 * 1024 * MB))
 print(f"  max_victim_slice = {teto//MB} MB ({frac}% of {total//MB} MB)")
 # Machine-independent invariants: an absolute byte ceiling turns this suite into
 # a test of the runner's RAM. A 16 GB CI box legitimately plans a 3995 MB ceiling

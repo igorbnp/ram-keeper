@@ -134,21 +134,27 @@ class TestUserRoot:
         result = rk.user_root()
         assert isinstance(result, Path)
 
-    def test_finds_user_slice(self):
+    def test_finds_user_slice(self, monkeypatch):
         """Should find the user slice for the current UID."""
         import os
+        if not hasattr(os, "getuid"):
+            monkeypatch.setattr(os, "getuid", lambda: 1000, raising=False)
         uid = os.getuid()
         result = rk.user_root()
-        # Should at least return a path (may not exist in test env)
         assert isinstance(result, Path)
+        assert f"user-{uid}.slice" in result.as_posix() or result == rk.CGROOT
 
     def test_does_not_borrow_another_users_slice(self, tmp_path, monkeypatch):
         import os
         cgroup = tmp_path / "cgroup"
-        (cgroup / "user.slice" / "user-1.slice").mkdir(parents=True)
+        other_leaf = cgroup / "user.slice" / "user-1.slice" / "victim.scope"
+        other_leaf.mkdir(parents=True)
+        (other_leaf / "memory.current").write_text(str(500 * 1024 * 1024), encoding="utf-8")
         monkeypatch.setattr(rk, "CGROOT", cgroup)
-        monkeypatch.setattr(os, "getuid", lambda: 4242)
-        assert rk.user_root() == cgroup / "user.slice" / "user-4242.slice"
+        monkeypatch.setattr(os, "getuid", lambda: 4242, raising=False)
+        root = rk.user_root()
+        assert root == cgroup / "user.slice" / "user-4242.slice"
+        assert rk.scan(root, set(), 0) == []
 
 
 # ---------------------------------------------------------------------------
@@ -490,11 +496,12 @@ class TestIsInviolable:
 class TestConfigPath:
     """Tests for config_path."""
 
-    def test_returns_path_in_config_dir(self):
+    def test_returns_path_in_config_dir(self, monkeypatch):
+        monkeypatch.delenv("RAM_KEEPER_CONFIG", raising=False)
         result = rk.config_path()
         assert isinstance(result, Path)
-        assert "ram-keeper" in str(result)
-        assert "config.json" in str(result)
+        assert "ram-keeper/config.json" in result.as_posix()
+        assert result.parts[-3:] == (".config", "ram-keeper", "config.json")
 
 
 # ---------------------------------------------------------------------------
