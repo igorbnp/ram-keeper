@@ -27,6 +27,7 @@ readonly FLAG_DIR="$STATE_DIR/flags"
 readonly LOG="$STATE_DIR/log.jsonl"
 readonly PIDFILE="$STATE_DIR/notify.pid"
 readonly RATE_FILE="$FLAG_DIR/.rate-timestamps"
+readonly RATE_LOCK="$FLAG_DIR/.rate.lock"
 readonly DEDUPE_SECONDS=${RAM_KEEPER_DEDUPE_SECONDS:-1800}
 # Poll intervals, overridable so the test suite can exercise a transition in
 # seconds instead of waiting 15 and 30 of them.
@@ -42,6 +43,7 @@ declare -A MEM_DEDUPE=()
 declare -a TOAST_TIMESTAMPS=()
 declare -a SUP_PIDS=()
 _RATE_MEM_ONLY=0
+_SEND_LOCK_MODE=""
 
 # python3 is already a hard dependency of this plugin (the daemon is written in
 # it), so parse the snapshot with it instead of adding a jq dependency. Validate
@@ -182,29 +184,72 @@ sanitize_victim() {
   printf '%s' "${clean:0:48}"
 }
 
+_acquire_send_lock() {
+  _SEND_LOCK_MODE=""
+  (( _RATE_MEM_ONLY == 0 )) || return 0
+  mkdir -p "$FLAG_DIR" 2>/dev/null || return 0
+  [[ -d "$FLAG_DIR" && -w "$FLAG_DIR" ]] || return 0
+  if command -v flock >/dev/null 2>&1 && ( exec 8>>"$RATE_LOCK" ) 2>/dev/null; then
+    exec 8>>"$RATE_LOCK"
+    if flock -w 10 8; then
+      _SEND_LOCK_MODE="flock"
+      return 0
+    fi
+    exec 8>&- 2>/dev/null || true
+    return 0
+  fi
+  local tries=0
+  while ! mkdir "$RATE_LOCK.d" 2>/dev/null; do
+    tries=$(( tries + 1 ))
+    if (( tries > 50 )); then
+      rmdir "$RATE_LOCK.d" 2>/dev/null || true
+      mkdir "$RATE_LOCK.d" 2>/dev/null || return 0
+      break
+    fi
+    sleep 0.1
+  done
+  _SEND_LOCK_MODE="mkdir"
+  return 0
+}
+
+_release_send_lock() {
+  if [[ "$_SEND_LOCK_MODE" == "flock" ]]; then
+    flock -u 8 2>/dev/null || true
+    exec 8>&- 2>/dev/null || true
+  elif [[ "$_SEND_LOCK_MODE" == "mkdir" ]]; then
+    rmdir "$RATE_LOCK.d" 2>/dev/null || true
+  fi
+  _SEND_LOCK_MODE=""
+}
+
 # Return codes:
 #   0 = delivered
 #   1 = transient failure (notification server unready or send failed)
 #   2 = dropped by global anti-flood rate-limit
 send() {
   local urgency="$1" glyph="$2" title="$3" body="$4" action="$5"
+  _acquire_send_lock
   if ! rate_limit_check_and_record check; then
+    _release_send_lock
     log_event "rate-limited"
     return 2
   fi
-  omarchy-notification-wait 5 || {
+  if ! omarchy-notification-wait 5 8>&-; then
+    _release_send_lock
     log_event "notify-server-unready"
     return 1
-  }
+  fi
   if omarchy-notification-send \
     --urgency "$urgency" \
     --glyph "$glyph" \
     "$title" \
     "$body" \
-    --exec bash -lc "$action"; then
+    --exec bash -lc "$action" 8>&-; then
     rate_limit_check_and_record record
+    _release_send_lock
     return 0
   fi
+  _release_send_lock
   log_event "notify-send-failed"
   return 1
 }
@@ -561,7 +606,7 @@ supervise() {
   # Do not let watcher subprocesses inherit the pidfile flock FD.
   exec 9>&- 2>/dev/null || true
   local name="$1"; shift
-  trap 'exit 0' INT TERM HUP
+  trap '_release_send_lock; exit 0' INT TERM HUP
   while true; do
     "$@"
     log_event "watcher-exited:$name"

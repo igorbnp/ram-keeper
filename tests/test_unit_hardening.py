@@ -489,6 +489,8 @@ def test_shell_scripts_avoid_sc2013_for_cat_antipattern():
     for rel in ("install.sh", "helper/ram_keeper_notify"):
         content = (PLUGIN / rel).read_text(encoding="utf-8")
         assert not sc2013.search(content), f"SC2013 anti-pattern in {rel}"
+    notifier = (PLUGIN / "helper" / "ram_keeper_notify").read_text(encoding="utf-8")
+    assert "_acquire_send_lock" in notifier and "_release_send_lock" in notifier
 
 
 def test_real_pytest_does_not_collect_unittest_bridge():
