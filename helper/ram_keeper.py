@@ -34,7 +34,7 @@ import time
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 
-CGROOT = Path("/sys/fs/cgroup")
+CGROOT = Path(os.environ.get("RAM_KEEPER_CGROUP_ROOT") or "/sys/fs/cgroup")
 _UNSET = object()
 
 
@@ -1182,6 +1182,51 @@ class SessionStats:
     def as_dict(self) -> dict:
         return asdict(self)
 
+    @classmethod
+    def from_dict(cls, data: object) -> SessionStats | None:
+        if not isinstance(data, dict):
+            return None
+
+        def _nonneg_int(val: object) -> int | None:
+            if isinstance(val, bool) or not isinstance(val, (int, float)):
+                return None
+            if not math.isfinite(val) or val < 0:
+                return None
+            return int(val)
+
+        started = data.get("started_at")
+        if isinstance(started, bool) or not isinstance(started, (int, float)):
+            return None
+        if not math.isfinite(started) or started <= 0:
+            return None
+        actions = _nonneg_int(data.get("actions", 0))
+        freed = _nonneg_int(data.get("bytes_freed", 0))
+        last_bytes = _nonneg_int(data.get("last_relief_bytes", 0))
+        if actions is None or freed is None or last_bytes is None:
+            return None
+        raw_ts = data.get("last_relief_ts")
+        if raw_ts is None:
+            last_ts = None
+        elif isinstance(raw_ts, bool) or not isinstance(raw_ts, (int, float)) or not math.isfinite(raw_ts) or raw_ts < 0:
+            return None
+        else:
+            last_ts = float(raw_ts)
+        raw_lbl = data.get("last_relief_label", "")
+        label = raw_lbl if isinstance(raw_lbl, str) else ""
+        return cls(
+            started_at=float(started),
+            actions=actions,
+            bytes_freed=freed,
+            last_relief_ts=last_ts,
+            last_relief_bytes=last_bytes,
+            last_relief_label=label[:128],
+        )
+
+
+def _pos_mem_int(info: dict, key: str) -> int:
+    val = info.get(key)
+    return val if isinstance(val, int) and not isinstance(val, bool) and val >= 0 else 0
+
 
 @dataclass
 class Steward:
@@ -1195,6 +1240,7 @@ class Steward:
     tracker: TrendTracker = field(default_factory=TrendTracker)
     last_forecast: Forecast = field(default_factory=Forecast)
     session_stats: SessionStats = field(default_factory=SessionStats)
+    _session_store_active: bool = field(default=False, repr=False, compare=False)
     # Rotate the reclaim log at 4 MB; two generations are kept.
     max_log_bytes: int = 4 * 1024 * 1024
     # Injectable so a test can walk several passes without waiting.
@@ -1355,16 +1401,36 @@ class Steward:
             mem_used = None
 
         raw_cached = info.get("Cached")
+        raw_free = info.get("MemFree")
         breakdown_valid = False
         cached = anon_and_kernel = None
         if (readings_valid and isinstance(raw_cached, int)
                 and not isinstance(raw_cached, bool)
                 and 0 <= raw_cached <= raw_total):
             breakdown_valid = True
-            # Clamp cache to used memory so the three portions still sum to
-            # MemTotal if Linux's cached estimate overlaps MemAvailable.
-            cached = min(raw_cached, raw_total - raw_available, raw_total)
-            anon_and_kernel = (raw_total - raw_available) - cached
+            if (isinstance(raw_free, int)
+                    and not isinstance(raw_free, bool)
+                    and 0 <= raw_free <= raw_total):
+                # In Linux /proc/meminfo, MemAvailable already includes reclaimable
+                # page cache, so subtracting Cached from (MemTotal - MemAvailable)
+                # double-counted cache and collapsed Apps to 0 B on cache-rich desktops.
+                # Partition MemTotal into physical buckets (procps-ng convention):
+                #   Free  = MemFree
+                #   Cache = max(0, Cached + Buffers + SReclaimable - Shmem)
+                #   Apps  = MemTotal - Free - Cache
+                reclaim_cache = max(
+                    0,
+                    raw_cached
+                    + _pos_mem_int(info, "Buffers")
+                    + _pos_mem_int(info, "SReclaimable")
+                    - _pos_mem_int(info, "Shmem"),
+                )
+                cached = min(reclaim_cache, raw_total - raw_free)
+                anon_and_kernel = (raw_total - raw_free) - cached
+            else:
+                # Fallback when synthetic mocks omit MemFree.
+                cached = min(raw_cached, raw_total - raw_available, raw_total)
+                anon_and_kernel = (raw_total - raw_available) - cached
 
         return {
             "state": state,
@@ -1815,7 +1881,7 @@ class Steward:
         self.actions_today += len(real)
         self.bytes_reclaimed_today += total_freed
         if real:
-            self.session_stats.record(total_freed, label=real[0].label if real else "")
+            self._record_session_stats(total_freed, label=real[0].label if real else "")
         reason = f"state={state}, free={free_percent}%, target={target_free}%"
         if skipped_anon:
             if skipped_anon == "psi-full-thrash":
@@ -1838,6 +1904,106 @@ class Steward:
                       "reason": reason, "state": state})
         return summary
 
+    def _session_stats_paths(self) -> tuple[Path, Path]:
+        sdir = state_dir()
+        return sdir / "session_stats.json", sdir / ".session_stats.lock"
+
+    def _read_session_stats_unlocked(self, path: Path) -> SessionStats | None:
+        raw, err = _read_regular_bytes(path, max_bytes=64 * 1024)
+        if raw is None or err is not None:
+            return None
+        try:
+            return SessionStats.from_dict(json.loads(raw.decode("utf-8")))
+        except (UnicodeDecodeError, ValueError, RecursionError):
+            return None
+
+    def _write_session_stats_unlocked(self, path: Path, stats: SessionStats) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.parent / f".session_stats.json.tmp.{os.getpid()}"
+        tmp.write_text(json.dumps(stats.as_dict(), allow_nan=False), encoding="utf-8")
+        _atomic_replace(tmp, path)
+
+    def _init_session_stats_store(self) -> None:
+        """Reset the shared session_stats store for a new daemon lifetime."""
+        self._session_store_active = True
+        self.session_stats = SessionStats()
+        path, lock_path = self._session_stats_paths()
+        try:
+            with _file_lock(lock_path):
+                self._write_session_stats_unlocked(path, self.session_stats)
+        except OSError:
+            pass
+
+    def _sync_session_stats_from_store(self) -> None:
+        """Pull cumulative session_stats (including manual CLI actions) into memory."""
+        path, lock_path = self._session_stats_paths()
+        if not self._session_store_active and not path.exists():
+            return
+        try:
+            with _file_lock(lock_path):
+                stored = self._read_session_stats_unlocked(path)
+        except OSError:
+            stored = None
+        if stored is not None:
+            self.session_stats = stored
+
+    def _record_session_stats(self, freed: int, label: str = "") -> None:
+        """Record a reclaim action in memory and, when active, in session_stats.json."""
+        self.session_stats.record(freed, label=label)
+        path, lock_path = self._session_stats_paths()
+        if not self._session_store_active and not path.exists():
+            return
+        try:
+            with _file_lock(lock_path):
+                base = self._read_session_stats_unlocked(path)
+                if base is None:
+                    base = SessionStats(started_at=self.session_stats.started_at)
+                base.record(freed, label=label)
+                self._write_session_stats_unlocked(path, base)
+                self.session_stats = base
+        except OSError:
+            pass
+
+    def record_manual_session_stats(self, result: dict, existing_snapshot: dict) -> dict | None:
+        """Merge a manual CLI --relieve/--sweep-cache pass into session_stats.json."""
+        path, lock_path = self._session_stats_paths()
+        existing_ss = SessionStats.from_dict(existing_snapshot.get("session_stats"))
+        acted = bool(result.get("acted")) and int(result.get("freed") or 0) > 0
+        if not acted:
+            if path.exists():
+                try:
+                    with _file_lock(lock_path):
+                        stored = self._read_session_stats_unlocked(path)
+                        if stored is not None:
+                            return stored.as_dict()
+                except OSError:
+                    pass
+            return existing_ss.as_dict() if existing_ss is not None else existing_snapshot.get("session_stats")
+
+        # If session_stats.json already existed when relieve() ran, _record_session_stats()
+        # already incremented it atomically; otherwise seed it from existing state.json now.
+        try:
+            with _file_lock(lock_path):
+                stored = self._read_session_stats_unlocked(path)
+                if stored is not None:
+                    self.session_stats = stored
+                    return stored.as_dict()
+                seed = existing_ss if existing_ss is not None else SessionStats(
+                    started_at=self.session_stats.started_at
+                )
+                actions = result.get("actions") or []
+                first_lbl = ""
+                for a in actions:
+                    if isinstance(a, dict) and (a.get("freed") or 0) > 0:
+                        first_lbl = str(a.get("label") or "")
+                        break
+                seed.record(int(result.get("freed") or 0), label=first_lbl)
+                self._write_session_stats_unlocked(path, seed)
+                self.session_stats = seed
+                return seed.as_dict()
+        except OSError:
+            return self.session_stats.as_dict()
+
     def sweep_cache(self) -> dict:
         """Manual, user-requested cleanup: drop page cache and nothing else.
 
@@ -1854,6 +2020,7 @@ class Steward:
         pass that had refused to move anything.
         """
         self._check_pause()
+        self._sync_session_stats_from_store()
         snap = self.snapshot()
         if self._paused:
             relief = {"acted": False, "reason": "paused", "skipped_anon": ""}
@@ -1943,6 +2110,7 @@ class Steward:
         individually guarded, failures back off, and a broken config reloads
         from disk so an edit takes effect without a restart.
         """
+        self._init_session_stats_store()
         self.log({"event": "start", "pid": os.getpid(), "cgroup": self_cgroup()})
         consecutive_failures = 0
         seen_mtime = None
@@ -2091,6 +2259,7 @@ def _sync_state_after_ctl() -> None:
         existing = published_snapshot(max_age=86400)
         steward = Steward()
         steward._check_pause()
+        steward._sync_session_stats_from_store()
         fresh = steward.snapshot()
         paused_rem = (
             max(0, int(steward._paused_until - time.time()))
@@ -2665,6 +2834,12 @@ def main() -> int:
         result = steward.sweep_cache() if args.sweep_cache else steward.relieve(force=True)
         print(json.dumps(result, default=str))
         existing = published_snapshot(max_age=86400) or {}
+        rec_manual = getattr(steward, "record_manual_session_stats", None)
+        merged_stats = (
+            rec_manual(result, existing)
+            if callable(rec_manual)
+            else existing.get("session_stats")
+        )
         check_pause = getattr(steward, "_check_pause", None)
         if callable(check_pause):
             check_pause()
@@ -2675,13 +2850,16 @@ def main() -> int:
             merged["paused_until"] = getattr(steward, "_paused_until", None)
             merged["paused_remaining_s"] = fresh.get("paused_remaining_s")
             merged["interval_idle"] = fresh.get("interval_idle", existing.get("interval_idle", 20.0))
+            if merged_stats is not None:
+                merged["session_stats"] = merged_stats
             fresh = merged
         else:
-            # Preserve only the live daemon's forecast and session_stats,
+            # Preserve the live daemon's forecast while publishing merged session_stats,
             # never overwriting current pause state with stale values.
-            for key in ("forecast", "session_stats"):
-                if existing.get(key) is not None:
-                    fresh[key] = existing[key]
+            if existing.get("forecast") is not None:
+                fresh["forecast"] = existing["forecast"]
+            if merged_stats is not None:
+                fresh["session_stats"] = merged_stats
         fresh["relief"] = {
             "acted": bool(result.get("acted")),
             "reason": str(result.get("reason") or ""),

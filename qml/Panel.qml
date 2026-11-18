@@ -189,8 +189,8 @@ Panel {
             : (root.keeper && root.keeper.lastResult !== "" ? root.keeper.lastResult : "")
           trailingControl: Component {
             PanelActionButton {
-              // U+F0432 — proven to render in JetBrainsMono Nerd Font.
-              iconText: "󰐲"
+              // U+F0425 (nf-md-power) — power toggle glyph in JetBrainsMono Nerd Font.
+              iconText: "󰐥"
               tooltipText: !root.actionsReady ? "Not connected"
                 : (root.daemonUp ? "Automatic protection is on" : "Automatic protection is off")
               foreground: root.daemonUp ? root.foreground : root.urgentColor
