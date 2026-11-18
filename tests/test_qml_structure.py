@@ -438,6 +438,8 @@ check("Panel shows immediate Protecting…/Releasing… feedback and swap mini-b
       '"Protecting…"' in panel and '"Releasing…"' in panel
       and "pendingProtectKey" in service and "swapBarBg" in panel
       and "sessionImpact" in panel and "Model.barLabel" in panel)
+check("PanelActionButton uses nf-md-power (U+F0425), not nf-md-qrcode (U+F0432)",
+      "\U000f0425" in panel and "\U000f0432" not in panel)
 
 print("\n" + ("QML structure ok" if fails == 0 else "%d check(s) failed" % fails))
 assert fails == 0, f"Test failed: {fails} failures"

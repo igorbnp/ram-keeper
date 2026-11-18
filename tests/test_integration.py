@@ -394,11 +394,14 @@ class TestCliPauseStateContract:
     """Contract tests for --pause/--resume/--protected-*/state.json/paused-by-user."""
 
     @staticmethod
-    def _run_cli(args, cfg_path: Path, st_dir: Path):
+    def _run_cli(args, cfg_path: Path, st_dir: Path, cg_root=None):
         import subprocess
         env = os.environ.copy()
         env["RAM_KEEPER_CONFIG"] = str(cfg_path)
         env["RAM_KEEPER_STATE_DIR"] = str(st_dir)
+        env["RAM_KEEPER_CGROUP_ROOT"] = str(
+            cg_root if cg_root is not None else (st_dir / "empty-cgroup")
+        )
         return subprocess.run(
             [sys.executable, str(PLUGIN / "helper" / "ram_keeper.py"), *args],
             env=env, capture_output=True, text=True, timeout=30,
@@ -588,6 +591,169 @@ class TestCliPauseStateContract:
         data = json.loads(real_cfg.read_text(encoding="utf-8"))
         assert "firefox" in data["never_reclaim"]
         assert data["target_free_percent"] == 22.0
+
+    def test_meminfo_breakdown_keeps_apps_nonzero_when_cached_exceeds_mem_used(self, monkeypatch):
+        """Real Linux /proc/meminfo includes reclaimable cache inside MemAvailable."""
+        steward = rk.Steward(config=dict(rk.DEFAULT_CONFIG))
+        # Real shape measured on Omarchy: MemTotal=7.83GB, MemFree=448MB,
+        # MemAvailable=3.83GB, Cached=4.13GB (> MemTotal - MemAvailable = 4.00GB).
+        monkeypatch.setattr(rk, "meminfo", lambda: {
+            "MemTotal": 8_000_000_000,
+            "MemFree": 450_000_000,
+            "MemAvailable": 3_850_000_000,
+            "Buffers": 28_000,
+            "Cached": 4_150_000_000,
+            "Shmem": 400_000_000,
+            "SReclaimable": 250_000_000,
+        })
+        monkeypatch.setattr(rk, "psi", lambda resource="memory": {
+            "available": True, "some_avg10": 0.0, "some_avg60": 0.0,
+            "some_avg300": 0.0, "full_avg10": 0.0, "full_avg60": 0.0, "full_avg300": 0.0,
+        })
+        monkeypatch.setattr(rk, "zram_stats", lambda: {"devices": [], "used": 0, "size": 0})
+        monkeypatch.setattr(rk, "user_root", lambda: Path("/nonexistent-cgroup"))
+
+        snap = steward.snapshot()
+        assert snap["memory_breakdown_valid"] is True
+        expected_cache = 4_150_000_000 + 28_000 + 250_000_000 - 400_000_000
+        expected_apps = 8_000_000_000 - 450_000_000 - expected_cache
+        assert snap["cached"] == expected_cache
+        assert snap["anon_and_kernel"] == expected_apps
+        assert snap["anon_and_kernel"] > 3_000_000_000
+        assert snap["anon_and_kernel"] + snap["cached"] + 450_000_000 == 8_000_000_000
+
+    def test_protected_cli_syncs_live_cgroup_tree_via_env_root(self, tmp_path):
+        """When RAM_KEEPER_CGROUP_ROOT has live user cgroups, --protected-add updates them."""
+        if not hasattr(os, "getuid"):
+            pytest.skip("POSIX uid required for user-$UID.slice layout")
+        cfg_path = tmp_path / "cfg" / "config.json"
+        st_dir = tmp_path / "state"
+        st_dir.mkdir()
+        cg_root = tmp_path / "cgroup"
+        app_cg = cg_root / "user.slice" / f"user-{os.getuid()}.slice" / "app-org.mozilla.firefox-999.scope"
+        app_cg.mkdir(parents=True)
+        (app_cg / "memory.current").write_text(str(500 * 1024 * 1024) + "\n", encoding="utf-8")
+        (app_cg / "memory.stat").write_text(
+            f"anon {300 * 1024 * 1024}\nfile {200 * 1024 * 1024}\ninactive_file {150 * 1024 * 1024}\n",
+            encoding="utf-8",
+        )
+        (app_cg / "memory.swap.current").write_text("0\n", encoding="utf-8")
+        (app_cg / "cgroup.procs").write_text("999\n", encoding="utf-8")
+
+        r_once = self._run_cli(["--once"], cfg_path, st_dir, cg_root=cg_root)
+        assert r_once.returncode == 0, r_once.stderr
+        (st_dir / "state.json").write_text(r_once.stdout, encoding="utf-8")
+
+        r_add = self._run_cli(["--protected-add", "firefox"], cfg_path, st_dir, cg_root=cg_root)
+        assert r_add.returncode == 0, r_add.stderr
+        st_add = json.loads((st_dir / "state.json").read_text(encoding="utf-8"))
+        ff = [g for g in st_add["groups"] if "firefox" in g["name"]]
+        assert len(ff) == 1 and ff[0]["protected"] is True
+
+    def test_manual_sweep_and_relieve_persist_session_stats_across_daemon_passes(self, tmp_path, monkeypatch):
+        """Manual CLI --sweep-cache increments session_stats and survives daemon supervise_once()."""
+        cfg_path = tmp_path / "cfg" / "config.json"
+        st_dir = tmp_path / "state"
+        st_dir.mkdir()
+        monkeypatch.setenv("RAM_KEEPER_CONFIG", str(cfg_path))
+        monkeypatch.setenv("RAM_KEEPER_STATE_DIR", str(st_dir))
+
+        cg_root = tmp_path / "cgroup"
+        uid_part = f"user-{os.getuid()}.slice" if hasattr(os, "getuid") else "user-nonposix.slice"
+        app_cg = cg_root / "user.slice" / uid_part / "app-heavy-cache-100.scope"
+        app_cg.mkdir(parents=True)
+        cur_file = app_cg / "memory.current"
+        stat_file = app_cg / "memory.stat"
+        reclaim_file = app_cg / "memory.reclaim"
+        cur_file.write_text(str(600 * 1024 * 1024) + "\n", encoding="utf-8")
+        stat_file.write_text(
+            f"anon {200 * 1024 * 1024}\nfile {400 * 1024 * 1024}\ninactive_file {300 * 1024 * 1024}\n",
+            encoding="utf-8",
+        )
+        (app_cg / "memory.swap.current").write_text("0\n", encoding="utf-8")
+        (app_cg / "cgroup.procs").write_text("100\n", encoding="utf-8")
+        reclaim_file.write_text("", encoding="utf-8")
+
+        monkeypatch.setattr(rk, "CGROOT", cg_root)
+        monkeypatch.setattr(rk, "meminfo", lambda: {
+            "MemTotal": 8_000_000_000, "MemFree": 1_000_000_000,
+            "MemAvailable": 4_000_000_000, "Cached": 3_000_000_000,
+        })
+        monkeypatch.setattr(rk, "psi", lambda resource="memory": {
+            "available": True, "some_avg10": 0.0, "some_avg60": 0.0,
+            "some_avg300": 0.0, "full_avg10": 0.0, "full_avg60": 0.0, "full_avg300": 0.0,
+        })
+        monkeypatch.setattr(rk, "zram_stats", lambda: {"devices": [], "used": 0, "size": 0})
+
+        # 1. Live daemon starts and publishes initial calm snapshot (actions=0).
+        daemon = rk.Steward(config=dict(rk.DEFAULT_CONFIG))
+        daemon._init_session_stats_store()
+        snap0 = daemon.supervise_once()
+        assert snap0["session_stats"]["actions"] == 0
+
+        # 2. Separate process (simulating Panel 'Drop cache' CLI call) frees 120 MB of cache.
+        def fake_reclaim_from(self_st, group, amount, cache_only=False):
+            freed = 120 * 1024 * 1024
+            return rk.Action(
+                label=group.label, requested=amount,
+                freed=freed, swapped_out=0, outcome="ok", cgroup_freed=freed,
+            )
+        monkeypatch.setattr(rk.Steward, "reclaim_from", fake_reclaim_from)
+        monkeypatch.setattr(sys, "argv", ["ram_keeper.py", "--sweep-cache"])
+        assert rk.main() == 0
+
+        st_after_cli = json.loads((st_dir / "state.json").read_text(encoding="utf-8"))
+        assert st_after_cli["session_stats"]["actions"] == 1
+        assert st_after_cli["session_stats"]["bytes_freed"] == 120 * 1024 * 1024
+
+        # 3. Daemon wakes on its next tick and MUST keep the manual session_stats!
+        snap1 = daemon.supervise_once()
+        assert snap1["session_stats"]["actions"] == 1
+        assert snap1["session_stats"]["bytes_freed"] == 120 * 1024 * 1024
+
+        # 4. Corrupt / hostile session_stats.json or 400-digit ints are safely rejected
+        #    WITHOUT losing accumulated stats on subsequent daemon or CLI reclaims!
+        huge_int = int("1" + "0" * 400)
+        for bad in (None, [], "x", {"started_at": True}, {"started_at": -1},
+                    {"started_at": huge_int, "actions": 1},
+                    {"started_at": 100.0, "actions": huge_int},
+                    {"started_at": 100.0, "bytes_freed": huge_int},
+                    {"started_at": 100.0, "last_relief_bytes": huge_int},
+                    {"started_at": 100.0, "last_relief_ts": huge_int},
+                    {"started_at": 100.0, "actions": -5}, {"started_at": 100.0, "bytes_freed": float("nan")},
+                    {"started_at": 100.0, "last_relief_ts": float("inf")}):
+            assert rk.SessionStats.from_dict(bad) is None
+
+        # Corrupt session_stats.json followed by daemon reclaim preserves in-memory history (1 -> 2).
+        (st_dir / "session_stats.json").write_text("{corrupt", encoding="utf-8")
+        daemon._record_session_stats(50 * 1024 * 1024, label="App")
+        assert daemon.session_stats.actions == 2
+        assert daemon.session_stats.bytes_freed == 170 * 1024 * 1024
+
+        # Corrupt session_stats.json followed by manual CLI reclaim recovers from state.json (2 -> 3).
+        daemon.supervise_once()
+        (st_dir / "session_stats.json").write_text("{corrupt", encoding="utf-8")
+        monkeypatch.setattr(sys, "argv", ["ram_keeper.py", "--sweep-cache"])
+        assert rk.main() == 0
+        st_recovered = json.loads((st_dir / "state.json").read_text(encoding="utf-8"))
+        assert st_recovered["session_stats"]["actions"] == 3
+        assert st_recovered["session_stats"]["bytes_freed"] == 290 * 1024 * 1024
+
+        # Sync daemon to actions=3, then test 400-digit int in session_stats.json.
+        daemon.supervise_once()
+        assert daemon.session_stats.actions == 3
+        (st_dir / "session_stats.json").write_text(
+            '{"started_at": ' + ("1" + "0" * 400) + ', "actions": 1}', encoding="utf-8"
+        )
+        r_pause = self._run_cli(["--pause", "10"], cfg_path, st_dir, cg_root=cg_root)
+        assert r_pause.returncode == 0, r_pause.stderr
+
+        # Fresh session_stats.json wins over stale state.json during _sync_state_after_ctl().
+        daemon._record_session_stats(10 * 1024 * 1024, label="App")  # store now has actions=4
+        r_resume = self._run_cli(["--resume"], cfg_path, st_dir, cg_root=cg_root)
+        assert r_resume.returncode == 0, r_resume.stderr
+        st_synced = json.loads((st_dir / "state.json").read_text(encoding="utf-8"))
+        assert st_synced["session_stats"]["actions"] == 4
 
 
 install_unittest_bridge(globals())
