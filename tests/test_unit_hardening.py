@@ -483,6 +483,14 @@ def test_ci_portability_and_process_guardian_retirement():
     assert "psi_full_abort_percent" in cfg_doc
 
 
+def test_shell_scripts_avoid_sc2013_for_cat_antipattern():
+    """Regression SC2013: shellcheck rejects `for x in $(cat ...)` in ci-suite.sh."""
+    sc2013 = re.compile(r"(?m)^\s*for\s+\w+\s+in\s+\$\(\s*cat\b")
+    for rel in ("install.sh", "helper/ram_keeper_notify"):
+        content = (PLUGIN / rel).read_text(encoding="utf-8")
+        assert not sc2013.search(content), f"SC2013 anti-pattern in {rel}"
+
+
 def test_real_pytest_does_not_collect_unittest_bridge():
     """Regression SO-1: when real pytest is imported, no TestCase runs parametrized/live funcs."""
     fake_pytest = types.ModuleType("pytest")

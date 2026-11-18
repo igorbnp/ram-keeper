@@ -540,11 +540,15 @@ watch_pressure() {
 # ---------------------------------------------------------------------------
 _kill_tree() {
   local target="$1" child
+  local -a children=()
   [[ -n "$target" ]] || return 0
   if [[ -r "/proc/$target/task/$target/children" ]]; then
-    for child in $(cat "/proc/$target/task/$target/children" 2>/dev/null); do
-      _kill_tree "$child"
-    done
+    read -r -a children <"/proc/$target/task/$target/children" 2>/dev/null || true
+    if (( ${#children[@]} > 0 )); then
+      for child in "${children[@]}"; do
+        [[ -n "$child" ]] && _kill_tree "$child"
+      done
+    fi
   elif command -v ps >/dev/null 2>&1; then
     for child in $(ps -o pid= --ppid "$target" 2>/dev/null); do
       _kill_tree "$child"
