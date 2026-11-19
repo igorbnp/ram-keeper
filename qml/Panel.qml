@@ -248,7 +248,7 @@ Panel {
 
                 Rectangle {
                   required property var modelData
-                  width: (strip.width - 2) * modelData.fraction
+                  width: strip.width * modelData.fraction
                   height: strip.height
                   color: modelData.tone === "apps"
                     ? root.accentColor
@@ -639,13 +639,13 @@ Panel {
         PanelSectionHeader {
           width: parent.width
           visible: root.loaded && !Model.isUnknown(root.state)
-            && Model.protectedGroups(root.snap, 4).length > 0
+            && Model.protectedGroups(root.snap).length > 0
           text: "NEVER RECLAIMED"
           foreground: root.foreground
         }
 
         Repeater {
-          model: root.loaded && !Model.isUnknown(root.state) ? Model.protectedGroups(root.snap, 4) : []
+          model: root.loaded && !Model.isUnknown(root.state) ? Model.protectedGroups(root.snap) : []
 
           Item {
             required property var modelData

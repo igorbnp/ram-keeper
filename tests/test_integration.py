@@ -755,5 +755,116 @@ class TestCliPauseStateContract:
         st_synced = json.loads((st_dir / "state.json").read_text(encoding="utf-8"))
         assert st_synced["session_stats"]["actions"] == 4
 
+    def test_protected_cli_refuses_corrupt_config_without_wiping_it(self, tmp_path):
+        """B2: syntax error in config.json must never be silently overwritten."""
+        cfg_path = tmp_path / "config.json"
+        st_dir = tmp_path / "state"
+        st_dir.mkdir()
+        broken = '{\n  "target_free_percent": 25.0,\n  "protected": ["my-db"],\n}\n'
+        cfg_path.write_text(broken, encoding="utf-8")
+
+        r_add = self._run_cli(["--protected-add", "firefox"], cfg_path, st_dir)
+        assert r_add.returncode == 2
+        assert "invalid" in r_add.stderr.lower()
+        assert cfg_path.read_text(encoding="utf-8") == broken
+
+        r_rem = self._run_cli(["--protected-remove", "ollama"], cfg_path, st_dir)
+        assert r_rem.returncode == 2
+        assert cfg_path.read_text(encoding="utf-8") == broken
+
+    def test_sweep_cache_and_relieve_do_not_forge_daemon_heartbeat(self, tmp_path):
+        """B3: manual CLI actions must preserve existing checked_at (or 0 when absent)."""
+        cfg_path = tmp_path / "config.json"
+        cfg_path.write_text("{}\n", encoding="utf-8")
+        st_dir = tmp_path / "state"
+        st_dir.mkdir()
+
+        # Case 1: daemon dead for 2 hours -> checked_at stays old, doctor flags stale
+        old_ts = time.time() - 7200
+        (st_dir / "state.json").write_text(json.dumps({
+            "state": "ok", "mem_total": 8_000_000_000, "mem_available": 4_000_000_000,
+            "free_percent": 50.0, "checked_at": old_ts, "groups": [],
+        }), encoding="utf-8")
+        r = self._run_cli(["--sweep-cache"], cfg_path, st_dir)
+        assert r.returncode == 0, r.stderr
+        st = json.loads((st_dir / "state.json").read_text(encoding="utf-8"))
+        assert abs(st["checked_at"] - old_ts) < 1.0
+
+        r_doc = self._run_cli(["--doctor", "--json"], cfg_path, st_dir)
+        doc = json.loads(r_doc.stdout)
+        sf = next(c for c in doc["checks"] if c["name"] == "state_freshness")
+        assert sf["ok"] is False
+
+        # Case 2: no prior state.json -> checked_at is 0 (no spoofed heartbeat)
+        (st_dir / "state.json").unlink()
+        r2 = self._run_cli(["--sweep-cache"], cfg_path, st_dir)
+        assert r2.returncode == 0, r2.stderr
+        if (st_dir / "state.json").exists():
+            st2 = json.loads((st_dir / "state.json").read_text(encoding="utf-8"))
+            assert st2["checked_at"] == 0
+
+    def test_resume_handles_oserror_without_traceback(self, tmp_path):
+        """D4: --resume reports OSError cleanly with rc=1, matching --pause."""
+        blocker = tmp_path / "not-a-dir"
+        blocker.write_text("file", encoding="utf-8")
+        r = self._run_cli(["--resume"], tmp_path / "cfg.json", blocker / "sub")
+        assert r.returncode == 1
+        assert "Traceback" not in r.stderr
+        assert "ram-keeper:" in r.stderr
+
+    def test_history_survives_null_and_malformed_reclaim_entries(self, tmp_path):
+        """D5: --history must not crash on null freed/swapped_out/actions."""
+        st_dir = tmp_path / "state"
+        st_dir.mkdir()
+        (st_dir / "log.jsonl").write_text("\n".join([
+            json.dumps({"event": "reclaim", "freed": None, "swapped_out": None,
+                        "actions": None, "ts": None, "reason": None}),
+            json.dumps({"event": "reclaim", "freed": 10 * 1024 * 1024, "swapped_out": "bad",
+                        "actions": ["bad", {"label": "app", "freed": None}], "ts": 1700000000}),
+        ]) + "\n", encoding="utf-8")
+        r = self._run_cli(["--history", "5"], tmp_path / "cfg.json", st_dir)
+        assert r.returncode == 0, r.stderr
+        assert "Traceback" not in r.stderr
+        assert "10.0 MB" in r.stdout
+
+    def test_doctor_scales_freshness_with_interval_idle_and_allows_small_skew(self, tmp_path):
+        """D6: interval_idle=300s with 150s age and -0.2s NTP skew are both healthy."""
+        cfg_path = tmp_path / "config.json"
+        cfg_path.write_text(json.dumps({"interval_idle": 300.0}), encoding="utf-8")
+        st_dir = tmp_path / "state"
+        st_dir.mkdir()
+        sf_path = st_dir / "state.json"
+
+        sf_path.write_text(json.dumps({
+            "state": "ok", "mem_total": 8_000_000_000, "checked_at": time.time() - 150.0,
+        }), encoding="utf-8")
+        r1 = self._run_cli(["--doctor", "--json"], cfg_path, st_dir)
+        chk1 = next(c for c in json.loads(r1.stdout)["checks"] if c["name"] == "state_freshness")
+        assert chk1["ok"] is True, chk1
+
+        sf_path.write_text(json.dumps({
+            "state": "ok", "mem_total": 8_000_000_000, "checked_at": time.time() + 0.2,
+        }), encoding="utf-8")
+        r2 = self._run_cli(["--doctor", "--json"], cfg_path, st_dir)
+        chk2 = next(c for c in json.loads(r2.stdout)["checks"] if c["name"] == "state_freshness")
+        assert chk2["ok"] is True, chk2
+
+    def test_swap_history_pruned_after_cooldown_expires(self):
+        """D8: expired _swap_history entries are pruned alongside _anon_ready_at."""
+        now_t = [1000.0]
+        steward = rk.Steward(config=dict(rk.DEFAULT_CONFIG), _clock=lambda: now_t[0])
+        steward._swap_history["app-old-1.scope"] = (2, 1120.0)
+        steward._swap_history["app-active-2.scope"] = (1, 6000.0)
+        steward._anon_ready_at["app-old-1.scope"] = 1120.0
+        now_t[0] = 5000.0
+        steward.relieve(snapshot={
+            "state": "tight", "free_percent": 15.0, "mem_total": 8 * 1024**3,
+            "mem_available": int(1.2 * 1024**3), "groups": [],
+            "zram": {"devices": []}, "psi": {"available": False},
+        })
+        assert "app-old-1.scope" not in steward._swap_history
+        assert "app-old-1.scope" not in steward._anon_ready_at
+        assert "app-active-2.scope" in steward._swap_history
+
 
 install_unittest_bridge(globals())

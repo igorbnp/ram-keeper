@@ -104,7 +104,7 @@ by its last component. So all of these are the same setting:
 | `chromium` | `app-org.chromium.Chromium-991.scope` |
 | `syncthing` | `syncthing.service` |
 | `localsearch-3` | `localsearch-3.service` |
-| `app-Foo-2.scope` | that exact instance only |
+| `app-Foo-2.scope` | `Foo` across restarts (the trailing instance ID is stripped by alias matching) |
 
 Hyphens are never split, so protecting `syncthing` cannot accidentally protect
 `syncthing-server`. The compositor, the session scope, the shell, the user

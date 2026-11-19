@@ -338,6 +338,12 @@ def test_units_restrict_network():
     assert "IPAddressDeny=any" not in notify_lines
     assert "RestrictAddressFamilies=AF_UNIX" in daemon_lines
     assert not any(ln.startswith("RestrictAddressFamilies=") for ln in notify_lines)
+    # D7: --user units must not order against PID-1 system units and must rejoin graphical-session.target
+    assert not any("systemd-user-sessions.service" in ln for ln in daemon_lines)
+    assert not any("systemd-zram-setup@zram0.service" in ln for ln in daemon_lines)
+    assert any(ln.startswith("WantedBy=") and "graphical-session.target" in ln for ln in daemon_lines)
+    # D1: notifier MemoryHigh gives realistic headroom for journalctl mmap
+    assert "MemoryHigh=96M" in notify_lines
 
 
 def test_quote_path_escapes_a_dollar():
@@ -470,6 +476,7 @@ def test_ci_portability_and_process_guardian_retirement():
     run_all = (PLUGIN / "tests" / "run-all.sh").read_text(encoding="utf-8")
     assert "test_config_isolation.py" in run_all
     assert "printf '{}\\n'" in run_all
+    assert "-m unittest" in run_all
 
     installer = (PLUGIN / "install.sh").read_text(encoding="utf-8")
     assert 'STATE_DIR="${RAM_KEEPER_STATE_DIR:-$HOME/.local/state/ram-keeper}"' in installer

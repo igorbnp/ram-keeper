@@ -594,8 +594,8 @@ function sessionImpactRow(snapshot, nowSeconds) {
   var lastLabel = "";
   var lastTs = safeNonNeg(ss.last_relief_ts);
   var nowSec = Number(nowSeconds);
-  if (lastTs > 0 && isFinite(nowSec) && nowSec >= lastTs) {
-    var ago = nowSec - lastTs;
+  if (lastTs > 0 && isFinite(nowSec) && nowSec >= lastTs - 15) {
+    var ago = Math.max(0, nowSec - lastTs);
     var agoStr = ago < 90 ? Math.max(1, Math.round(ago)) + "s ago"
       : ago < 5400 ? Math.round(ago / 60) + " min ago"
       : (ago / 3600).toFixed(1) + " h ago";

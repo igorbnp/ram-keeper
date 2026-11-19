@@ -28,6 +28,7 @@ if [[ -z "${RAM_KEEPER_STATE_DIR:-}" ]]; then
   export RAM_KEEPER_STATE_DIR="$_own_state"
 fi
 fails=0
+skipped=0
 test_out="$(mktemp "${TMPDIR:-/tmp}/ram-keeper-test.XXXXXX")"
 trap 'rm -f "$test_out" ${_own_cfg:+"$_own_cfg"}; [[ -n "$_own_state" ]] && rm -rf "$_own_state"' EXIT
 
@@ -67,10 +68,13 @@ run "qml structure"      "$PY" test_qml_structure.py
 
 echo
 echo "node tests (panel data shaping):"
-command -v node >/dev/null && {
+if command -v node >/dev/null; then
   run "model + forecast" node test_model.js
   run "unknown state"     node test_unknown_ui.js
-} || echo "  node not installed — skipping the JS tests"
+else
+  echo "  --   SKIP: node not installed — skipping the JS tests"
+  skipped=$((skipped + 1))
+fi
 
 echo
 echo "python tests (daemon logic and hostile input):"
@@ -91,12 +95,11 @@ echo "notifier (real script, stub binaries, throwaway HOME):"
 run "notifier e2e"       bash test_notifier_e2e.sh
 
 echo
-echo "unit-test suites (pytest):"
-# These are the biggest suites in the repo and they were previously not part of
-# this runner at all — `run-all.sh` reported "all suites passed" while 200+
-# tests in test_ram_keeper_core.py, test_integration.py and the rest had never
-# been executed. pytest is an optional tool on a desktop, so report SKIP with
-# the one command that fixes it rather than pretending to pass.
+echo "unit-test suites (pytest or unittest fallback):"
+# These are the biggest suites in the repo (270+ tests). Prefer pytest when
+# available, and fall back to stdlib `unittest` via tests/_pytest_shim.py so a
+# desktop without pytest still executes every unit test instead of silently
+# skipping them.
 PYTEST_PY=""
 for candidate in "$PY" /usr/bin/python3 python3; do
   if command -v "$candidate" >/dev/null 2>&1 \
@@ -105,20 +108,31 @@ for candidate in "$PY" /usr/bin/python3 python3; do
     break
   fi
 done
+UNIT_MODULES=(
+  test_ram_keeper_core.py
+  test_integration.py
+  test_bugfixes.py
+  test_reclaim_policy.py
+  test_config_attacks.py
+  test_unit_hardening.py
+  test_config_isolation.py
+)
 if [[ -n "$PYTEST_PY" ]]; then
   run "pytest (core, policy, attacks)" \
-    "$PYTEST_PY" -m pytest -q -p no:cacheprovider \
-      test_ram_keeper_core.py test_integration.py \
-      test_bugfixes.py test_reclaim_policy.py test_config_attacks.py \
-      test_unit_hardening.py test_config_isolation.py
+    "$PYTEST_PY" -m pytest -q -p no:cacheprovider "${UNIT_MODULES[@]}"
 else
-  echo "  --   SKIP: pytest not installed for this python."
-  echo "       install with: python3 -m pip install --user pytest   (see requirements.txt)"
+  run "unittest fallback (core, policy, attacks)" \
+    "$PY" -m unittest \
+      test_ram_keeper_core test_integration test_bugfixes \
+      test_reclaim_policy test_config_attacks test_unit_hardening \
+      test_config_isolation
 fi
 
 echo
-if (( fails == 0 )); then
+if (( fails == 0 && skipped == 0 )); then
   echo "all suites passed"
+elif (( fails == 0 )); then
+  echo "executed suites passed ($skipped skipped)"
 else
   echo "$fails suite(s) failed"
 fi
