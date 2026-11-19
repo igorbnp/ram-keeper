@@ -772,6 +772,23 @@ class TestCliPauseStateContract:
         assert r_rem.returncode == 2
         assert cfg_path.read_text(encoding="utf-8") == broken
 
+        # Broken symlink must be refused without materializing target directories/files
+        broken_dir = tmp_path / "broken-target-dir"
+        broken_target = broken_dir / "nonexistent.json"
+        link_cfg = tmp_path / "broken-link.json"
+        try:
+            link_cfg.symlink_to(broken_target)
+        except OSError as exc:
+            if os.name == "nt" and getattr(exc, "winerror", None) == 1314:
+                return
+            raise
+        for flag in (["--protected-add", "firefox"], ["--protected-remove", "ollama"]):
+            r_lnk = self._run_cli(flag, link_cfg, st_dir)
+            assert r_lnk.returncode == 2
+            assert link_cfg.is_symlink()
+            assert not broken_target.exists()
+            assert not broken_dir.exists()
+
     def test_sweep_cache_and_relieve_do_not_forge_daemon_heartbeat(self, tmp_path):
         """B3: manual CLI actions must preserve existing checked_at (or 0 when absent)."""
         cfg_path = tmp_path / "config.json"
@@ -848,6 +865,13 @@ class TestCliPauseStateContract:
         r2 = self._run_cli(["--doctor", "--json"], cfg_path, st_dir)
         chk2 = next(c for c in json.loads(r2.stdout)["checks"] if c["name"] == "state_freshness")
         assert chk2["ok"] is True, chk2
+
+        # Corrupt JSON or non-object root must NOT pass as fresh even with recent mtime
+        for bad_state in ("{broken", "[]", "null"):
+            sf_path.write_text(bad_state, encoding="utf-8")
+            r_bad = self._run_cli(["--doctor", "--json"], cfg_path, st_dir)
+            chk_bad = next(c for c in json.loads(r_bad.stdout)["checks"] if c["name"] == "state_freshness")
+            assert chk_bad["ok"] is False, (bad_state, chk_bad)
 
     def test_swap_history_pruned_after_cooldown_expires(self):
         """D8: expired _swap_history entries are pruned alongside _anon_ready_at."""

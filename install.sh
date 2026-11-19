@@ -118,11 +118,15 @@ p = sys.argv[1]
 try:
     st = os.stat(p)
     d = json.loads(open(p, encoding="utf-8").read(1048576))
-    idle = d.get("interval_idle", 20.0) if isinstance(d, dict) else 20.0
+    if not isinstance(d, dict):
+        print("ERR 180")
+        raise SystemExit(0)
+    idle = d.get("interval_idle", 20.0)
     if isinstance(idle, bool) or not isinstance(idle, (int, float)) or not math.isfinite(idle) or idle <= 0:
         idle = 20.0
-    lim = int(max(180.0, float(idle) * 3.0))
-    cb = d.get("checked_at") if isinstance(d, dict) and "checked_at" in d else st.st_mtime
+    idle = min(3600.0, float(idle))
+    lim = int(max(180.0, idle * 3.0))
+    cb = d.get("checked_at") if "checked_at" in d else st.st_mtime
     if isinstance(cb, bool) or not isinstance(cb, (int, float)) or not math.isfinite(cb) or cb <= 0:
         print(f"NOHB {lim}")
     else:

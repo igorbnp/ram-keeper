@@ -2367,6 +2367,10 @@ def add_never_reclaim(name: str) -> list[str]:
     path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = path.parent / f".{path.name}.lock"
     with _file_lock(lock_path):
+        if path.is_symlink() and not path.exists():
+            raise ValueError(
+                "config.json is a broken symlink; fix it before changing protection"
+            )
         target = path.resolve() if path.is_symlink() else path
         target.parent.mkdir(parents=True, exist_ok=True)
 
@@ -2442,6 +2446,10 @@ def remove_protection(name: str) -> list[str]:
     path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = path.parent / f".{path.name}.lock"
     with _file_lock(lock_path):
+        if path.is_symlink() and not path.exists():
+            raise ValueError(
+                "config.json is a broken symlink; fix it before changing protection"
+            )
         target = path.resolve() if path.is_symlink() else path
         target.parent.mkdir(parents=True, exist_ok=True)
 
@@ -2674,30 +2682,38 @@ def doctor(as_json: bool = False) -> tuple[int, str]:
     try:
         st = state_path.stat()
         if stat.S_ISREG(st.st_mode):
-            ref_ts: float | None = st.st_mtime
             raw_st, err_st = _read_regular_bytes(state_path, max_bytes=10 * 1024 * 1024)
-            if raw_st is not None and err_st is None:
+            if raw_st is None or err_st is not None:
+                state_detail = f"unreadable ({err_st})"
+            else:
                 try:
                     parsed_st = json.loads(raw_st.decode("utf-8"))
-                    if isinstance(parsed_st, dict) and "checked_at" in parsed_st:
+                except (UnicodeDecodeError, ValueError, RecursionError):
+                    parsed_st = _UNSET
+                if parsed_st is _UNSET:
+                    state_detail = "corrupt JSON"
+                elif not isinstance(parsed_st, dict):
+                    state_detail = "invalid JSON root"
+                else:
+                    ref_ts: float | None = st.st_mtime
+                    if "checked_at" in parsed_st:
                         cb = parsed_st.get("checked_at")
                         if (isinstance(cb, (int, float))
                                 and not isinstance(cb, bool)
-                                and math.isfinite(cb)):
-                            ref_ts = float(cb) if cb > 0 else None
+                                and math.isfinite(cb)
+                                and cb > 0):
+                            ref_ts = float(cb)
                         else:
                             ref_ts = None
-                except (UnicodeDecodeError, ValueError, RecursionError):
-                    pass
-            if ref_ts is None:
-                state_detail = "stale (no daemon heartbeat)"
-            else:
-                age = time.time() - ref_ts
-                if -60.0 <= age <= max_state_age:
-                    state_ok = True
-                    state_detail = f"age={max(0.0, age):.0f}s"
-                else:
-                    state_detail = f"stale (age={age:.0f}s)"
+                    if ref_ts is None:
+                        state_detail = "stale (no daemon heartbeat)"
+                    else:
+                        age = time.time() - ref_ts
+                        if -60.0 <= age <= max_state_age:
+                            state_ok = True
+                            state_detail = f"age={max(0.0, age):.0f}s"
+                        else:
+                            state_detail = f"stale (age={age:.0f}s)"
         else:
             state_detail = "not a regular file"
     except OSError:

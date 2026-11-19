@@ -507,7 +507,7 @@ except Exception:
     raise SystemExit(1)
 if not isinstance(d, dict):
     raise SystemExit(1)
-if "checked_at" in d and d.get("checked_at") is not None:
+if "checked_at" in d:
     cb = d.get("checked_at")
     if isinstance(cb, bool) or not isinstance(cb, (int, float)) or not math.isfinite(cb) or cb <= 0:
         raise SystemExit(1)

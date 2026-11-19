@@ -445,6 +445,9 @@ check "stale critical snapshot produced 0 toasts" "$(toast_count)" "0"
 printf '{"state":"critical\\t99","free_percent":4.0}\n' >"$CASE/.local/state/ram-keeper/state.json"
 sleep 3
 check "tab-injected state did not match critical or shift columns" "$(toast_count)" "0"
+printf '{"state":"critical","free_percent":4.0,"checked_at":null}\n' >"$CASE/.local/state/ram-keeper/state.json"
+sleep 3
+check "null checked_at produced 0 toasts" "$(toast_count)" "0"
 stop_pid "$P"
 unset RAM_KEEPER_DAEMON_POLL RAM_KEEPER_PRESSURE_POLL
 
