@@ -110,12 +110,47 @@ if [[ "${1:-}" == "--check" ]]; then
   fi
 
   if [[ -f "$STATE_DIR/state.json" ]]; then
-    age=$(( $(date +%s) - $(stat -c %Y "$STATE_DIR/state.json" 2>/dev/null || echo 0) ))
-    if (( age <= 180 )); then
-      check_ok "state.json is fresh (${age}s old)"
+    max_age=180
+    if [[ -n "$CHECK_PY" ]]; then
+      fresh_info="$("$CHECK_PY" -c '
+import json, math, os, sys, time
+p = sys.argv[1]
+try:
+    st = os.stat(p)
+    d = json.loads(open(p, encoding="utf-8").read(1048576))
+    if not isinstance(d, dict):
+        print("ERR 180")
+        raise SystemExit(0)
+    idle = d.get("interval_idle", 20.0)
+    if isinstance(idle, bool) or not isinstance(idle, (int, float)) or not math.isfinite(idle) or idle <= 0:
+        idle = 20.0
+    idle = min(3600.0, float(idle))
+    lim = int(max(180.0, idle * 3.0))
+    cb = d.get("checked_at") if "checked_at" in d else st.st_mtime
+    if isinstance(cb, bool) or not isinstance(cb, (int, float)) or not math.isfinite(cb) or cb <= 0:
+        print(f"NOHB {lim}")
+    else:
+        age = int(time.time() - float(cb))
+        print(f"{age} {lim}")
+except Exception:
+    print("ERR 180")
+' "$STATE_DIR/state.json" 2>/dev/null || echo "ERR 180")"
+      read -r age max_age <<<"$fresh_info"
     else
-      check_warn "state.json is stale (${age}s old)"
+      age=$(( $(date +%s) - $(stat -c %Y "$STATE_DIR/state.json" 2>/dev/null || echo 0) ))
     fi
+    if [[ "$age" == "NOHB" ]]; then
+      check_warn "state.json has no daemon heartbeat"
+    elif [[ "$age" == "ERR" ]]; then
+      check_warn "state.json could not be parsed"
+    elif (( age >= -60 && age <= max_age )); then
+      disp_age=$(( age < 0 ? 0 : age ))
+      check_ok "state.json is fresh (${disp_age}s old)"
+    else
+      check_warn "state.json is stale (${age}s old, limit ${max_age}s)"
+    fi
+  else
+    check_warn "state.json missing: $STATE_DIR/state.json"
   fi
 
   # 5. Kernel / Omarchy environment & AI diagnosis skill.
@@ -275,7 +310,16 @@ fi
 
 if [[ -e /sys/block/zram0 ]]; then
   ZRAM_PRIO="$(awk '$1=="/dev/zram0"{print $5}' /proc/swaps 2>/dev/null || true)"
-  [[ -n "$ZRAM_PRIO" ]] && ok "zram swap priority: $ZRAM_PRIO (higher than disk = correct)"
+  DISK_MAX_PRIO="$(awk 'NR>1 && $1!~/^\/dev\/zram/{if(!seen || $5>max){max=$5; seen=1}} END{if(seen) print max}' /proc/swaps 2>/dev/null || true)"
+  if [[ -n "$ZRAM_PRIO" ]]; then
+    if [[ -z "$DISK_MAX_PRIO" ]]; then
+      ok "zram swap priority: $ZRAM_PRIO (no disk swap configured)"
+    elif (( ZRAM_PRIO > DISK_MAX_PRIO )); then
+      ok "zram swap priority: $ZRAM_PRIO (higher than disk $DISK_MAX_PRIO = correct)"
+    else
+      warn "zram swap priority ($ZRAM_PRIO) is NOT higher than disk swap ($DISK_MAX_PRIO) — anon pages may spill to disk"
+    fi
+  fi
 fi
 
 if systemctl is-active --quiet systemd-oomd; then

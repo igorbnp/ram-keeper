@@ -34,6 +34,13 @@ Item {
   readonly property string helperPath: decodeURIComponent(
     String(Qt.resolvedUrl("../helper/ram_keeper.py")).replace(/^file:\/\//, ""))
 
+  // Honour RAM_KEEPER_PYTHON just like install.sh and the notifier do, so a
+  // custom Python >= 3.9 interpreter works in manual actions too.
+  readonly property string pythonBin: {
+    var custom = String(Quickshell.env("RAM_KEEPER_PYTHON") || "").trim()
+    return custom !== "" ? custom : "python3"
+  }
+
   readonly property string unitName: "ram-keeper.service"
 
   // Honour RAM_KEEPER_STATE_DIR just like the Python helper and notifier do,
@@ -185,7 +192,8 @@ Item {
     if (root.busy) return
     root.busy = true
     root.activeAction = "relieve"
-    actionProc.command = ["python3", root.helperPath, "--relieve"]
+    root.lastError = ""
+    actionProc.command = [root.pythonBin, root.helperPath, "--relieve"]
     actionProc.running = true
   }
 
@@ -195,7 +203,7 @@ Item {
     if (!name || protectProc.running) return
     root.listVerb = "protect"
     root.pendingProtectKey = String(name)
-    protectProc.command = ["python3", root.helperPath, "--protected-add", String(name)]
+    protectProc.command = [root.pythonBin, root.helperPath, "--protected-add", String(name)]
     protectProc.running = true
   }
 
@@ -203,7 +211,7 @@ Item {
     if (!name || protectProc.running) return
     root.listVerb = "release"
     root.pendingProtectKey = String(name)
-    protectProc.command = ["python3", root.helperPath, "--protected-remove", String(name)]
+    protectProc.command = [root.pythonBin, root.helperPath, "--protected-remove", String(name)]
     protectProc.running = true
   }
 
@@ -211,7 +219,8 @@ Item {
     if (root.busy) return
     root.busy = true
     root.activeAction = "sweep"
-    actionProc.command = ["python3", root.helperPath, "--sweep-cache"]
+    root.lastError = ""
+    actionProc.command = [root.pythonBin, root.helperPath, "--sweep-cache"]
     actionProc.running = true
   }
 
@@ -264,11 +273,11 @@ Item {
       var mins = Number(req.minutes) || 0
       root.ctlPauseArg = mins > 0 ? String(Math.round(mins)) : "indefinite"
       root.ctlStep = "pause-cli"
-      daemonCtlProc.command = ["python3", root.helperPath, "--pause", root.ctlPauseArg]
+      daemonCtlProc.command = [root.pythonBin, root.helperPath, "--pause", root.ctlPauseArg]
       daemonCtlProc.running = true
     } else {
       root.ctlStep = "resume-cli"
-      daemonCtlProc.command = ["python3", root.helperPath, "--resume"]
+      daemonCtlProc.command = [root.pythonBin, root.helperPath, "--resume"]
       daemonCtlProc.running = true
     }
   }
@@ -423,9 +432,14 @@ Item {
       waitForEnd: true
       onStreamFinished: if (String(text || "").trim() !== "") root.lastError = String(text).trim().split("\n")[0]
     }
-    onExited: {
+    onExited: function(exitCode) {
       root.busy = false
       root.activeAction = ""
+      if (exitCode !== 0 && root.lastError === "") {
+        root.lastError = "Memory reclaim action failed"
+      } else if (exitCode === 0) {
+        root.lastError = ""
+      }
       actionDoneTimer.restart()
     }
   }
@@ -452,7 +466,7 @@ Item {
           // safely via argv (no shell interpolation) and stop the unit.
           root.snoozeRemaining = 0
           root.ctlStep = "pause-fallback-flag"
-          daemonCtlProc.command = ["python3", "-c",
+          daemonCtlProc.command = [root.pythonBin, "-c",
             "import pathlib,sys; p=pathlib.Path(sys.argv[1]); p.parent.mkdir(parents=True, exist_ok=True); p.write_text('1\\n', encoding='utf-8')",
             root.pauseFlagPath]
           daemonCtlProc.running = true

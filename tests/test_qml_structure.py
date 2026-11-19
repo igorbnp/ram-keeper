@@ -440,6 +440,14 @@ check("Panel shows immediate Protecting…/Releasing… feedback and swap mini-b
       and "sessionImpact" in panel and "Model.barLabel" in panel)
 check("PanelActionButton uses nf-md-power (U+F0425), not nf-md-qrcode (U+F0432)",
       "\U000f0425" in panel and "\U000f0432" not in panel)
+check("Service.qml honours RAM_KEEPER_PYTHON and clears lastError on actionProc success (D9)",
+      "RAM_KEEPER_PYTHON" in service and "root.pythonBin" in service
+      and 'root.lastError = ""' in action_section
+      and '"Memory reclaim action failed"' in action_section)
+check("Panel NEVER RECLAIMED lists all protected groups (no 4-item cap) and fills strip width (D9/G4)",
+      "Model.protectedGroups(root.snap, 4)" not in panel
+      and "Model.protectedGroups(root.snap)" in panel
+      and "strip.width * modelData.fraction" in panel)
 
 print("\n" + ("QML structure ok" if fails == 0 else "%d check(s) failed" % fails))
 assert fails == 0, f"Test failed: {fails} failures"

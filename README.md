@@ -73,10 +73,10 @@ deliberately does not flag `zram` as a problem at any fill level, because a
 "90% full" zram is a healthy zram.
 
 **It reports what actually happened, not what the kernel counted.** Moving 300 MB
-of anonymous memory into `zram` at a measured 4.4× compression ratio returns
-~68 MB of real RAM. The panel's "freed" figure accounts for that; the raw
-per-cgroup drop is kept alongside it for auditing rather than being passed off
-as a fourfold benefit.
+of anonymous memory into `zram` at a measured 4.4× compression ratio consumes
+~68 MB of compressed RAM and returns ~232 MB of real RAM. The panel's "freed"
+figure accounts for that; the raw per-cgroup drop is kept alongside it for
+auditing rather than pretending compression costs zero RAM.
 
 ---
 
@@ -98,9 +98,8 @@ So this app never triggers on "memory is being used". It triggers on:
 | Per-cgroup `memory.current` | cgroup v2 | Which specific process can give memory back. |
 | **Unreadable signals** | any of the above | Report `No reading` and do nothing. A signal that fails must never escalate into the most aggressive response available. |
 
-`MemAvailable` is used rather than `MemFree` on purpose: `MemFree` counts
-reclaimable page cache as unused, so it reads as "0 bytes free" on a completely
-healthy machine.
+`MemAvailable` is used rather than `MemFree` on purpose: `MemFree` excludes
+reclaimable page cache, so it reads near zero on a completely healthy machine.
 
 ### The order it gives memory back
 
@@ -148,7 +147,8 @@ burns its budget on a victim that was never able to help.
 ├── install.sh                 # idempotent installer
 ├── helper/
 │   ├── ram_keeper.py          # the daemon — plain stdlib Python 3.9+
-│   └── ram_keeper_notify      # event-driven alerts + one-click AI diagnosis
+│   ├── ram_keeper_notify      # event-driven alerts + one-click AI diagnosis
+│   └── render_unit.py         # shared systemd unit template renderer
 ├── qml/
 │   ├── Service.qml            # owns the daemon, reads the published snapshot
 │   ├── Panel.qml              # the bar widget and its panel
@@ -228,7 +228,7 @@ only writes `memory.reclaim` inside cgroups it already owns.
 
 ## The panel
 
-Click the bar widget (or `omarchy-shell shell toggle ram-keeper`). It shows:
+Click the bar widget (or `omarchy-shell io.github.igorbnp.ram-keeper toggle`). It shows:
 
 - **Headline** — `Healthy · 42% free`, with the state as the first word.
 - **Memory bar** — one strip split into Apps / Cache / Free, because reading
@@ -342,8 +342,10 @@ one that names them.
 
 ## Operational notes
 
-- **Cost:** ~14 MB RSS idle. `MemoryHigh=192M`, `MemoryMax=384M` in the unit, so
-  a runaway loop can't become the problem it was built to prevent.
+- **Cost:** ~14–20 MB RSS idle for the daemon (`MemoryHigh=192M`, `MemoryMax=384M`),
+  plus ~50–65 MB for the optional notifier unit (`journalctl -f` mmaps journal
+  files; bounded at `MemoryHigh=96M`, `MemoryMax=160M`). Neither can run away
+  and become the problem it was built to prevent.
 - **Cadence:** every 20 s when healthy, every 5 s under pressure.
 - **Sandbox:** `ProtectSystem=strict`, `ProtectHome=read-only` with a single
   `ReadWritePaths` for its own state directory. It needs nothing else.

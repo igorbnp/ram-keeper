@@ -271,13 +271,44 @@ $prompt"
 # ---------------------------------------------------------------------------
 # 1. The daemon died — the one thing that must never be silent
 # ---------------------------------------------------------------------------
+# Return 0 only when the user intentionally stopped/indefinitely paused the
+# daemon. A timed snooze (`pause.json` with a numeric `paused_until`) keeps the
+# daemon running to warm trends and clear the flag on expiry — if the daemon
+# dies during or after a timed snooze, we MUST still alert.
+_user_pause_suppresses_down_alert() {
+  [[ -f "$STATE_DIR/paused-by-user" ]] || return 1
+  local pfile="$STATE_DIR/pause.json"
+  if [[ -f "$pfile" && ! -p "$pfile" && -n "$PYTHON3" ]]; then
+    "$PYTHON3" -c '
+import json, math, os, stat, sys
+p = sys.argv[1]
+try:
+    st = os.lstat(p)
+    if not stat.S_ISREG(st.st_mode) or st.st_size <= 0 or st.st_size > 65536:
+        raise SystemExit(0)
+    with open(p, encoding="utf-8") as fh:
+        d = json.loads(fh.read(65537))
+except Exception:
+    raise SystemExit(0)
+if isinstance(d, dict) and "paused_until" in d:
+    pu = d.get("paused_until")
+    # Numeric paused_until = timed snooze (daemon is expected to stay alive).
+    if isinstance(pu, (int, float)) and not isinstance(pu, bool) and math.isfinite(pu):
+        raise SystemExit(1)
+raise SystemExit(0)
+' "$pfile" 2>/dev/null
+    return $?
+  fi
+  return 0
+}
+
 watch_daemon() {
   local was_alive="" rc=0
   while true; do
     if systemctl --user is-active --quiet "$UNIT"; then
       was_alive=1
-    elif [[ -f "$STATE_DIR/paused-by-user" ]]; then
-      # The panel or CLI wrote this before pausing. A pause is not a crash.
+    elif _user_pause_suppresses_down_alert; then
+      # Indefinite user pause (or legacy pre-v1.2 stop). Not a crash.
       was_alive=0
     elif [[ "$was_alive" == "1" ]]; then
       log_event "daemon-down"
@@ -456,20 +487,43 @@ for raw in sys.stdin:
 # 3. Memory critical and staying there
 # ---------------------------------------------------------------------------
 
-# Prints 7 tab-separated fields using "-" for empty values so bash `IFS=$'\t'
-# read -r` never collapses adjacent tabs.
-snapshot_fields() {
-  [[ -n "$PYTHON3" ]] || return 1
-  printf '%s' "$1" | "$PYTHON3" -c 'import json, math, sys
+# Read state.json safely (regular file <= 1 MiB, non-FIFO) and print 7
+# tab-separated fields in a single Python invocation (halving periodic spawns).
+# Rejects stale snapshots when checked_at is present and outside the live window,
+# and sanitizes every field (including state) so tabs/newlines cannot shift cols.
+read_snapshot_fields() {
+  local path="$1"
+  [[ -f "$path" && ! -p "$path" && -n "$PYTHON3" ]] || return 1
+  "$PYTHON3" -c 'import json, math, os, stat, sys, time
+MAX_BYTES = 1048576
+p = sys.argv[1]
 try:
-    d = json.load(sys.stdin)
+    st = os.lstat(p)
+    if not stat.S_ISREG(st.st_mode) or st.st_size <= 0 or st.st_size > MAX_BYTES:
+        raise SystemExit(1)
+    with open(p, encoding="utf-8") as fh:
+        d = json.loads(fh.read(MAX_BYTES + 1))
 except Exception:
     raise SystemExit(1)
 if not isinstance(d, dict):
     raise SystemExit(1)
+if "checked_at" in d:
+    cb = d.get("checked_at")
+    if isinstance(cb, bool) or not isinstance(cb, (int, float)) or not math.isfinite(cb) or cb <= 0:
+        raise SystemExit(1)
+    raw_idle = d.get("interval_idle")
+    idle = float(raw_idle) if isinstance(raw_idle, (int, float)) and not isinstance(raw_idle, bool) and math.isfinite(raw_idle) and raw_idle > 0 else 20.0
+    max_age = max(180.0, idle * 3.0)
+    age = time.time() - cb
+    if age > max_age or age < -60.0:
+        raise SystemExit(1)
 free = d.get("free_percent")
 if isinstance(free, bool) or not isinstance(free, (int, float)) or not math.isfinite(free) or free < 0 or free > 100:
     raise SystemExit(1)
+raw_state = d.get("state")
+state_s = "".join(ch for ch in str(raw_state) if ch.isalnum() or ch in "-_")[:32] if isinstance(raw_state, str) else "unknown"
+if not state_s:
+    state_s = "unknown"
 relief = d.get("relief") if isinstance(d.get("relief"), dict) else {}
 acted = relief.get("acted")
 acted_s = "yes" if acted is True else "no" if acted is False else ""
@@ -493,26 +547,8 @@ for cand in (relief.get("freed"), relief.get("freed_bytes"), stats.get("last_rel
         freed_b = int(cand)
         break
 freed_mb = str(freed_b // 1048576) if freed_b >= 1048576 else ""
-cols = [str(d.get("state") or "unknown"), str(free), acted_s, skipped, ", ".join(names[:8]), culprit, freed_mb]
-print("\t".join(c if c else "-" for c in cols))' 2>/dev/null
-}
-
-read_bounded_state() {
-  local path="$1"
-  [[ -f "$path" && ! -p "$path" && -n "$PYTHON3" ]] || return 1
-  "$PYTHON3" -c '
-import os, stat, sys
-MAX_BYTES = 1048576
-p = sys.argv[1]
-try:
-    st = os.lstat(p)
-    if not stat.S_ISREG(st.st_mode) or st.st_size <= 0 or st.st_size > MAX_BYTES:
-        raise SystemExit(1)
-    with open(p, encoding="utf-8") as fh:
-        sys.stdout.write(fh.read(MAX_BYTES + 1))
-except Exception:
-    raise SystemExit(1)
-' "$path" 2>/dev/null
+cols = [state_s, str(free), acted_s, skipped, ", ".join(names[:8]), culprit, freed_mb]
+print("\t".join(c if c else "-" for c in cols))' "$path" 2>/dev/null
 }
 
 watch_pressure() {
@@ -520,12 +556,8 @@ watch_pressure() {
   while true; do
     [[ -f "$STATE_DIR/state.json" && ! -p "$STATE_DIR/state.json" ]] || { sleep "$PRESSURE_POLL"; continue; }
 
-    local snapshot state free fields acted skipped held culprit freed_mb body prompt_ctx rc=0
-    if ! snapshot="$(read_bounded_state "$STATE_DIR/state.json")" || [[ -z "$snapshot" ]]; then
-      sleep "$PRESSURE_POLL"
-      continue
-    fi
-    if ! fields="$(snapshot_fields "$snapshot")" || [[ -z "$fields" ]]; then
+    local state free fields acted skipped held culprit freed_mb body prompt_ctx rc=0
+    if ! fields="$(read_snapshot_fields "$STATE_DIR/state.json")" || [[ -z "$fields" ]]; then
       sleep "$PRESSURE_POLL"
       continue
     fi

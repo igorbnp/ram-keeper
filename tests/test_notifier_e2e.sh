@@ -418,6 +418,40 @@ stop_pid "$P"
 unset RAM_KEEPER_DAEMON_POLL RAM_KEEPER_PRESSURE_POLL
 
 echo
+echo "== 12. B1: daemon crash during timed snooze still alerts (only indefinite pause suppresses) =="
+new_case snooze-daemon-crash
+export RAM_KEEPER_DAEMON_POLL=1 RAM_KEEPER_PRESSURE_POLL=2
+P="$(launch)"
+sleep 2
+touch "$CASE/.local/state/ram-keeper/paused-by-user"
+printf '{"set_at":1700000000,"paused_until":1999999999}\n' >"$CASE/.local/state/ram-keeper/pause.json"
+echo inactive >"$STUB/systemctl_state"
+if wait_for 8 grep -q 'RAM protection stopped' "$STUB/toasts"; then
+  ok "daemon crash during timed snooze still produced alert"
+else
+  bad "timed snooze suppressed daemon-down alert"
+fi
+stop_pid "$P"
+unset RAM_KEEPER_DAEMON_POLL RAM_KEEPER_PRESSURE_POLL
+
+echo
+echo "== 13. D10: stale checked_at and tab-injected state are safely handled =="
+new_case stale-and-tab
+printf '{"state":"critical","free_percent":4.0,"checked_at":1000000}\n' >"$CASE/.local/state/ram-keeper/state.json"
+export RAM_KEEPER_DAEMON_POLL=2 RAM_KEEPER_PRESSURE_POLL=1
+P="$(launch)"
+sleep 3
+check "stale critical snapshot produced 0 toasts" "$(toast_count)" "0"
+printf '{"state":"critical\\t99","free_percent":4.0}\n' >"$CASE/.local/state/ram-keeper/state.json"
+sleep 3
+check "tab-injected state did not match critical or shift columns" "$(toast_count)" "0"
+printf '{"state":"critical","free_percent":4.0,"checked_at":null}\n' >"$CASE/.local/state/ram-keeper/state.json"
+sleep 3
+check "null checked_at produced 0 toasts" "$(toast_count)" "0"
+stop_pid "$P"
+unset RAM_KEEPER_DAEMON_POLL RAM_KEEPER_PRESSURE_POLL
+
+echo
 if (( fails == 0 )); then
   echo "notifier: todos os casos passaram"
 else

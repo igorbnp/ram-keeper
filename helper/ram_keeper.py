@@ -1886,11 +1886,15 @@ class Steward:
         # non-swapable cgroups for anon, which always fails with EAGAIN and wastes
         # the pass's budget. The test expects non-swapable victims to NOT be reached.
 
-        # Prune expired entries from _anon_ready_at to prevent unbounded growth
+        # Prune expired entries from _anon_ready_at and _swap_history to prevent
+        # unbounded growth over long uptimes and stale strike penalties.
         now_mono = self._clock()
         expired = [k for k, v in self._anon_ready_at.items() if now_mono >= v]
         for k in expired:
             del self._anon_ready_at[k]
+        expired_swap = [k for k, (_, until) in self._swap_history.items() if now_mono >= until]
+        for k in expired_swap:
+            del self._swap_history[k]
 
         real = [a for a in actions if a.freed > 0]
         total_freed = sum(a.freed for a in real)
@@ -2363,18 +2367,31 @@ def add_never_reclaim(name: str) -> list[str]:
     path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = path.parent / f".{path.name}.lock"
     with _file_lock(lock_path):
+        if path.is_symlink() and not path.exists():
+            raise ValueError(
+                "config.json is a broken symlink; fix it before changing protection"
+            )
         target = path.resolve() if path.is_symlink() else path
         target.parent.mkdir(parents=True, exist_ok=True)
 
         existing: dict = {}
         raw, err = _read_regular_bytes(target, max_bytes=1024 * 1024)
-        if raw is not None and err is None:
+        if err == "missing":
+            existing = {}
+        elif raw is None or err is not None:
+            raise ValueError(f"cannot safely modify config.json ({err})")
+        else:
             try:
                 loaded = json.loads(raw.decode("utf-8-sig"))
-                if isinstance(loaded, dict):
-                    existing = loaded
-            except (ValueError, UnicodeDecodeError, RecursionError):
-                existing = {}
+            except (ValueError, UnicodeDecodeError, RecursionError) as exc:
+                raise ValueError(
+                    f"config.json is invalid ({exc}); fix it before changing protection"
+                ) from exc
+            if not isinstance(loaded, dict):
+                raise ValueError(
+                    "config.json root must be a JSON object; fix it before changing protection"
+                )
+            existing = loaded
 
         current = existing.get("never_reclaim")
         if isinstance(current, str):
@@ -2398,8 +2415,15 @@ def add_never_reclaim(name: str) -> list[str]:
         ]
 
         tmp = target.parent / f".{target.name}.tmp.{os.getpid()}"
-        tmp.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
-        _atomic_replace(tmp, target)
+        try:
+            tmp.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
+            _atomic_replace(tmp, target)
+        except BaseException:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            raise
     _sync_state_after_ctl()
     return names
 
@@ -2422,18 +2446,31 @@ def remove_protection(name: str) -> list[str]:
     path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = path.parent / f".{path.name}.lock"
     with _file_lock(lock_path):
+        if path.is_symlink() and not path.exists():
+            raise ValueError(
+                "config.json is a broken symlink; fix it before changing protection"
+            )
         target = path.resolve() if path.is_symlink() else path
         target.parent.mkdir(parents=True, exist_ok=True)
 
         existing: dict = {}
         raw, err = _read_regular_bytes(target, max_bytes=1024 * 1024)
-        if raw is not None and err is None:
+        if err == "missing":
+            existing = {}
+        elif raw is None or err is not None:
+            raise ValueError(f"cannot safely modify config.json ({err})")
+        else:
             try:
                 loaded = json.loads(raw.decode("utf-8-sig"))
-                if isinstance(loaded, dict):
-                    existing = loaded
-            except (ValueError, UnicodeDecodeError, RecursionError):
-                existing = {}
+            except (ValueError, UnicodeDecodeError, RecursionError) as exc:
+                raise ValueError(
+                    f"config.json is invalid ({exc}); fix it before changing protection"
+                ) from exc
+            if not isinstance(loaded, dict):
+                raise ValueError(
+                    "config.json root must be a JSON object; fix it before changing protection"
+                )
+            existing = loaded
 
         def _listed(key: str) -> list[str]:
             current = existing.get(key)
@@ -2467,8 +2504,15 @@ def remove_protection(name: str) -> list[str]:
         existing["unprotect"] = gone
 
         tmp = target.parent / f".{target.name}.tmp.{os.getpid()}"
-        tmp.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
-        _atomic_replace(tmp, target)
+        try:
+            tmp.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
+            _atomic_replace(tmp, target)
+        except BaseException:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            raise
     _sync_state_after_ctl()
     return existing["unprotect"]
 
@@ -2629,19 +2673,47 @@ def doctor(as_json: bool = False) -> tuple[int, str]:
     checks.append({"name": "config", "ok": cfg_ok,
                     "detail": "clean" if cfg_ok else f"{len(warnings)} warnings"})
 
-    # 8. state.json age
+    # 8. state.json age (prefer daemon checked_at over file mtime so CLI writes
+    #    cannot spoof a live heartbeat; scale with interval_idle and allow small NTP jitter)
     state_path = state_dir() / "state.json"
     state_ok = False
     state_detail = "no state.json"
+    max_state_age = max(120.0, float(cfg.get("interval_idle", 20.0)) * 3.0)
     try:
         st = state_path.stat()
         if stat.S_ISREG(st.st_mode):
-            age = time.time() - st.st_mtime
-            if 0 <= age <= 120:
-                state_ok = True
-                state_detail = f"age={age:.0f}s"
+            raw_st, err_st = _read_regular_bytes(state_path, max_bytes=10 * 1024 * 1024)
+            if raw_st is None or err_st is not None:
+                state_detail = f"unreadable ({err_st})"
             else:
-                state_detail = f"stale (age={age:.0f}s)"
+                try:
+                    parsed_st = json.loads(raw_st.decode("utf-8"))
+                except (UnicodeDecodeError, ValueError, RecursionError):
+                    parsed_st = _UNSET
+                if parsed_st is _UNSET:
+                    state_detail = "corrupt JSON"
+                elif not isinstance(parsed_st, dict):
+                    state_detail = "invalid JSON root"
+                else:
+                    ref_ts: float | None = st.st_mtime
+                    if "checked_at" in parsed_st:
+                        cb = parsed_st.get("checked_at")
+                        if (isinstance(cb, (int, float))
+                                and not isinstance(cb, bool)
+                                and math.isfinite(cb)
+                                and cb > 0):
+                            ref_ts = float(cb)
+                        else:
+                            ref_ts = None
+                    if ref_ts is None:
+                        state_detail = "stale (no daemon heartbeat)"
+                    else:
+                        age = time.time() - ref_ts
+                        if -60.0 <= age <= max_state_age:
+                            state_ok = True
+                            state_detail = f"age={max(0.0, age):.0f}s"
+                        else:
+                            state_detail = f"stale (age={age:.0f}s)"
         else:
             state_detail = "not a regular file"
     except OSError:
@@ -2726,8 +2798,18 @@ def history(count: int = 20, as_json: bool = False) -> str:
     if not tail:
         return "ram-keeper history: no reclaim events found"
 
-    total_freed = sum(e.get("freed", 0) for e in tail)
-    total_swapped = sum(e.get("swapped_out", 0) for e in tail)
+    def _safe_nonneg_num(val) -> int:
+        if isinstance(val, bool) or not isinstance(val, (int, float)):
+            return 0
+        try:
+            if not math.isfinite(val) or val <= 0:
+                return 0
+            return int(val)
+        except OverflowError:
+            return 0
+
+    total_freed = sum(_safe_nonneg_num(e.get("freed")) for e in tail)
+    total_swapped = sum(_safe_nonneg_num(e.get("swapped_out")) for e in tail)
     lines = [f"ram-keeper history: last {len(tail)} of {len(reclaims)} reclaim events"]
     lines.append(f"  Total freed: {total_freed / (1024*1024):.1f} MB, swapped: {total_swapped / (1024*1024):.1f} MB")
     lines.append("")
@@ -2735,9 +2817,15 @@ def history(count: int = 20, as_json: bool = False) -> str:
     # Top victims by freed bytes
     victim_freed: dict[str, int] = {}
     for ev in tail:
-        for action in ev.get("actions", []):
-            label = action.get("label", "?")
-            victim_freed[label] = victim_freed.get(label, 0) + action.get("freed", 0)
+        raw_actions = ev.get("actions")
+        if not isinstance(raw_actions, list):
+            continue
+        for action in raw_actions:
+            if not isinstance(action, dict):
+                continue
+            raw_lbl = action.get("label")
+            label = raw_lbl if isinstance(raw_lbl, str) and raw_lbl else "?"
+            victim_freed[label] = victim_freed.get(label, 0) + _safe_nonneg_num(action.get("freed"))
     top = sorted(victim_freed.items(), key=lambda x: x[1], reverse=True)[:5]
     if top:
         lines.append("  Top victims:")
@@ -2747,13 +2835,17 @@ def history(count: int = 20, as_json: bool = False) -> str:
 
     # Recent events
     for ev in tail[-5:]:
-        ts = ev.get("ts", 0)
-        try:
-            dt_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
-        except (OSError, ValueError, OverflowError):
-            dt_str = str(ts)
-        freed = ev.get("freed", 0) / (1024 * 1024)
-        reason = ev.get("reason", "")
+        ts = ev.get("ts")
+        if isinstance(ts, (int, float)) and not isinstance(ts, bool) and math.isfinite(ts):
+            try:
+                dt_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+            except (OSError, ValueError, OverflowError):
+                dt_str = str(ts)
+        else:
+            dt_str = "?"
+        freed = _safe_nonneg_num(ev.get("freed")) / (1024 * 1024)
+        raw_reason = ev.get("reason")
+        reason = raw_reason if isinstance(raw_reason, str) else ""
         lines.append(f"  [{dt_str}] freed {freed:.1f} MB — {reason}")
 
     return "\n".join(lines)
@@ -2828,7 +2920,11 @@ def main() -> int:
         return 0
 
     if args.resume:
-        result = resume_daemon()
+        try:
+            result = resume_daemon()
+        except OSError as exc:
+            print(f"ram-keeper: could not clear pause state: {exc}", file=sys.stderr)
+            return 1
         print(json.dumps(result, allow_nan=False))
         return 0
 
@@ -2882,12 +2978,21 @@ def main() -> int:
                 merged["session_stats"] = merged_stats
             fresh = merged
         else:
-            # Preserve the live daemon's forecast while publishing merged session_stats,
-            # never overwriting current pause state with stale values.
+            # Preserve the live daemon's forecast and checked_at heartbeat while
+            # publishing merged session_stats, never forging a running daemon
+            # heartbeat from a one-shot CLI action.
             if existing.get("forecast") is not None:
                 fresh["forecast"] = existing["forecast"]
             if merged_stats is not None:
                 fresh["session_stats"] = merged_stats
+            prior_hb = existing.get("checked_at")
+            if (isinstance(prior_hb, (int, float))
+                    and not isinstance(prior_hb, bool)
+                    and math.isfinite(prior_hb)
+                    and prior_hb > 0):
+                fresh["checked_at"] = prior_hb
+            else:
+                fresh["checked_at"] = 0
         fresh["relief"] = {
             "acted": bool(result.get("acted")),
             "reason": str(result.get("reason") or ""),

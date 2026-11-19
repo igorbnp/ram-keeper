@@ -1,9 +1,9 @@
 [Unit]
 Description=ram-keeper — automatic RAM steward for a memory-scarce desktop
 Documentation=man:systemd.unit(5)
-# After the things that define what memory exists: zram must exist before we
-# can reclaim anon into it, and our own cgroup must be discoverable.
-After=systemd-user-sessions.service systemd-zram-setup@zram0.service
+# System-level units (systemd-zram-setup@zram0.service, etc.) live in the PID 1
+# manager and cannot be ordered from a --user unit; the daemon itself probes
+# zram and cgroup v2 dynamically on every pass.
 PartOf=graphical-session.target
 
 [Service]
@@ -53,4 +53,7 @@ RestrictRealtime=yes
 LockPersonality=yes
 
 [Install]
-WantedBy=default.target
+# Wanted by both default.target (start on user manager boot) and
+# graphical-session.target (restart cleanly if a graphical session restarts
+# after PartOf=graphical-session.target stopped us).
+WantedBy=default.target graphical-session.target

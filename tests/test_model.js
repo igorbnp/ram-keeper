@@ -546,6 +546,7 @@ console.log("\n== Service.qml behavioral harness (B-06, B-07, D-22, F2, F3) ==")
         manifestPath: "/plugin/manifest.json",
         diskVersion: "",
         helperPath: "/plugin/helper/ram_keeper.py",
+        pythonBin: "python3",
         unitName: "ram-keeper.service",
         stateDir: "/tmp/rk-state",
         statePath: "/tmp/rk-state/state.json",
@@ -767,6 +768,20 @@ console.log("\n== Service.qml behavioral harness (B-06, B-07, D-22, F2, F3) ==")
     psLive.remaining === 35 && psLive.label === "Snoozed · resumes in 35s", psLive.label);
   check("array/object values in numeric fields coerce to 0, not single-element number",
     M.reclaimableGroups({ groups: [{ name: "arr.scope", anon: [500 * MB], reclaimable: [200 * MB], protected: false }] }).length === 0);
+
+  // G1: sessionImpactRow tolerates slight liveNow lag behind last_relief_ts
+  const lagImpact = M.sessionImpactRow({
+    session_stats: {
+      actions: 1,
+      bytes_freed: 411 * MB,
+      last_relief_ts: 1003,
+      last_relief_bytes: 411 * MB,
+      last_relief_label: "firefox"
+    }
+  }, 1000);
+  check("sessionImpactRow keeps 'freed 1s ago' when liveNow lags last_relief_ts by 3s (G1)",
+    lagImpact && /411 MB \(firefox\) freed 1s ago/.test(lagImpact.text),
+    lagImpact ? lagImpact.text : "null");
 }
 
 console.log(failures === 0 ? "\nALL PASS" : `\n${failures} FAILURES`);

@@ -60,17 +60,18 @@ def _run_live():
     except Exception as e:
         check("snapshot parses", False, repr(e))
     print("\n== 2. cgroup disappears mid-flight (the classic race) ==")
-    # Start a hog, kill it while a scan is walking the tree. A scan that assumed
-    # cgroups are stable would raise FileNotFoundError here.
+    # Start a hog with a PID-scoped unit name so concurrent test runs never collide,
+    # then stop it while a scan walks the tree.
+    unit_name = f"ramtest-race-{os.getpid()}"
     hog = "b=[bytearray(1024*1024) for _ in range(400)]\nimport time\ntime.sleep(45)"
-    subprocess.run(["systemd-run", "--user", "--unit=ramtest-race", "/usr/bin/python3", "-c", hog],
+    subprocess.run(["systemd-run", "--user", f"--unit={unit_name}", "/usr/bin/python3", "-c", hog],
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     time.sleep(3)
     _uid = os.getuid()
     victim = (f"/sys/fs/cgroup/user.slice/user-{_uid}.slice/"
-              f"user@{_uid}.service/app.slice/ramtest-race.service")
+              f"user@{_uid}.service/app.slice/{unit_name}.service")
     check("victim cgroup exists", Path(victim).is_dir())
-    subprocess.run(["systemctl", "--user", "stop", "ramtest-race"], capture_output=True)
+    subprocess.run(["systemctl", "--user", "stop", unit_name], capture_output=True)
     # Immediately scan: the cgroup is gone or mid-teardown.
     rc, out, err = once()
     check("scan survives a vanished cgroup", rc == 0, f"rc={rc} err={err[:300]}")
@@ -145,13 +146,15 @@ print('  acted =', r['acted'])
     before = subprocess.run(["/usr/bin/python3", HELPER, "--once"],
                             capture_output=True, text=True).stdout
     b = json.loads(before)
+    watch_procs = [("Hyprland", ["pgrep", "-x", "Hyprland"]),
+                   ("quickshell", ["pgrep", "-x", "quickshell"])]
+    if subprocess.run(["pgrep", "-x", "hermes"], capture_output=True).returncode == 0:
+        watch_procs.append(("hermes", ["pgrep", "-x", "hermes"]))
     r = subprocess.run(["/usr/bin/python3", HELPER, "--relieve"],
                        capture_output=True, text=True, timeout=90)
     res = json.loads(r.stdout)
     check("relieve returns a well formed result", "acted" in res and "actions" in res)
-    for name, cmd in (("Hyprland", ["pgrep", "-x", "Hyprland"]),
-                      ("quickshell", ["pgrep", "-x", "quickshell"]),
-                      ("hermes", ["pgrep", "-x", "hermes"])):
+    for name, cmd in watch_procs:
         check(f"{name} survived the forced relieve",
               subprocess.run(cmd, capture_output=True).returncode == 0)
     # Match on the CGROUP NAME, not the human label: a label like
@@ -176,4 +179,16 @@ print('  acted =', r['acted'])
     assert fails == 0, f"Test failed: {fails} failures"
 
 
-_run_live()
+import unittest
+
+
+class TestResilienceLive(unittest.TestCase):
+    @unittest.skipIf(_SKIP_LIVE, "no user cgroup, or CI without RAM_KEEPER_LIVE=1")
+    def test_resilience_live(self):
+        global fails
+        fails = 0
+        _run_live()
+
+
+if __name__ == "__main__":
+    _run_live()
